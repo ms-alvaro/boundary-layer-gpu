@@ -1,0 +1,50 @@
+! domain size nx ny nz
+1142 180 34
+! CFL
+0.5
+! viscosity
+4.436253367443143e-06
+! Pressure gradient dPdx, dPdz
+0.00000000000 0.000000000000
+! LES model (0: no model 1: constant smagorinsky 2: DSM)
+0
+! wall model (0: no model 1: momentum 2: Bose 3: fitting 4: momentum wall 5: constant alpha 6: log 7: momentum wall dyn 8: log-f)
+0
+! for wall model 9: 0->fixed viscous fraction, 2->dynamic viscous fraction and viscous fraction
+2 0.05
+! V at the top: Vbs_max, x_bs, sigma_bs, phi_bs, dummy
+2.0 15 1 0 0
+! nsteps, nsave, nstats, nstats z, nmonitor
+ 50000000    500      50       50       50
+! inflow: input Blasius solution
+'dummy.dat'
+! inflow bc flag: 1->generate Blasius, 2->read from file, 3->Lund's rescaling, 4->Blasius+random, 5->Lund's rescaling fluctuations
+ 5
+! top bc flag: 1->Blasius/Turbulent correlation, 2->Falkner-Skan
+ 1
+! inflow: own mean profile
+'Mean_profile_Retheta1100_ny180_Ly0.4.dat'
+! inflow: time dependent component
+'dummy.dat'
+! input flow field file
+'../data/bl_test_DNS.500'
+! output flow field file
+'../data/bl_test_DNS'
+! first number for output flow field
+ 0
+! random initial condition 0->no (reads previous file), 1->yes
+ 1
+! Rossby number (in + units)
+ 0
+! time integration 1->Euler, 2->RK2, 3->RK3
+ 2
+! BC for eddy vicosity: 1->Dirichlet, 0->Neumann
+ 1
+! if inflow flag==3 or 5, x index for rescaling plane,  delta inlet, and T_average
+ 1000 3.0E-002 0.5
+! model to compute wall stress: 0->use utau_ref, 1->law-of-the-wall
+ 0
+! Amplitude for random inflow perturbations
+ 0
+! Hartree parameter for Falkner-Skan
+ 0
