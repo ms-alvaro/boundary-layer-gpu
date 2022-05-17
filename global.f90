@@ -31,6 +31,7 @@ Module global
 
   ! domain size
   Real(Int64) :: Lx, Lz, Ly, Lxp, Lzp
+  Real(Int64) :: Lx_rand, Ly_rand, Lz_rand, alpha_rand
 
   ! steps
   Integer(Int32) :: nsteps, nstep_init
@@ -40,7 +41,7 @@ Module global
   Real(Int64) :: nu
 
   ! Reynolds numbers and delta99
-  Real(Int64) :: Rex_inlet, Retheta_inlet, Redelta_inlet, delta99_inlet_ins
+  Real(Int64) :: Rex_inlet, Retheta_inlet, Redelta_inlet, delta99_inlet_ins, Retau_inlet
 
   ! global face points
   Integer(Int32) :: nx_global, ny_global, nz_global

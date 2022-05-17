@@ -20,7 +20,7 @@
 'dummy.dat'
 ! inflow bc flag: 1->generate Blasius, 2->read from file, 3->Lund's rescaling, 4->Blasius+random, 5->Lund's rescaling fluctuations
  5
-! top bc flag: 1->Blasius/Turbulent correlation, 2->Falkner-Skan
+! top bc flag: 0->Falkner-Skan, 1->Abe2017, 2->Coleman2018
  1
 ! inflow: own mean profile
 'Mean_profile_Retheta1100_ny180_Ly0.4.dat'

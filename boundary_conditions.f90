@@ -56,11 +56,11 @@ Contains
 
     !---------------------------------------------------------!
     ! apply velocity boundary conditions at the top
-    If ( top_boundary_flag == 1 ) Then
+    If ( top_boundary_flag.ne.0 ) Then
        ! U and W boundary condition at the top           
        Call apply_top_bc_y(U,W) 
        ! V boundary condition at the top    
-       Call apply_Dirichlet_bc_y_top_BlowingSuction(V,1)
+       Call apply_Dirichlet_bc_y_top_BlowingSuction(V,top_boundary_flag)
     Else
        Call apply_top_bc_y_Falkner_Skan(U,V,W) 
     End If
@@ -302,7 +302,7 @@ Contains
        !Call compute_temporal_inflow
 
        ! perturbation 
-       Amp_per = 1d-1
+       Amp_per = Amplitude_perturbations
        
        ! variables at centers 
        Do j=1,nyg
@@ -468,7 +468,13 @@ Contains
 
     Integer(Int32) :: i
 
-    If ( id==1 ) Then
+    If ( id==1 ) Then ! Abe 2017
+       ! F defined at y faces
+       Do i=1,nxg
+          F(i,ny,:) = Vbs_max*(x_bs-xg(i))/sigma_bs*dexp(.5d0 - ((x_bs-xg(i))/sigma_bs)**2d0 ) &
+                      + phi_bs
+       End Do     
+    Elseif ( id==2 ) Then ! Coleman 2018
        ! F defined at y faces
        Do i=1,nxg
           F(i,ny,:) = Vbs_max*(x_bs-xg(i))/sigma_bs*dexp(phi_bs - ((x_bs-xg(i))/sigma_bs)**2d0 )

@@ -103,6 +103,9 @@ Contains
        Read(*,*) dummy_line
        Read(*,*) beta_hartree
 
+       Read(*,*) dummy_line
+       Read(*,*) Lx_rand, Ly_rand, Lz_rand, alpha_rand
+
        ! reference utau
        utau_   = dPdx**0.5d0
 
@@ -159,6 +162,11 @@ Contains
     Call Mpi_bcast (   phi_bs,1,MPI_real8,0,MPI_COMM_WORLD,ierr )
     Call Mpi_bcast (    freq_mult,1,MPI_real8,0,MPI_COMM_WORLD,ierr )
     
+    Call Mpi_bcast (    Lx_rand,1,MPI_real8,0,MPI_COMM_WORLD,ierr )
+    Call Mpi_bcast (    Ly_rand,1,MPI_real8,0,MPI_COMM_WORLD,ierr )
+    Call Mpi_bcast (    Lz_rand,1,MPI_real8,0,MPI_COMM_WORLD,ierr )
+    Call Mpi_bcast ( alpha_rand,1,MPI_real8,0,MPI_COMM_WORLD,ierr )
+
     ! small check
     If ( i_rescale>nx_global ) Stop 'Error! i_rescale>nx_global'
     
@@ -188,22 +196,13 @@ Contains
        x_global(i) = Real(i-1,8)
     End Do
     x_global = x_global - x_global(1)
-    !x_global = 1d0 + x_global/Maxval(x_global)*3.5d0 ! H type
-    !x_global = 1d0 + x_global/Maxval(x_global)*4.5d0 ! streaks
-    !x_global = 1d0 + x_global/Maxval(x_global)*4.0d0  ! streaks, streaks+floquet
-    !x_global = 3d0 + x_global/Maxval(x_global)*4.0d0  ! turbulent test
-    x_global = 1d0 + x_global/Maxval(x_global)*3.0d0 ! streaks+random
-    !x_global = 1d0 + x_global/Maxval(x_global)*5.0d0  ! turbulent test II
+    x_global = 1d0 + x_global/Maxval(x_global)*Lx_rand 
     
     ! zmesh
     Do k=1,nz_global
        z_global(k) = Real(k-1,8)
     End Do
-    !z_global = ( z_global/z_global(nz_global-1)*2d0*pi/59.561030723478709d0 )  ! H type
-    !z_global = ( z_global/z_global(nz_global-1)*2d0*pi/1.929302490212350d02 )  ! streaks
-    !z_global = 3d0*( z_global/z_global(nz_global-1)*2d0*pi/96.465124510617500 ) ! streaks+floquet
-    z_global = ( 2d0*z_global/z_global(nz_global-1)*2d0*pi/1.929302490212350d02 ) ! streaks+random    
-    !z_global = z_global/z_global(nz_global-1)*0.5d0 ! turbulent test II
+    z_global = z_global/z_global(nz_global-1)*Lz_rand
 
     ! ymesh
     ! Note: delta99/x0 = 4.91/sqrt(Rex0) = 0.0155 for Rex0 = 1e5
@@ -213,16 +212,13 @@ Contains
     y_global = y_global - y_global(1)
     y_global = y_global/Maxval(y_global)
     !If ( iwall_model == 0 ) Then
-       alpha = 6.5d0 ! H-type wall-resolved
-       !alpha = 2.5d0 ! H-type wall-modeled
-       !alpha = 4.5d0 ! turbulent wall-modeled
+       alpha = alpha_rand
        Do i=1,ny_global
           y_global(i) = dsinh(alpha*y_global(i))/dsinh(alpha)
        End Do
     !End If
     y_global = y_global - y_global(1)
-    y_global = y_global/Maxval(y_global)*0.3d0 ! H type and streaks
-    !y_global = y_global/Maxval(y_global)*0.249981497629082 ! turbulent test II
+    y_global = y_global/Maxval(y_global)*Ly_rand
 
     ! U
     U = 1d0
