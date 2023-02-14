@@ -468,13 +468,14 @@ Contains
 
     Integer(Int32) :: i
 
-    If ( id==1 ) Then ! Abe 2017
+    If ( id==1 ) Then ! Coleman 2018
        ! F defined at y faces
        Do i=1,nxg
+          ! Note that the minus sign is accounted in ( x_bs - x_g )
           F(i,ny,:) = Vbs_max*(x_bs-xg(i))/sigma_bs*dexp(.5d0 - ((x_bs-xg(i))/sigma_bs)**2d0 ) &
                       + phi_bs
        End Do     
-    Elseif ( id==2 ) Then ! Coleman 2018
+    Elseif ( id==2 ) Then ! Abe 2017
        ! F defined at y faces
        Do i=1,nxg
           F(i,ny,:) = Vbs_max*(x_bs-xg(i))/sigma_bs*dexp(phi_bs - ((x_bs-xg(i))/sigma_bs)**2d0 )
