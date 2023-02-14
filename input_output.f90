@@ -254,13 +254,19 @@ Contains
     End Do
 
     If ( myid==0 ) Then
-       Write(*,*) '   Max U ',MaxVal(U)
-       Write(*,*) '   Max V ',MaxVal(V)
-       Write(*,*) '   Max W ',MaxVal(W)
+       Write(*,*) 'Random initial condition:'
+       Write(*,*) '   Lx     : ',Lx_rand
+       Write(*,*) '   Ly     : ',Ly_rand
+       Write(*,*) '   Lz     : ',Lz_rand
+       Write(*,*) '   alpha  : ',alpha_rand
+
+       Write(*,*) '   Max U : ',MaxVal(U)
+       Write(*,*) '   Max V : ',MaxVal(V)
+       Write(*,*) '   Max W : ',MaxVal(W)
        
-       Write(*,*) '   Mean U',sum(U)/Real(nx_global*nyg_global*nzg_global,8)
-       Write(*,*) '   Mean V',sum(V)/Real(nxg_global*ny_global*nzg_global,8)
-       Write(*,*) '   Mean W',sum(W)/Real(nxg_global*nyg_global*nz_global,8)
+       Write(*,*) '   Mean U : ',sum(U)/Real(nx_global*nyg_global*nzg_global,8)
+       Write(*,*) '   Mean V : ',sum(V)/Real(nxg_global*ny_global*nzg_global,8)
+       Write(*,*) '   Mean W : ',sum(W)/Real(nxg_global*nyg_global*nz_global,8)
     End If
  
   End Subroutine init_flow
@@ -629,7 +635,7 @@ Contains
   Subroutine output_statistics
 
     Character(200) :: fname,my_format
-    Character(8)   :: ext,ext_ny
+    Character(8)   :: ext,ext_ny,ext_nx
     Integer(Int32) :: ii
 
     If ( myid==0 ) Then
@@ -637,16 +643,21 @@ Contains
        ! create file name
        Write(ext,'(I8)') istep + nstep_init
 
+       Write(ext_nx,'(I8)') nx
        Write(ext_ny,'(I8)') ny
-       my_format = '('//Trim(Adjustl(ext_ny))//'F15.8)'
               
        fname = Trim(Adjustl(fileout))//'.'//Trim(Adjustl(ext))//'.stats.txt'
        Write(*,*) 'writting ',Trim(Adjustl(fname))
        Open(3,file=fname,form='formatted',action='write') 
        !
        Write(3,'(A,2F15.8,4I)') '%',t, nu, nx_global, ny_global, nz_global, istep
-       Write(3,my_format) y
+
+       my_format = '('//Trim(Adjustl(ext_nx))//'F15.8)'
        Write(3,my_format) Cf
+
+       my_format = '('//Trim(Adjustl(ext_ny))//'F15.8)'
+       Write(3,my_format) y
+
        !
        Do ii=1,nx
           Write(3,my_format) Umean(ii,:)

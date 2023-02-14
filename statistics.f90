@@ -199,7 +199,7 @@ Contains
 
        ! write statistics
 !!!!!!!!!!!!!!!!!!!
-       !Call output_statistics       
+       Call output_statistics       
 !!!!!!!!!!!!!!!!!!!
 
        ! Sanity check

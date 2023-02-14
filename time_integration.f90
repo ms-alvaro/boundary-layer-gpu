@@ -309,7 +309,7 @@ Contains
 
     ! use multiple of the TS period instead
     If ( CFL<0 ) Then
-       dt = dt_period
+       dt = -CFL
     end If
      
    End Subroutine compute_dt

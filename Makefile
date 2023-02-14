@@ -1,12 +1,13 @@
 ####################################################################
 ### INPUT ##########################################################
 ####################################################################
+
 SHELL:=/bin/bash
 
 export F_UFMTENDIAN=big
 
 ## name of the executable file
-EXE = boundary_layer_0.7
+EXE = boundary_layer_0.8
 ## source code path
 SRC = pwd
 
@@ -59,6 +60,7 @@ OBJECTS = $(OBJ)/mpi.o $(OBJ)/global.o $(OBJ)/Newton_solver.o $(OBJ)/interpolati
 
 #################################################### compile 
 $(OBJ)/%.o: $(PREBUILD)/%.f90
+	module load icc/2019.5
 	@echo compiling $<
 	cd $(OBJ);\
 		$(F90) -c $(FFTFLAGS)  $(FEX) $< -o $@
@@ -84,6 +86,7 @@ DIRSETUP:
 
 ############################################################ build
 debug: DIRSETUP $(OBJECTS) 
+	module load icc/2019.5
 	@echo " "
 	@echo "LINKING... "
 	@echo " "
@@ -96,6 +99,7 @@ debug: DIRSETUP $(OBJECTS)
 
 ############################################################ build
 $(EXE): DIRSETUP $(OBJECTS) 
+	module load icc/2019.5
 	@echo " "
 	@echo "LINKING... "
 	@echo " "
@@ -106,10 +110,15 @@ $(EXE): DIRSETUP $(OBJECTS)
 	echo $@ built, congratulations.
 
 ########################################################## message
+.PHONY: clean cleandebug cleanobj
 clean:
 	@if [ -d $(OBJ)       ]; then rm -r $(OBJ);      echo OBJECTS directory removed ; fi
 	@if [ -d $(PREBUILD)  ]; then rm -r $(PREBUILD); echo PRECOMP directory removed ; fi
-	@if [ -f $(EXE)       ]; then rm $(EXE)        ;echo EXECUT. file       removed ; fi
+cleandebug: clean
 	@if [ -f debug        ]; then rm debug         ;echo EXECUT. file       removed ; fi
+cleanobj: clean
+	@if [ -f $(EXE)       ]; then rm $(EXE)        ;echo EXECUT. file       removed ; fi
 
 all: $(EXE)
+
+.DEFAULT_GOAL := all
