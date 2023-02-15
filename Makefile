@@ -60,7 +60,6 @@ OBJECTS = $(OBJ)/mpi.o $(OBJ)/global.o $(OBJ)/Newton_solver.o $(OBJ)/interpolati
 
 #################################################### compile 
 $(OBJ)/%.o: $(PREBUILD)/%.f90
-	module load icc/2019.5
 	@echo compiling $<
 	cd $(OBJ);\
 		$(F90) -c $(FFTFLAGS)  $(FEX) $< -o $@
@@ -86,7 +85,6 @@ DIRSETUP:
 
 ############################################################ build
 debug: DIRSETUP $(OBJECTS) 
-	module load icc/2019.5
 	@echo " "
 	@echo "LINKING... "
 	@echo " "
@@ -99,7 +97,6 @@ debug: DIRSETUP $(OBJECTS)
 
 ############################################################ build
 $(EXE): DIRSETUP $(OBJECTS) 
-	module load icc/2019.5
 	@echo " "
 	@echo "LINKING... "
 	@echo " "
