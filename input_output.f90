@@ -480,7 +480,7 @@ Contains
        ! processor 0 writes the data
        If ( myid==0 ) Then
           
-          Write(ext,'(I8)') istep + nstep_init
+          Write(ext,'(I08)') istep + nstep_init
           
           fname = Trim(Adjustl(fileout))//'.'//Trim(Adjustl(ext))
           Write(*,*) 'writting ',Trim(Adjustl(fname))
@@ -641,7 +641,7 @@ Contains
     If ( myid==0 ) Then
 
        ! create file name
-       Write(ext,'(I8)') istep + nstep_init
+       Write(ext,'(I08)') istep + nstep_init
 
        Write(ext_nx,'(I8)') nx
        Write(ext_ny,'(I8)') ny
