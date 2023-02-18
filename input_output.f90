@@ -26,85 +26,18 @@ Contains
 
     ! processor 0 reads the data
     If ( myid==0 ) Then
+       call initparams()
+      
+       ! WARNING: nstats_zmodes not read
 
-       Read(*,*) dummy_line
-       Read(*,*) nx_global, ny_global, nz_global
-       
-       Read(*,*) dummy_line
-       Read(*,*) CFL
-       
-       Read(*,*) dummy_line
-       Read(*,*) nu   
-       
-       Read(*,*) dummy_line
-       Read(*,*) dPdx, dPdy
+       !Read(*,*) dummy_line
+       !Read(*,*) Rossby_plus
 
-       Read(*,*) dummy_line
-       Read(*,*) LES_model
+       !Read(*,*) dummy_line
+       !Read(*,*) Amplitude_perturbations
 
-       Read(*,*) dummy_line
-       Read(*,*) iwall_model
-
-       Read(*,*) dummy_line
-       Read(*,*) iwall_model_nut, frac_vis_wall_model
- 
-       Read(*,*) dummy_line
-       !Read(*,*) alpha_mean_x, alpha_mean_y, alpha_mean_z, alpha_std, freq_mult
-       Read(*,*)  Vbs_max, x_bs, sigma_bs, phi_bs, freq_mult
-       
-       Read(*,*) dummy_line
-       Read(*,*) nsteps, nsave, nstats, nstats_zmodes, nmonitor
-
-       Read(*,*) dummy_line
-       Read(*,*) file_blasius
-
-       Read(*,*) dummy_line
-       Read(*,*) inflow_boundary_flag
-
-       Read(*,*) dummy_line
-       Read(*,*) top_boundary_flag
-
-       Read(*,*) dummy_line
-       Read(*,*) file_blasius_own
-
-       Read(*,*) dummy_line
-       Read(*,*) file_temporal_inlet
-       
-       Read(*,*) dummy_line
-       Read(*,*) filein
-       
-       Read(*,*) dummy_line
-       Read(*,*) fileout
-
-       Read(*,*) dummy_line
-       Read(*,*) nstep_init
-
-       Read(*,*) dummy_line
-       Read(*,*) random_init
-
-       Read(*,*) dummy_line
-       Read(*,*) Rossby_plus
-
-       Read(*,*) dummy_line
-       Read(*,*) itime_step
-
-       Read(*,*) dummy_line
-       Read(*,*) Dirichlet_nu_t
-
-       Read(*,*) dummy_line
-       Read(*,*) i_rescale, delta_inlet, T_resc
-
-       Read(*,*) dummy_line
-       Read(*,*) istress_model
-
-       Read(*,*) dummy_line
-       Read(*,*) Amplitude_perturbations
-
-       Read(*,*) dummy_line
-       Read(*,*) beta_hartree
-
-       Read(*,*) dummy_line
-       Read(*,*) Lx_rand, Ly_rand, Lz_rand, alpha_rand
+       !Read(*,*) dummy_line
+       !Read(*,*) beta_hartree
 
        ! reference utau
        utau_   = dPdx**0.5d0

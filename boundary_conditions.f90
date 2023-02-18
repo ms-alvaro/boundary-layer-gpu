@@ -1194,10 +1194,10 @@ Contains
        If ( myid==0 ) Then 
           Write(*,*) 'Reading Turbulent profile for inlet from file'       
           ! read blasius solution
-          Open(5,file=file_blasius_own,form='unformatted',action='read',access='stream')
+          Open(5,file=file_inflow,form='unformatted',action='read',access='stream')
           Read(5) ny_profile
           If (ny_profile/=ny_global ) Then
-             Write(*,*) 'file_blasius_own',file_blasius_own
+             Write(*,*) 'file_blasius_own',file_inflow
              Write(*,*)  'Profile doesnt match dimensions', ny_profile, ny_global
              Stop
           End If
@@ -1264,7 +1264,7 @@ Contains
     If ( myid==0 ) Then
        
        ! read self-similar blasius solution       
-       Open(4,file=file_blasius,form='formatted',action='read')
+       Open(4,file=file_inflow,form='formatted',action='read')
        Read(4,*) n_source
        Allocate(eta_source(n_source))
        Allocate(  f_source(n_source))
@@ -1339,10 +1339,10 @@ Contains
           If (inflow_boundary_flag==2) Write(*,*) 'Reading Blasius for inlet from file'
 
           ! read blasius solution       
-          Open(5,file=file_blasius_own,form='unformatted',action='read',access='stream')
+          Open(5,file=file_inflow,form='unformatted',action='read',access='stream')
           Read(5) ny_blasius
           If (ny_blasius/=ny_global ) Then 
-             Write(*,*) 'file_blasius_own',file_blasius_own
+             Write(*,*) 'file_blasius_own',file_inflow
              Write(*,*)  'Blasius doesnt match dimensions', ny_blasius, ny_global
              Stop
           End If

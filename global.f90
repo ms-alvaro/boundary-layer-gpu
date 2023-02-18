@@ -220,7 +220,7 @@ Module global
 
   ! Blasius boundary layer for boundary conditions
   ! input file
-  Character(200) :: file_blasius, file_blasius_own, file_temporal_inlet
+  Character(200) :: file_inflow, file_temporal_inlet
   Integer(Int32) :: ny_inlet, n_modes_inlet, m_modes_inlet
   Real   (Int64) :: beta_inlet, omega_inlet
   Real   (Int64), Allocatable, Dimension(:)     :: ymesh_inlet, zmode_inlet, tmode_inlet

@@ -7,7 +7,7 @@ SHELL:=/bin/bash
 export F_UFMTENDIAN=big
 
 ## name of the executable file
-EXE = boundary_layer_0.8
+EXE = boundary_layer_0.9
 ## source code path
 SRC = pwd
 
@@ -56,7 +56,7 @@ OBJECTS = $(OBJ)/mpi.o $(OBJ)/global.o $(OBJ)/Newton_solver.o $(OBJ)/interpolati
 	$(OBJ)/pressure.o $(OBJ)/input_output.o $(OBJ)/fftz.o $(OBJ)/statistics.o \
 	$(OBJ)/initialization.o $(OBJ)/subgrid.o $(OBJ)/wallmodel.o $(OBJ)/finalization.o \
 	$(OBJ)/projection.o $(OBJ)/time_integration.o \
-	$(OBJ)/monitor.o $(OBJ)/main.o
+	$(OBJ)/params.o $(OBJ)/miscel.o $(OBJ)/monitor.o $(OBJ)/main.o
 
 #################################################### compile 
 $(OBJ)/%.o: $(PREBUILD)/%.f90

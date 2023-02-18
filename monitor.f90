@@ -202,13 +202,13 @@ Contains
        Write(*,*) 'Inflow parameters: '
        If    ( inflow_boundary_flag == 1 ) Then
           Write(*,*) '     Blasius profile + temporal perturbations'
-          Write(*,*) '     Blasius  file  : ', Trim(file_blasius)
+          Write(*,*) '     Blasius  file  : ', Trim(file_inflow)
           Write(*,*) '     temporal file  : ', Trim(file_temporal_inlet)
           Write(*,*) '     beta           : ',  beta_inlet
           Write(*,*) '     omega          : ', omega_inlet
        Elseif ( inflow_boundary_flag == 2 ) Then
           Write(*,*) '     Blasius profile from file + temporal perturbations'
-          Write(*,*) '     Blasius  file2 : ', Trim(file_blasius_own)
+          Write(*,*) '     Blasius  file2 : ', Trim(file_inflow)
           Write(*,*) '     temporal file  : ', Trim(file_temporal_inlet)
           Write(*,*) '     beta           : ',  beta_inlet
           Write(*,*) '     omega          : ', omega_inlet
@@ -224,7 +224,7 @@ Contains
           Write(*,*) '     plus random perturbations of amplitude: ', Amplitude_perturbations
        Elseif ( inflow_boundary_flag == 5 ) Then 
           Write(*,*) '     Lund fixed mean and rescaled fluctuations'
-          Write(*,*) '     turbulent mean inflow file : ',Trim(file_blasius_own)
+          Write(*,*) '     turbulent mean inflow file : ',Trim(file_inflow)
           Write(*,*) '     rescaling plane index:     : ',i_rescale
           !Write(*,*) '     delta 99 at inlet:         : ',delta_inlet
           !Write(*,*) '     time for averaging:        : ',T_resc
