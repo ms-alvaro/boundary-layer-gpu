@@ -1,0 +1,124 @@
+! This is a template file to specify the input parameters of the code
+! NOTE: you can add all comments you want, they must be followed by a "!" symbol.
+! comments can be added after variables declaration
+!
+! Mandatory arguments are designated with (*) 
+
+! Define the number of points in the domain (nx_global, ny_global, nz_global)
+nxyz = 1142 180 34 ! (*)
+! Define CFL number or time step (if negative)
+CFL = -1e-4 ! (*)
+
+nu = 4.436253367443143e-06 ! (*) viscosity of the flow
+
+! Time integration scheme 
+!   1 -> Euler, 
+!   2 -> RK2 
+!   3 -> RK3
+RKscheme = 2 ! (*)
+
+! Define subgrid scale model LES model 
+!   0 -> no model 
+!   1 -> constant smagorinsky 
+!   2 -> DSM
+LES = 0 ! (*)
+
+! Define the wall model
+!   0 -> no model 
+!   1 -> momentum 
+!   2 -> Bose 
+!   3 -> fitting 
+!   4 -> momentum wall 
+!   5 -> constant alpha 
+!   6 -> log 
+!   7 -> momentum wall dyn 
+!   8 -> log-f
+!   9 -> ?????
+WM = 0 ! (*)
+
+! Additional arguments IF WM is 9
+! for wall model 9: 0->fixed viscous fraction, 2->dynamic viscous fraction and viscous fraction
+!WMnutflag = 0 -> fixed viscous fraction / 2 -> dynamic viscous fraction 
+!WMnut = 0.05 -> dynamic viscous fraction (float number)
+
+! Pressure gradients dPdx, dPdz
+dPdx = 0.0 ! (*)
+dPdz = 0.0 ! (*)
+
+! Boundary condition for the top wall 
+!   0 -> Falkner-Skan, 
+!   1 -> Abe2017
+!   2 -> Coleman2018
+top_flag = 1 ! (*)
+
+! If top_flag is 1 or 2 we have to define additional inputs. Their definition 
+! can be found in eq (2.1) of Coleman et al 2018, JFM vol 847 pp 28-70 / or in
+! eq (2.1) in Abe 2017, JFM vol 833, pp 563-598.
+Vmax = 0.3 ! maximum vertical velocity
+x0 = 0     ! xc in Abe, streamwise position at which we pass from blowing to suction.
+           ! Recall that the domain starts at x = 1 !!!
+sigma = .3 ! std of the gaussian shape (sigma in the eqs)
+phi = .003 ! This is phi_top in coleman2018 and psi in abe2017
+
+! Define the number of steps to run, save, etc...
+nsteps   = 1000000  ! (*) total steps for simulation
+nsave    = 100000   ! (*) save a flow field
+nstats   = 10000    ! (*) save a file with statistics
+nmonitor = 1000     ! (*) info in the output file
+
+! Start simulation from a random field
+!   0 -> No, we need to specify a input file
+!   1 -> Yes, a random initial condition is generated
+! NOTE: if init_rand is not given, a value 0 is assigned
+init_rand = 0 ! (*)
+
+! If init_rand = 1 -> we must specify an input file:
+filein = ../BL.00070000
+! IMPORTANT: strings cannot have quotes!!
+!   filein = ../BL.00070000    OK
+!   filein = '../BL.00070000'  ERROR
+
+! If init_rand = 0 -> we must specify the fluid domain:
+! Lx, Ly, Lz, stret_factor (in y direction)
+boxsize = 6.283185307179586 2.0 3.141592653589793 1d0
+! NOTE: if stret_factor = 1d0 -> uniform mesh in y direction
+
+init_step = 10 ! first number for output flow field (default is 0)
+
+! Prefix name for the output flow field file
+fileout = ../BLnew ! (*)
+
+
+! Inflow bounday condition 
+!   1 -> generate Blasius, 
+!   2 -> Read from file, 
+!   3 -> Lund's rescaling, 
+!   4 -> Blasius+random, 
+!   5 -> Lund's rescaling fluctuations
+inflow_flag = 5 ! (*)
+
+! In case inflow_flag > 1, we have to specify the inflow:
+inflow_file = Mean_profile_Retheta1100_ny180_Ly0.4.dat
+! inflow: time dependent component
+timeinflow_file = **TO DO**
+
+! if inflow_flag is 3 or 5:
+Lund_ix = 129           ! streamwise plane for re-scaling ( grid index )
+Lund_deltai = 3.0E-002  ! delta at the inlet
+Lund_T = 0.5            ! rescaling time
+
+! BC for eddy vicosity: 
+!   0 -> Neumann
+!   1 -> Dirichlet, 
+nutBC = 1 !(*)
+
+! Model to compute wall stress: 
+!   0 -> use utau_ref, 
+!   1 -> law-of-the-wall
+TauwModel = 0
+
+**TO DO**
+!! Amplitude for random inflow perturbations
+! 0
+!! Hartree parameter for Falkner-Skan
+! 0

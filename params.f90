@@ -144,7 +144,7 @@
       call get_str('fileout'      , fileout,     200, f)
 
       call get_dbl('dPdx'         , dPdx            , f)
-      call get_dbl('dPdy'         , dPdy            , f)
+      call get_dbl('dPdz'         , dPdz            , f)
 
       !call get_str('LES'          , LES_model_str   ,f)
       call get_int('LES'          , LES_model       , f)
