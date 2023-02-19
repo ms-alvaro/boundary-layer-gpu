@@ -135,7 +135,7 @@
 
       call get_int('Lund_ix'      , i_rescale       , f)
       call get_int('Lund_deltai'  , delta_inlet     , f)
-      call get_int('Lund_T'       , T_resc          , f)
+      call get_dbl('Lund_T'       , T_resc          , f)
 
 
       call get_dbl('dPdx'         , dPdx            , f)

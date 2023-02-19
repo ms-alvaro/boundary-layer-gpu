@@ -391,7 +391,6 @@ Contains
 
     ! Sanity check
     If ( Any( Isnan(U) ) ) Stop 'Error U NaNs!'
-    write (*,*) 'no nans here'
     If ( Any( Isnan(V) ) ) Stop 'Error V NaNs!'
     If ( Any( Isnan(W) ) ) Stop 'Error W NaNs!'
     

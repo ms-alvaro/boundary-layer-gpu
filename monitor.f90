@@ -233,7 +233,9 @@ Contains
        Write(*,*) ' '
        Write(*,*) 'Top bc parameters: '
        If ( top_boundary_flag == 1 ) Then
-          Write(*,*) '    Blasius velocity'
+          Write(*,*) '    Coleman 2018'
+       Elseif ( top_boundary_flag == 2 ) Then
+          Write(*,*) '    Abe 2017'
        Else
           Write(*,*) '    Falkner-Skan velocity with beta: ', beta_hartree
           Write(*,*) '    assuming Uinf==1 and x_origin==-1'
