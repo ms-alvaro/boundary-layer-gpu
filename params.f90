@@ -82,34 +82,32 @@
 
       implicit none
 
-      logical :: f
+      logical :: f, f1
       integer :: bl, fl
       integer :: i
       character(len=32) :: arg
-
-      ! blank strings
-      call blank(paramsfilename, baselength)
-      call blank(filein        , baselength)
-      call blank(fileout       , baselength)
-
 
       bl = baselength
       fl = filelength
 
       ! read name of parameters file 
       f = .FALSE. ! init flag
-      do i = 1, command_argument_count()
-          call get_command_argument(i, arg)
-          select case (arg)
-              case ('-i')
-                  call get_command_argument(i+1,paramsfilename)
-                  f = .TRUE. ! input_file found 
-          end select
+      i = 0
+      do
+        call get_command_argument(i, arg)
+        if (len_trim(arg) == 0) exit
+
+        select case (arg)
+            case ('-i')
+                call get_command_argument(i+1,paramsfilename)
+                f = .true. ! input_file found 
+            end select
+        i = i+1
       end do
       if (f.eq..FALSE.) then
           stop 'No input file provided. Use *.exe -i <input_file>'
       endif
-      
+
       call get_dbl('nu'           , nu              , f)
       call get_dbl('CFL'          , CFL             , f)
 
@@ -134,14 +132,11 @@
           stop ' ERROR: you must specify a BL profile in inflow_file '
       endif
 
-      call get_str('timeinflow_file' , file_temporal_inlet, 200, f)
 
       call get_int('Lund_ix'      , i_rescale       , f)
       call get_int('Lund_deltai'  , delta_inlet     , f)
       call get_int('Lund_T'       , T_resc          , f)
 
-      call get_str('filein'       , filein,      200, f)
-      call get_str('fileout'      , fileout,     200, f)
 
       call get_dbl('dPdx'         , dPdx            , f)
       call get_dbl('dPdz'         , dPdz            , f)
@@ -156,8 +151,15 @@
       call get_int('WMnutflag'    , iwall_model_nut,  f)
       call get_int('WMnut'        , frac_vis_wall_model,  f)
 
-      call get_int('init_step'       , nstep_init   , f)
-      call get_int('init_rand'       , random_init  , f)
+      call get_int('init_step'    , nstep_init   , f)
+      call get_int('init_rand'    , random_init  , f)
+      call get_str('filein'       , filein,      200, f1)
+      if ( (random_init.eq.1) .and. (f1.eq..TRUE.) ) then
+          stop ' ERROR: init_rand = 1, but a filein has also been specified'
+      endif
+        
+      call get_str('fileout'      , fileout,     200, f)
+      call get_str('timeinflow_file' , file_temporal_inlet, 200, f)
     
       call get_int('RKscheme'        , itime_step   , f)        
 

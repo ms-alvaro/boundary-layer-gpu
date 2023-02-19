@@ -24,6 +24,12 @@ Contains
     Character(200) :: dummy_line
     Real(Int64)    :: Rossby_plus, utau_
 
+    ! initialize default variables
+    nstep_init = 0
+    Rossby_plus = 0d0
+    Amplitude_perturbations = 0d0
+    beta_hartree = 0d0
+
     ! processor 0 reads the data
     If ( myid==0 ) Then
        call initparams()
@@ -385,6 +391,7 @@ Contains
 
     ! Sanity check
     If ( Any( Isnan(U) ) ) Stop 'Error U NaNs!'
+    write (*,*) 'no nans here'
     If ( Any( Isnan(V) ) ) Stop 'Error V NaNs!'
     If ( Any( Isnan(W) ) ) Stop 'Error W NaNs!'
     

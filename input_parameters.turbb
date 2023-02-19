@@ -47,8 +47,8 @@ dPdz = 0.0 ! (*)
 
 ! Boundary condition for the top wall 
 !   0 -> Falkner-Skan, 
-!   1 -> Abe2017
-!   2 -> Coleman2018
+!   1 -> Coleman2018
+!   2 -> Abe2017
 top_flag = 1 ! (*)
 
 ! If top_flag is 1 or 2 we have to define additional inputs. Their definition 
@@ -72,7 +72,7 @@ nmonitor = 1000     ! (*) info in the output file
 ! NOTE: if init_rand is not given, a value 0 is assigned
 init_rand = 0 ! (*)
 
-! If init_rand = 1 -> we must specify an input file:
+! If init_rand = 0 -> we must specify an input file:
 filein = ../BL.00070000
 ! IMPORTANT: strings cannot have quotes!!
 !   filein = ../BL.00070000    OK
