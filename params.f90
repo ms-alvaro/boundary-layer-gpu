@@ -53,7 +53,7 @@
       !!
       module params
 
-      use global, only : Int32
+      use global, only : Int32, Int64
 
       integer, parameter:: IO_TMP = 10 !< temporal file unit 
 
@@ -65,11 +65,11 @@
 
       character(baselength) paramsfilename !< File with the name of the parameters file
 
-      integer nxyz(ndim)       !< number of grid points in x, y, z
-      integer boxsize(ndim+1)  !< Length of domain and stretching in y-dir
-                               !< [Lx Ly Lz alpha]
-      integer alphas(ndim+3)   !< alpha_mean_[xyz] + std and freq_mult
-                               !< slip lenghts for robin
+      integer nxyz(ndim)            !< number of grid points in x, y, z
+      real(int64)  boxsize(ndim+1)  !< Length of domain and stretching in y-dir
+                                    !< [Lx Ly Lz alpha]
+      real(int64) alphas(ndim+3)    !< alpha_mean_[xyz] + std and freq_mult
+                                    !< slip lenghts for robin
       endmodule params
 
       !~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -134,7 +134,7 @@
 
 
       call get_int('Lund_ix'      , i_rescale       , f)
-      call get_int('Lund_deltai'  , delta_inlet     , f)
+      call get_dbl('Lund_deltai'  , delta_inlet     , f)
       call get_dbl('Lund_T'       , T_resc          , f)
 
 
