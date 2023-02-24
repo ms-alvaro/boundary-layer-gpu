@@ -78,7 +78,7 @@ filein = ../BL.00070000
 !   filein = ../BL.00070000    OK
 !   filein = '../BL.00070000'  ERROR
 
-! If init_rand = 0 -> we must specify the fluid domain:
+! If init_rand = 1 -> we must specify the fluid domain:
 ! Lx, Ly, Lz, stret_factor (in y direction)
 boxsize = 6.283185307179586 2.0 3.141592653589793 1d0
 ! NOTE: if stret_factor = 1d0 -> uniform mesh in y direction
