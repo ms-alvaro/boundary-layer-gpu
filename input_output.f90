@@ -51,6 +51,8 @@ Contains
        ! nominal rotation
        Omega_z = Rossby_plus*utau_/2d0
        
+        ! multiply velocity by sqrt(2)
+        Vbs_max = sqrt( 2d0 ) * Vbs_max  
     End If
 
     ! broadcast data to all processors

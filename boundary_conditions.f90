@@ -61,6 +61,8 @@ Contains
        Call apply_top_bc_y(U,W) 
        ! V boundary condition at the top    
        Call apply_Dirichlet_bc_y_top_BlowingSuction(V,top_boundary_flag)
+       ! Impose zero vorticity
+       Call zero_wz_top(U,V)
     Else
        Call apply_top_bc_y_Falkner_Skan(U,V,W) 
     End If
@@ -116,7 +118,18 @@ Contains
     Call apply_global_mass_conservation(U,V,W)
 
   End Subroutine apply_boundary_conditions
-  
+ 
+  Subroutine zero_wz_top( U_, V_ )
+     Real(Int64), Dimension(:,:,:), Intent(InOut) :: U_, V_
+     Integer(Int32) :: i
+     Real(Int64) :: dy
+
+     dy = yg(nyg) - yg(nyg-1)
+     Do i=2,nxg-1 ! start in 2, because we want to impose Utop at the first point
+        U_(i,nyg,:) = (dy/dx)*( V_(i+1,ny,:) - V_(i,ny,:)) + U_(i,nyg-1,:)
+     End Do
+
+  end Subroutine zero_wz_top
   !-------------------------------------------------!
   !                Periodicity in x                 !
   !          No MPI communication required          !
@@ -467,7 +480,11 @@ Contains
     Integer(Int32), Intent(In)    :: id
 
     Integer(Int32) :: i
-
+    
+    ! IMPORTANT!!!
+    ! Vbs_max is already multiplied by sqrt( 2 ) in read_input_parameters
+    !
+    
     If ( id==1 ) Then ! Coleman 2018
        ! F defined at y faces
        Do i=1,nxg
