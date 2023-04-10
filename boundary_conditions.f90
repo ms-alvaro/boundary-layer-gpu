@@ -58,11 +58,11 @@ Contains
     ! apply velocity boundary conditions at the top
     If ( top_boundary_flag.ne.0 ) Then
        ! U and W boundary condition at the top           
-       Call apply_top_bc_y(U,W) 
+       !Call apply_top_bc_y(U,W) 
        ! V boundary condition at the top    
        Call apply_Dirichlet_bc_y_top_BlowingSuction(V,top_boundary_flag)
-       ! Impose zero vorticity
-       Call zero_wz_top(U,V)
+       ! Impose zero vorticity and dw/dy = 0
+       Call zero_wz_top(U,V,W)
     Else
        Call apply_top_bc_y_Falkner_Skan(U,V,W) 
     End If
@@ -119,17 +119,20 @@ Contains
 
   End Subroutine apply_boundary_conditions
  
-  Subroutine zero_wz_top( U_, V_ )
-     Real(Int64), Dimension(:,:,:), Intent(InOut) :: U_, V_
+  Subroutine zero_wz_top( U_, V_, W_ )
+     Real(Int64), Dimension(:,:,:), Intent(InOut) :: U_, W_
+     Real(Int64), Dimension(:,:,:), Intent(In) :: V_
      Integer(Int32) :: i
      Real(Int64) :: dy
 
      dy = yg(nyg) - yg(nyg-1)
-     Do i=2,nxg-1 ! start in 2, because we want to impose Utop at the first point
+     Do i=1,nxg-1 
         U_(i,nyg,:) = (dy/dx)*( V_(i+1,ny,:) - V_(i,ny,:)) + U_(i,nyg-1,:)
      End Do
+     W_(:,nyg,:) = W_(:,nyg-1,:)
 
   end Subroutine zero_wz_top
+
   !-------------------------------------------------!
   !                Periodicity in x                 !
   !          No MPI communication required          !
