@@ -596,6 +596,9 @@ Contains
        my_format = '('//Trim(Adjustl(ext_nx))//'F15.8)'
        Write(3,my_format) Cf
 
+       my_format = '('//Trim(Adjustl(ext_nx))//'F15.8)'
+       Write(3,my_format) x
+
        my_format = '('//Trim(Adjustl(ext_ny))//'F15.8)'
        Write(3,my_format) y
 

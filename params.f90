@@ -79,17 +79,18 @@
 
       use params
       use global
+      use ifport, only : MAKEDIRQQ
 
       implicit none
 
       logical :: f, f1
       integer :: bl, fl
-      integer :: i
+      integer :: i, Nout
       character(len=32) :: arg
 
       bl = baselength
       fl = filelength
-
+      write(*,*) 'hello 3'
       ! read name of parameters file 
       f = .FALSE. ! init flag
       i = 0
@@ -159,6 +160,26 @@
       endif
         
       call get_str('fileout'      , fileout,     200, f)
+        
+      ! Create a folder for the parent directory of the file if it does not exist
+      Nout = len(trim(adjustl(fileout))) ! len of fileout string
+
+      i = Nout
+      f = .false.
+      do while (f.eqv..false.)
+         if (fileout(i:i).eq.'/') then
+             f = .true.
+         endif
+         i = i - 1
+      end do
+        
+      write(*,*) fileout, Nout, fileout(1:i)
+
+      inquire( FILE=trim( adjustl( fileout(1:i) ) ), EXIST=f1 )
+      if (f1.eqv..false.) then
+          f = MAKEDIRQQ ( trim( adjustl( fileout(1:i) ) ) )    
+      endif
+    
       call get_str('timeinflow_file' , file_temporal_inlet, 200, f)
     
       call get_int('RKscheme'        , itime_step   , f)        
