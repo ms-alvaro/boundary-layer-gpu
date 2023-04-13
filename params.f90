@@ -90,7 +90,7 @@
 
       bl = baselength
       fl = filelength
-      write(*,*) 'hello 3'
+
       ! read name of parameters file 
       f = .FALSE. ! init flag
       i = 0
@@ -107,6 +107,12 @@
       end do
       if (f.eq..FALSE.) then
           stop 'No input file provided. Use *.exe -i <input_file>'
+      endif
+
+      INQUIRE(FILE= paramsfilename, EXIST= f )
+      if ( f.eq..false. ) then
+          write(*,*) 'input file: ', adjustl(trim(paramsfilename)), ' does not exist'
+          stop
       endif
 
       call get_dbl('nu'           , nu              , f)
