@@ -124,15 +124,8 @@ Contains
     Vmean_resc  = Vmean_resc /Real(nzg_global-2,8)
     Umean_inlet = Umean_inlet/Real(nzg_global-2,8)
     Vmean_inlet = Vmean_inlet/Real(nzg_global-2,8)
-    
-    ! garranz: this may be the problem when we change the BC
-    !Uinf = Umean_resc(nyg,1)
-    
-    ! Let us change pick a lower point (this does not work, either)
-    Uinf = Umean_resc(nyg-3,1)
-    
-    ! Let us fix it to 1
-    !Uinf = 1d0
+
+    Uinf = Umean_resc(nyg,1)
 
     ! time average
     ! NOTE: should be changed to read from file

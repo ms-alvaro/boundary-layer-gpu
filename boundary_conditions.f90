@@ -121,7 +121,7 @@ Contains
  
   Subroutine zero_wz_top( U_, V_, W_ )
      Real(Int64), Dimension(:,:,:), Intent(InOut) :: U_, W_
-     Real(Int64), Dimension(:,:,:), Intent(In) :: V_
+     Real(Int64), Dimension(:,:,:), Intent(InOut) :: V_
      Integer(Int32) :: i
      Real(Int64) :: dy
 
@@ -130,6 +130,13 @@ Contains
         U_(i,nyg,:) = (dy/dx)*( V_(i+1,ny,:) - V_(i,ny,:) ) + U_(i,nyg-1,:)
      End Do
      W_(:,nyg,:) = W_(:,nyg-1,:)
+
+
+     Do i=1,i_rescale
+        U_(i,nyg,:) = U_top(i)
+        V_(i,nyg,:) = V_top(i)
+        W_(i,nyg,:) = W_top(i)
+     End Do
 
   end Subroutine zero_wz_top
 
