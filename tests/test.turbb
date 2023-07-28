@@ -1,0 +1,60 @@
+! Define the number of points in the domain (nx_global, ny_global, nz_global)
+nxyz = 1156 192 34 ! (*)
+! Define CFL number or time step (if negative)
+CFL = -1e-3 ! (*)
+
+nu = 2.2726e-06 ! (*) viscosity of the flow
+
+! Time integration scheme 
+RKscheme = 2 ! (*) RK2
+
+! Define subgrid scale model LES model 
+LES = 1 ! (*) cte smagorinsky
+
+! Define the wall model
+WM = 0 ! (*) no wall model
+
+! Pressure gradients dPdx, dPdz
+dPdx = 0.0 ! (*)
+dPdz = 0.0 ! (*)
+
+! Boundary condition for the top wall 
+top_flag = 1 ! (*) Coleman2018
+
+! Eq (2.1) of Coleman et al 2018, JFM vol 847 pp 28-70 / or in
+Vmax = 0.20 ! maximum vertical velocity
+x0 = 10.    ! xc in Abe, streamwise position at which we pass from blowing to suction.
+sigma = .6  ! std of the gaussian shape (sigma in the eqs)
+phi = .0034 ! This is phi_top in coleman2018 and psi in abe2017
+
+! Define the number of steps to run, save, etc...
+nsteps   = 5000000  ! (*) total steps for simulation
+nsave    = 10000    ! (*) save a flow field
+nstats   = 1000     ! (*) save a file with statistics
+nmonitor = 1000     ! (*) info in the output file
+
+! Start simulation from a random field
+init_rand = 0 ! yes
+filein =./Ly6_V2_s60_Lx11_xr200.00240000
+
+init_step = 0 ! first number for output flow field (default is 0)
+
+! Prefix name for the output flow field file
+fileout =./data/test
+
+! Inflow bounday condition 
+inflow_flag = 5 ! (*) -> Lund's rescaling fluctuations
+
+! In case inflow_flag > 1, we have to specify the inflow:
+inflow_file =./Mean_profile_Retheta1100_ny192_Ly0.60.dat
+
+Lund_ix = 200           ! streamwise plane for re-scaling ( grid index )
+Lund_deltai = 0.024998  ! delta at the inlet
+Lund_T = 0.5            ! rescaling time
+
+! BC for eddy vicosity: 
+nutBC = 1 !(*) -> Dirichlet BC 
+
+! Model to compute wall stress: 
+TauwModel = 0 !  0 -> use utau_ref, 
+
