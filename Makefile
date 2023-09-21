@@ -7,7 +7,7 @@ SHELL:=/bin/bash
 export F_UFMTENDIAN=big
 
 ## name of the executable file
-EXE = boundary_layer_1.0
+EXE = boundary_layer_1.1
 ## source code path
 SRC = pwd
 
