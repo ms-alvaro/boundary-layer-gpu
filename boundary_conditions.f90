@@ -365,7 +365,7 @@ Contains
     Real(Int64), Dimension(:,:,:), Intent(InOut) :: U_ , V_,  W_
 
     ! local variables
-    Integer(Int32) :: j, k
+    Integer(Int32) :: j, k, ks
 
     If ( step_beginning == 1 ) Then
 
@@ -376,17 +376,28 @@ Contains
        ! variables at centers 
        Do j=1,nyg
           Do k=1,nzg
+
+             ! swap indeces in the spanwise direction
+             ks = mod( k + 16, nzg) + 1
+
              U_(1,j,k) = U_inlet(j) + Ut_inlet(j,k)
           End Do
        End Do
        Do j=1,nyg
           Do k=1,nz
-             W_(1,j,k) = W_inlet(j) + Wt_inlet(j,k)
+             ! swap indeces in the spanwise direction
+             ks = mod( k + 16, nz ) + 1
+
+             W_(1,j,k) = W_inlet(j) + Wt_inlet(j,ks)
           End Do
        End Do
        ! variables at faces
        Do j=1,ny
           Do k=1,nzg
+
+             ! swap indeces in the spanwise direction
+             ks = mod( k + 16, nzg) + 1
+
              V_(1,j,k) = V_inlet(j) + Vt_inlet(j,k)
           End Do
        End Do
@@ -491,21 +502,18 @@ Contains
 
     Integer(Int32) :: i
     
-    ! IMPORTANT!!!
-    ! Vbs_max is already multiplied by sqrt( 2 ) in read_input_parameters
-    !
     
     If ( id==1 ) Then ! Coleman 2018
        ! F defined at y faces
        Do i=1,nxg
           ! Note that the minus sign is accounted in ( x_bs - x_g )
-          F(i,ny,:) = Vbs_max*(x_bs-xg(i))/sigma_bs*dexp(.5d0 - ((x_bs-xg(i))/sigma_bs)**2d0 ) &
+          F(i,ny,:) = sqrt(2d0)*Vbs_max*(x_bs-xg(i))/sigma_bs*dexp(.5d0 - ((x_bs-xg(i))/sigma_bs)**2d0 ) &
                       + phi_bs
        End Do     
     Elseif ( id==2 ) Then ! Abe 2017
        ! F defined at y faces
        Do i=1,nxg
-          F(i,ny,:) = Vbs_max*(x_bs-xg(i))/sigma_bs*dexp(phi_bs - ((x_bs-xg(i))/sigma_bs)**2d0 )
+          F(i,ny,:) = sqrt(2d0)*Vbs_max*(x_bs-xg(i))/sigma_bs*dexp(phi_bs - ((x_bs-xg(i))/sigma_bs)**2d0 )
        End Do     
     Else
        ! F defined at y centers
