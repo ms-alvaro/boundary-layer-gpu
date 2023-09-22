@@ -63,8 +63,8 @@ To set up a simulation, `BLseparation` needs and input file. A template of the
 input file can be found in [input_parameters.turbb](input_parameters.turbb). 
 You should copy this file and edit the local copy.
 
-NOTE: If `inflow_flag` > 1, a binary input file has to be specified 
-as `inflow_file`. For that, you can use [generate_inflow_file.py](python/generate_inflow_file.py).
+> NOTE: If `inflow_flag` > 1, a binary input file has to be specified 
+> as `inflow_file`. For that, you can use [generate_inflow_file.py](python/generate_inflow_file.py).
 
 
 ## Run a simulation
@@ -74,6 +74,14 @@ the simulation is launched as
 ```bash
 mpirun -np <np> ./boundary_layer_<version> -i <myinput_file>.turbb > output
 ```
-Where `<np>` is the number of processors.
+where `<np>` is the number of processors.
+
+
+## Post-processing
+
+After executing the code, `BLseparation` generates two different output files: the instantaneous
+flow field, and a `txt` file with statistics of the flow.
+
+Python scripts to post-process these files can be found in [tests/pyfiles](tests/pyfiles).
 
 

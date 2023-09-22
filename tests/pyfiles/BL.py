@@ -327,6 +327,7 @@ def velocity_profile(case : str, x : np.ndarray, vmax : float,
 
     return v
 
+
 class ymesh:
     '''
     @brief class to work with the mesh used by BL code in Fortran
@@ -395,48 +396,4 @@ class ymesh:
             @param y      closest value of the grid
         '''
         return self.getyfromj(self.getcontrolj(y))
-
-
-def returnInputArgs():
-    '''@brief return arguments parsed to script
-
-        Ly, Vmax, sigma, nprocs = returnInputArgs()
-
-    Returns:
-        @param  Ly      [double] height of domain
-        @param  Vmax    [double] maximum blowing/suction
-        @param  sigma   [double] width of blowing/suction
-        @param  nprocs  [int] number of procs we want to run the script
-    '''
-
-    # Create command-line argument parser
-    parser = argparse.ArgumentParser()
-    # Add optional arguments
-    parser.add_argument('--Ly'       , '-Ly', default = 0.6, type= np.double)
-    parser.add_argument('--Vmax'     , '-V' , default =  .4, type= np.double)
-    parser.add_argument('--sigma'    , '-s' , default = 0.6, type= np.double)
-    parser.add_argument('--Lx'       , '-Lx', default = 11., type= np.double)
-    parser.add_argument('--irecycle' , '-xr', default = 200, type= int      )
-    parser.add_argument('--nprocs'   , '-np', default =  10, type= int      )
-    # Parse arguments from terminal
-    args = parser.parse_args()
-
-    return args.Ly, args.Vmax, args.sigma, args.Lx, args.irecycle, args.nprocs
-
-
-
-def getbasenm( Ly, V, sigma, Lx, xr ): 
-    '''@brief return name of the simulation
-
-        basenm = returnInputArgs( L, V, sigma )
-
-    Parameters:
-        @param  Ly      [double] height of domain
-        @param  V       [double] maximum blowing/suction
-        @param  sigma   [double] width of blowing/suction
-
-    Returns:
-        @param  basenm  [str] name of the simulation
-    '''
-    return f'Ly{int(Ly*10)}_V{int(V*10)}_s{int(sigma*100)}_Lx{int(Lx)}_xr{xr}'
 
