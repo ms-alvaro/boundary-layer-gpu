@@ -48,8 +48,8 @@ and `mpiifort` are available commands, follow these steps:
     make debug
     ```
 
-    NOTE: If you are in supercloud, intel compilers can be loaded as:
-    ```bash
-    module load intel-oneapi/2023.1
-    ```
+> NOTE: If you are in supercloud, intel compilers can be loaded as:
+> ```bash
+> module load intel-oneapi/2023.1
+> ```
 
