@@ -26,10 +26,11 @@ compilers `ifort` and `mpiifort` [intel oneAPI](https://www.intel.com/content/ww
 
 
 ## Compilation
-Provided that the `build` folder of fftw is found in `<path-to_fftw>` and that `ifort`
+
+Provided that FFTW is installed under `<path-to_fftw>` and that `ifort`
 and `mpiifort` are available commands, follow these steps:
 
-1. Add the include and lib paths of your local installation of fftw to your `~/.bashrc`:
+1. Add the include and lib paths of your local installation of FFTW to your `~/.bashrc`:
     ```bash
     export FFTW_INCLUDE_DIR=<path-to-fftw>/include
     export FFTW_LIBRARY_DIR=<path-to-fftw>/lib
@@ -48,8 +49,31 @@ and `mpiifort` are available commands, follow these steps:
     make debug
     ```
 
-> NOTE: If you are in supercloud, intel compilers can be loaded as:
+These steps will generate an executable file `boundary_layer_<version>`
+in `<path>/<name>` directory.
+
+> NOTE: If you are in supercloud.mit.edu, intel compilers can be loaded as:
 > ```bash
 > module load intel-oneapi/2023.1
 > ```
+
+## Setting-up a simulation
+
+To set up a simulation, `BLseparation` needs and input file. A template of the
+input file can be found in [input_parameters.turbb](input_parameters.turbb). 
+You should copy this file and edit the local copy.
+
+NOTE: If `inflow_flag` > 1, a binary input file has to be specified 
+as `inflow_file`. For that, you can use [generate_inflow_file.py](python/generate_inflow_file.py).
+
+
+## Run a simulation
+
+Once you have defined your input file, `<myinput_file>.turbb`, 
+the simulation is launched as
+```bash
+mpirun -np <np> ./boundary_layer_<version> -i <myinput_file>.turbb > output
+```
+Where `<np>` is the number of processors.
+
 
