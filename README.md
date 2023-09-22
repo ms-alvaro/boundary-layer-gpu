@@ -49,6 +49,19 @@ and `mpiifort` are available commands, follow these steps:
     make debug
     ```
 
+### Advanced compilation
+
+In case you want to make some modification to the source code. A clean way to 
+do it is by creating and empty directory (`my_modifications` in this example)
+elsewhere.
+
+Then, copy [Makefile](Makefile) into `my_modifications` and edit the line
+```Makefile
+SRC = pwd
+```
+replacing `pwd` by `<path>/<name>`
+
+
 These steps will generate an executable file `boundary_layer_<version>`
 in `<path>/<name>` directory.
 
