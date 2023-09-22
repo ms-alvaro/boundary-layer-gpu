@@ -22,7 +22,7 @@ dPdz = 0.0 ! (*)
 top_flag = 1 ! (*) Coleman2018
 
 ! Eq (2.1) of Coleman et al 2018, JFM vol 847 pp 28-70 / or in
-Vmax = 0.20 ! maximum vertical velocity
+Vmax = 0.40 ! maximum vertical velocity
 x0 = 10.    ! xc in Abe, streamwise position at which we pass from blowing to suction.
 sigma = .6  ! std of the gaussian shape (sigma in the eqs)
 phi = .0034 ! This is phi_top in coleman2018 and psi in abe2017
@@ -30,17 +30,17 @@ phi = .0034 ! This is phi_top in coleman2018 and psi in abe2017
 ! Define the number of steps to run, save, etc...
 nsteps   = 5000000  ! (*) total steps for simulation
 nsave    = 10000    ! (*) save a flow field
-nstats   = 1000     ! (*) save a file with statistics
-nmonitor = 1000     ! (*) info in the output file
+nstats   = 5000     ! (*) save a file with statistics
+nmonitor = 100      ! (*) info in the output file
 
 ! Start simulation from a random field
 init_rand = 0 ! yes
-filein =./Ly6_V2_s60_Lx11_xr200.00240000
+filein =./data/test_swap.00500000
 
-init_step = 0 ! first number for output flow field (default is 0)
+init_step = 500000 ! first number for output flow field (default is 0)
 
 ! Prefix name for the output flow field file
-fileout =./data/test
+fileout =./data/test_swap
 
 ! Inflow bounday condition 
 inflow_flag = 5 ! (*) -> Lund's rescaling fluctuations

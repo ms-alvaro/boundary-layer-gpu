@@ -5,8 +5,8 @@ from NGlib import post as ngpost
 import matplotlib.pyplot as plt
 
 datapath = Path( '../data' )
-nf_flow  = ngpost.NumberedFile( datapath, 'test', ext = None )
-nf_stats = ngpost.NumberedFile( datapath, 'test', ext = 'stats.txt' )
+nf_flow  = ngpost.NumberedFile( datapath, 'test_swap', ext = None )
+nf_stats = ngpost.NumberedFile( datapath, 'test_swap', ext = 'stats.txt' )
 
 ifrl_f = nf_flow.getifrl()
 ifrl_s = nf_stats.getifrl()
@@ -17,8 +17,8 @@ print( W.mean() )
 
 case_stats = BL.stats( nf_stats )
 
-cols = plt.get_cmap('Reds')(np.linspace(.2,1.,len(ifrl_s[::10])))
-for k_, ifr in enumerate(ifrl_s[::10]):
+cols = plt.get_cmap('Reds')(np.linspace(.2,1.,len(ifrl_s[::1])))
+for k_, ifr in enumerate(ifrl_s[::1]):
 
     case_stats.updatedata( ifr )
     case_stats.getCf()
