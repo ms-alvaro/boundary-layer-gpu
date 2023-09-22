@@ -49,19 +49,6 @@ and `mpiifort` are available commands, follow these steps:
     make debug
     ```
 
-### Advanced compilation
-
-In case you want to make some modification to the source code. A clean way to 
-do it is by creating and empty directory (`my_modifications` in this example)
-elsewhere.
-
-Then, copy [Makefile](Makefile) into `my_modifications` and edit the line
-```Makefile
-SRC = pwd
-```
-replacing `pwd` by `<path>/<name>`
-
-
 These steps will generate an executable file `boundary_layer_<version>`
 in `<path>/<name>` directory.
 
@@ -69,6 +56,36 @@ in `<path>/<name>` directory.
 > ```bash
 > module load intel-oneapi/2023.1
 > ```
+
+### Advanced compilation
+
+In case you want to make some modification to the source code, a clean way to 
+do it is:
+
+1. Create an empty directory (`my_modifications` in this example)
+elsewhere.
+Then, copy [Makefile](Makefile) into `my_modifications` and edit the line
+```Makefile
+SRC = pwd
+```
+replacing `pwd` by `<path>/<name>`
+
+2. Copy *only* file that you want to modify into `my_modifications` and 
+edit it as desired.
+
+3. Compile the code as usual inside `my_modifications` by running
+    ```bash
+    make
+    ```
+    or
+    ```bash
+    make debug
+    ```
+
+In this way, you do not modify the original files, and it is easy to
+keep track of the files that you have modified with respect to the
+original version.
+
 
 ## Setting-up a simulation
 
