@@ -64,7 +64,7 @@ input file can be found in [input_parameters.turbb](input_parameters.turbb).
 You should copy this file and edit the local copy.
 
 > NOTE: If `inflow_flag` > 1, a binary input file has to be specified 
-> as `inflow_file`. For that, you can use [generate_inflow_file.py](python/generate_inflow_file.py).
+> as `inflow_file`. For that, you can use [generate_inflow_file.py](pyfiles/generate_inflow_file.py).
 
 
 ## Run a simulation
