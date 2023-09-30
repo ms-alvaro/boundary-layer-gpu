@@ -35,7 +35,7 @@ Module global
 
   ! steps
   Integer(Int32) :: nsteps, nstep_init
-  Real   (Int64) :: dt, t, dt_period
+  Real   (Int64) :: dt, t, dt_period, dt_min_cfl
 
   ! viscosity
   Real(Int64) :: nu
