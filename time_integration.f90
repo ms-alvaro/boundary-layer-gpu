@@ -306,6 +306,8 @@ Contains
     ! time step limiter
     dt_max = alpha_mean_z
     dt     = Min( dt, dt_max )
+    
+    dt_min_cfl = dt ! save min dt for monitor output
 
     ! use multiple of the TS period instead
     If ( CFL<0 ) Then

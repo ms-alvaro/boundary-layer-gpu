@@ -59,26 +59,27 @@ Contains
        ! processor 0 shows the results
        If ( myid==0 ) Then
 
-          Write(*,*) 'step number :', istep
-          Write(*,*) 'time        :', t
-          Write(*,*) 'time step   :', dt
-          
-          Write(*,*) ' '
-          Write(*,*) 'Mean Cf:    :', Sum(Cf)/Real(nx,8)
+          Write(*,*) 'step number  :', istep
+          Write(*,*) 'time         :', t
+          Write(*,*) 'time step    :', dt
+          if (CFL < 0)  Write(*,*) 'min time step:', dt_min_cfl
 
-          Write(*,*) ' '          
-          Write(*,*) 'Maximum U   :', maxU
-          Write(*,*) 'Maximum V   :', maxV
-          Write(*,*) 'Maximum W   :', maxW
+          Write(*,*) ' '
+          Write(*,*) 'Mean Cf:     :', Sum(Cf)/Real(nx,8)
+
+          Write(*,*) ' '           
+          Write(*,*) 'Maximum U    :', maxU
+          Write(*,*) 'Maximum V    :', maxV
+          Write(*,*) 'Maximum W    :', maxW
           
-          Write(*,*) 'Mean U      :', meanU/Real( nxm_global*nym_global*nzm_global, 8 )
-          Write(*,*) 'Mean V      :', meanV/Real( nxm_global*nym_global*nzm_global, 8 )
-          Write(*,*) 'Mean W      :', meanW/Real( nxm_global*nym_global*nzm_global, 8 )
+          Write(*,*) 'Mean U       :', meanU/Real( nxm_global*nym_global*nzm_global, 8 )
+          Write(*,*) 'Mean V       :', meanV/Real( nxm_global*nym_global*nzm_global, 8 )
+          Write(*,*) 'Mean W       :', meanW/Real( nxm_global*nym_global*nzm_global, 8 )
 
           If ( LES_model>0 ) Then
              Write(*,*) ' '
-             Write(*,*) "Maximum nu_t: ", maxNut
-             Write(*,*) "Average nu_t: ", meanNut/Real( nxm_global*nym_global*nzm_global, 8 )
+             Write(*,*) "Maximum nu_t : ", maxNut
+             Write(*,*) "Average nu_t : ", meanNut/Real( nxm_global*nym_global*nzm_global, 8 )
           End If
 
           Write(*,*) ' '
