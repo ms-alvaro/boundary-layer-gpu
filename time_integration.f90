@@ -268,8 +268,10 @@ Contains
     Real   (Int64) :: lUmax, lVmax, lWmax, dt_local
     Real   (Int64) :: dt_conv_u, dt_conv_v, dt_conv_w, dt_conv
     Real   (Int64) :: dt_vis_u, dt_vis_v, dt_vis_w, dt_vis
-    Real   (Int64) :: dt_max
-    
+    Real   (Int64) :: dt_max, CFLa
+   
+    CFLa = Abs( CFL )   ! absolute value of CFL ( for when CFL is dt )
+
     ! convective time step
     lUmax = 0d0
     lVmax = 0d0
@@ -284,16 +286,16 @@ Contains
        End Do
     End Do
     
-    dt_conv_u = CFL*lUmax 
-    dt_conv_v = CFL*lVmax
-    dt_conv_w = CFL*lWmax
+    dt_conv_u = CFLa*lUmax 
+    dt_conv_v = CFLa*lVmax
+    dt_conv_w = CFLa*lWmax
     
     dt_conv = Minval( (/dt_conv_u,dt_conv_v,dt_conv_w/) )
     
     ! viscous time step
-    dt_vis_u = CFL*dxmin**2d0/nu
-    dt_vis_v = CFL*dymin**2d0/nu
-    dt_vis_w = CFL*dzmin**2d0/nu
+    dt_vis_u = CFLa*dxmin**2d0/nu
+    dt_vis_v = CFLa*dymin**2d0/nu
+    dt_vis_w = CFLa*dzmin**2d0/nu
     
     dt_vis = Minval( (/dt_vis_u,dt_vis_v,dt_vis_w/) )
     
@@ -303,11 +305,12 @@ Contains
     ! compute global minimum and communicate results to all processors
     Call MPI_Allreduce(dt_local,dt,1,MPI_real8,MPI_min,MPI_COMM_WORLD,ierr)
 
+    ! NOTE garranz: remove alpha_mean_z since we are not using it!!!
     ! time step limiter
-    dt_max = alpha_mean_z
-    dt     = Min( dt, dt_max )
+    !dt_max = alpha_mean_z
+    !dt     = Min( dt, dt_max )
     
-    dt_min_cfl = dt ! save min dt for monitor output
+    dt_min_cfl = dt / CFLa ! save min dt for monitor output
 
     ! use multiple of the TS period instead
     If ( CFL<0 ) Then
