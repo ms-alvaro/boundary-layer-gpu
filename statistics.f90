@@ -68,8 +68,8 @@ Contains
              
              UVmean (ii,jj)   = Sum( term_1(ii,jj,2:nzg-1)*term_2(ii,jj,2:nzg-1) )
              
-             Pmean  (ii,jj)   = Sum( term (ii, jj, 2:nzg-1)      )
-             P2mean (ii,jj)   = Sum( term (ii, jj, 2:nzg-1)**2d0 )
+             Pmean  (ii,jj)   = Sum( P (ii, jj, 2:nzg-1)      )
+             P2mean (ii,jj)   = Sum( P (ii, jj, 2:nzg-1)**2d0 )
 
              nu_t_mean(ii,jj) = Sum( nu_t(ii, jj, 2:nzg-1) )
              
