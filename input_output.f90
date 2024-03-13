@@ -238,6 +238,12 @@ Contains
        ! mesh
        Read(1) nx_global_f
 
+       If ( nx_global.eq.-73) Then
+            write(*,*) 'Reading init step from file'
+            Read(1) nstep_init    
+            Read(1) nx_global_f     ! read the actual nx_global in file
+       EndIf
+
        If ( nx_global_f/=nx_global ) Stop 'nx_f/=nx'
        Read(1) x_global
        
@@ -406,7 +412,7 @@ Contains
   !--------------------------------------------!
   Subroutine output_data
 
-    Character(200)   :: fname, fileout_resc
+    Character(200)   :: fname, fileout_resc, fname_symlnk
     Character(8)     :: ext
     Integer  (Int32) :: iproc, nze, nzge
     
@@ -428,6 +434,7 @@ Contains
           
           ! metadata
           Write(1) t, nu
+          Write(1) -73, istep + nstep_init    ! magic number for compatibility with older versions
 
           ! mesh
           Write(1) Shape(x_global), x_global
@@ -553,6 +560,9 @@ Contains
        ! close file
        If (myid==0) Then
           Close(1)
+
+          fname_symlnk = Trim(Adjustl(fileout))//'.'//'restart'
+          call symlnk(  fname, fname_symlnk )
        End If
 
        ! save means for Lund's rescaling
