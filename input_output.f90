@@ -412,10 +412,13 @@ Contains
   !--------------------------------------------!
   Subroutine output_data
 
-    Character(200)   :: fname, fileout_resc, fname_symlnk
+    Character(200)   :: fname, fileout_resc
     Character(8)     :: ext
     Integer  (Int32) :: iproc, nze, nzge
     
+    integer(4) status_, system ! to create a softlink
+    Character(200)   :: string_link,fname_symlnk
+
     If ( Mod(istep,nsave)==0 ) then
 
        ! P
@@ -562,7 +565,9 @@ Contains
           Close(1)
 
           fname_symlnk = Trim(Adjustl(fileout))//'.'//'restart'
-          call symlnk(  fname, fname_symlnk )
+          string_link = 'ln -s '//Trim(fname)//' '//Trim(fname_symlnk)
+          status_ = system( string_link )
+
        End If
 
        ! save means for Lund's rescaling
