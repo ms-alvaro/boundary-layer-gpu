@@ -238,7 +238,7 @@ Contains
        ! mesh
        Read(1) nx_global_f
 
-       If ( nx_global.eq.-73) Then
+       If ( nx_global_f.eq.-73) Then
             write(*,*) 'Reading init step from file'
             Read(1) nstep_init    
             Read(1) nx_global_f     ! read the actual nx_global in file
@@ -417,7 +417,9 @@ Contains
     Integer  (Int32) :: iproc, nze, nzge
     
     integer(4) status_, system ! to create a softlink
-    Character(200)   :: string_link,fname_symlnk
+    Character(200)   :: fname_symlnk
+    Character(400)   :: string_link
+    logical :: exists
 
     If ( Mod(istep,nsave)==0 ) then
 
@@ -565,7 +567,17 @@ Contains
           Close(1)
 
           fname_symlnk = Trim(Adjustl(fileout))//'.'//'restart'
-          string_link = 'ln -s '//Trim(fname)//' '//Trim(fname_symlnk)
+
+          ! Check if symlink exists
+          inquire(file=fname_symlnk, exist=exists)
+          
+          if (exists) then
+              ! Open the file for writing
+              !command = trim(adjustl('rm '//trim(adjustl(filename))
+              status_ = system( 'rm '//fname_symlnk )
+          end if
+
+          string_link = 'ln -s '//Trim(Adjustl(fname))//' '//Trim(fname_symlnk)
           status_ = system( string_link )
 
        End If
