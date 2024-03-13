@@ -11,7 +11,7 @@ EXE = boundary_layer_1.1
 ## source code path
 SRC = pwd
 
-F90=mpiifort
+F90=mpifort
 
 ####################################################################
 # END INPUT ########################################################
@@ -46,9 +46,10 @@ LFLAGS += $(LAPACK_LFLAGS)
 ## profile -> -pg -O0 -fno-inline-functions
 ## run     -> -O3 -ipo
 FEXDEB = -O0 -g -traceback -check all -check bounds
-FEX = -O3 -ipo
+FEXOPT = -O3 -ipo
 
-
+debug:  FEX = $(FEXDEB)
+$(EXE): FEX = $(FEXOPT)
 
 #################################################### objects alpha
 OBJECTS = $(OBJ)/mpi.o $(OBJ)/global.o $(OBJ)/Newton_solver.o $(OBJ)/interpolation.o \

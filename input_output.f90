@@ -237,6 +237,7 @@ Contains
        
        ! mesh
        Read(1) nx_global_f
+
        If ( nx_global_f/=nx_global ) Stop 'nx_f/=nx'
        Read(1) x_global
        
@@ -263,9 +264,9 @@ Contains
        ! get header position and size
        Inquire(1,pos=pos_header)
        pos_header = pos_header - 1
-       nsize_U    = nx_global*nyg_global*nzg_global*8
-       nsize_V    = nxg_global*ny_global*nzg_global*8
-                     
+       nsize_U    = nx_global*nyg_global*nzg_global*8_int64
+       nsize_V    = nxg_global*ny_global*nzg_global*8_int64
+
     End If
 
     ! U
