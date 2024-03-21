@@ -224,6 +224,7 @@ Contains
     Integer(Int64) :: pos_header, nsize_U, nsize_V
     Real   (Int64) :: nu_dummy
     Character(200) :: filein_resc
+    Character(200) :: err_msg
     logical        :: iostat_res
     
     ! processor 0 Reads the all the data
@@ -243,28 +244,34 @@ Contains
             Read(1) nstep_init    
             Read(1) nx_global_f     ! read the actual nx_global in file
        EndIf
-
-       If ( nx_global_f/=nx_global ) Stop 'nx_f/=nx'
+        
+       write(err_msg,'(A,I5,A,I5,A)') 'nx_f(' , nx_global_f , ')/=nx(' , nx_global , ')'
+       If ( nx_global_f/=nx_global ) Stop err_msg
        Read(1) x_global
        
        Read(1) ny_global_f
-       If ( ny_global_f/=ny_global ) Stop 'ny_f/=ny'
+       write(err_msg,'(A,I5,A,I5,A)') 'ny_f(' , ny_global_f , ')/=ny(' , ny_global , ')'
+       If ( ny_global_f/=ny_global ) Stop err_msg
        Read(1) y_global
        
        Read(1) nz_global_f
-       If ( nz_global_f/=nz_global ) Stop 'nz_f/=nz'
+       write(err_msg,'(A,I5,A,I5,A)') 'nz_f(' , nz_global_f , ')/=nz(' , nz_global , ')'
+       If ( nz_global_f/=nz_global ) Stop err_msg
        Read(1) z_global
        
        Read(1) nxm_global_f
-       If ( nxm_global_f/=nxm_global ) Stop 'nxm_f/=nxm'
+       write(err_msg,'(A,I5,A,I5,A)') 'nxm_f(' , nxm_global_f , ')/=nxm(' , nxm_global , ')'
+       If ( nxm_global_f/=nxm_global ) Stop err_msg
        Read(1) xm_global
        
        Read(1) nym_global_f
-       If ( nym_global_f/=nym_global ) Stop 'nym_f/=nym'
+       write(err_msg,'(A,I5,A,I5,A)') 'nym_f(' , nym_global_f , ')/=nym(' , nym_global , ')'
+       If ( nym_global_f/=nym_global ) Stop err_msg
        Read(1) ym_global
        
        Read(1) nzm_global_f
-       If ( nzm_global_f/=nzm_global ) Stop 'nzm_f/=nzm'
+       write(err_msg,'(A,I5,A,I5,A)') 'nzm_f(' , nzm_global_f , ')/=nzm(' , nzm_global , ')'
+       If ( nzm_global_f/=nzm_global ) Stop err_msg
        Read(1) zm_global
 
        ! get header position and size
