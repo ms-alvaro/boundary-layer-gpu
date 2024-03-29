@@ -56,15 +56,16 @@ Contains
 
     !---------------------------------------------------------!
     ! apply velocity boundary conditions at the top
-    If ( top_boundary_flag.ne.0 ) Then
-       ! U and W boundary condition at the top           
-       !Call apply_top_bc_y(U,W) 
+    If ( top_boundary_flag==1 .Or. top_boundary_flag==2 ) Then
        ! V boundary condition at the top    
        Call apply_Dirichlet_bc_y_top_BlowingSuction(V,top_boundary_flag)
        ! Impose zero vorticity and dw/dy = 0
        Call zero_wz_top(U,V,W)
-    Else
+    Elseif (top_boundary_flag==3) Then
        Call apply_top_bc_y_Falkner_Skan(U,V,W) 
+    Else
+       ! U, V and W boundary condition at the top           
+       Call apply_top_bc_y(U,V,W) 
     End If
 
     
@@ -772,9 +773,9 @@ Contains
   ! Output: U,W  at the top                         !
   !                                                 !
   !-------------------------------------------------!
-  Subroutine apply_top_bc_y(U_,W_)
+  Subroutine apply_top_bc_y(U_,V_,W_)
 
-    Real(Int64), Dimension(:,:,:), Intent(InOut) :: U_, W_
+    Real(Int64), Dimension(:,:,:), Intent(InOut) :: U_, V_, W_
 
     ! local variables
     Integer(Int32) :: i
@@ -785,6 +786,7 @@ Contains
     End Do
     ! variables at faces
     Do i=1,nxg
+       V_(i, ny,:) = V_top(i)
        W_(i,nyg,:) = W_top(i)
     End Do
 
