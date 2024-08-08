@@ -32,8 +32,8 @@ and `mpiifort` are available commands, follow these steps:
 
 1. Add the include and lib paths of your local installation of FFTW to your `~/.bashrc`:
     ```bash
-    export FFTW_INCLUDE_DIR=<path-to-fftw>/include
-    export FFTW_LIBRARY_DIR=<path-to-fftw>/lib
+    export FFTW_DIR=<path-to-fftw>
+    export LAPACK_DIR=<path-to-lapack>
     ```
 2. Load the new variables:
     ```bash
@@ -56,6 +56,20 @@ in `<path>/<name>` directory.
 > ```bash
 > module load intel-oneapi/2023.1
 > ```
+
+### Compile in Resnick HPC (Caltech)
+
+To make the intel compilers available, you have to load the modules:
+```bash
+module load intel-oneapi-compilers/2023.2.1-gcc-11.3.1-3knpjdr   
+module load openmpi/5.0.1-oneapi-2023.2.1-aef2p6e  
+```
+
+The paths to be added to `.bashrc` are
+```bash
+export FFTW_DIR=/central/software9/spack/opt/spack/linux-rhel9-x86_64/oneapi-2023.2.1/fftw-3.3.10-dxwsxf6a4v6xxyp4wxmnixbuvayokeso/
+export LAPACK_DIR=/home/garranz/opt/lapack-3.12.0/
+```
 
 ### Advanced compilation
 
