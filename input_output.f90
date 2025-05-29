@@ -26,6 +26,7 @@ Contains
 
     ! initialize default variables
     nstep_init = 0
+    nstep_init_input = -45
     Rossby_plus = 0d0
     Amplitude_perturbations = 0d0
     beta_hartree = 0d0
@@ -240,8 +241,13 @@ Contains
        Read(1) nx_global_f
 
        If ( nx_global_f.eq.-73) Then
-            write(*,*) 'Reading init step from file'
-            Read(1) nstep_init    
+            Read(1) ny_global_f ! dummy
+            ! This is the time step, but we only use it if we haven't provided
+            ! and input init_step
+            If ( nstep_init_input.eq.-45) Then
+               nstep_init = ny_global_f
+               write(*,*) 'Reading init step from file: ', nstep_init
+            Endif
             Read(1) nx_global_f     ! read the actual nx_global in file
        EndIf
         
@@ -397,6 +403,9 @@ Contains
     Call Mpi_bcast ( zm_global,nzm_global,MPI_real8,0,MPI_COMM_WORLD,ierr )   
 
     Call Mpi_bcast ( t,1,MPI_real8,0,MPI_COMM_WORLD,ierr ) 
+
+    ! Update nstep_init in case it has been read from file
+    Call Mpi_bcast (          nstep_init,1,MPI_integer,0,MPI_COMM_WORLD,ierr )
 
     ! set solution for zero step
     Uo = U
