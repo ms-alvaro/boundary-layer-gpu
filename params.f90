@@ -111,7 +111,8 @@
 
       INQUIRE(FILE= paramsfilename, EXIST= f )
       if ( f.eq..false. ) then
-          write(*,*) 'input file: ', adjustl(trim(paramsfilename)), ' does not exist'
+          write(*,*) 'input file: ', &
+             adjustl(trim(paramsfilename)), ' does not exist'
           stop
       endif
 
@@ -158,13 +159,17 @@
       call get_int('WMnutflag'    , iwall_model_nut,  f)
       call get_int('WMnut'        , frac_vis_wall_model,  f)
 
-      call get_int('init_step'    , nstep_init   , f)
-      call get_int('init_rand'    , random_init  , f)
+      call get_int('init_step'    , nstep_init_input, f)
+      call get_int('init_rand'    , random_init     , f)
       call get_str('filein'       , filein,      200, f1)
       if ( (random_init.eq.1) .and. (f1.eq..TRUE.) ) then
-          stop ' ERROR: init_rand = 1, but a filein has also been specified'
+          stop ' ERROR: init_rand = 1, but filein exists'
       endif
-        
+      ! Assign input number if given
+      if (nstep_init_input.ne.-45) Then
+         nstep_init = nstep_init_input
+      endif
+  
       call get_str('fileout'      , fileout,     200, f)
         
       ! Create a folder for the parent directory of the file if it does not exist

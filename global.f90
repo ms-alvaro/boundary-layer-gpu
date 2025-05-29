@@ -34,7 +34,7 @@ Module global
   Real(Int64) :: Lx_rand, Ly_rand, Lz_rand, alpha_rand
 
   ! steps
-  Integer(Int32) :: nsteps, nstep_init
+  Integer(Int32) :: nsteps, nstep_init, nstep_init_input
   Real   (Int64) :: dt, t, dt_period, dt_min_cfl
 
   ! viscosity
