@@ -1,0 +1,74 @@
+! Laminar Blasius boundary layer test case
+! Small grid, no perturbations, no turbulence model
+
+! Grid: nx=102, ny=32, nz=4
+! nx even, nz even, nz-2=2 divisible by nprocs=1 or 2
+nxyz = 102 64 8
+
+! Fixed time step (negative CFL = fixed dt)
+CFL = -5e-5
+
+! Viscosity: Rex_inlet = U_inf * x0 / nu = 1.0 / nu
+! For Rex_inlet ~ 1e5 -> nu = 1e-5
+nu = 1e-5
+
+! Time integration: Euler (simplest)
+RKscheme = 2
+
+! No SGS model (DNS)
+LES = 0
+
+! No wall model (no-slip)
+WM = 0
+
+! No pressure gradient
+dPdx = 0.0
+dPdz = 0.0
+
+! Top BC: impose velocity (Blasius)
+top_flag = 0
+
+! Blowing/suction params (not used with top_flag=0, but needed by parser)
+Vmax = 0.0
+x0 = 0.0
+sigma = 1.0
+phi = 0.0
+
+! Simulation control
+nsteps   = 2000
+nsave    = 500
+nstats   = 500
+nmonitor = 100
+
+! Random initial condition (no need for input file)
+init_rand = 1
+
+! Domain size: Lx=1.0 (domain from x=1 to x=2), Ly=0.40, Lz=0.2
+! x starts at x=1 (distance from leading edge)
+! Stretching alpha=2.5 in y
+boxsize = 1.0 0.10 0.2 3.0
+
+init_step = 0
+
+! Output
+fileout =./data/BL_laminar
+
+! Inflow: generate Blasius (flag=1)
+inflow_flag = 1
+
+! Blasius self-similar solution (text file: eta, f, f')
+inflow_file =blasius_solution.dat
+
+! No temporal perturbation file (pure laminar)
+timeinflow_file =**TO DO**
+
+! Lund params (not used but needed by parser)
+Lund_ix = 10
+Lund_deltai = 0.03
+Lund_T = 0.5
+
+! Eddy viscosity BC
+nutBC = 1
+
+! Wall stress model
+TauwModel = 0
