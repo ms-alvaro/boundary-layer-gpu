@@ -33,10 +33,12 @@ Contains
     Vo = V
     Wo = W
     !$acc end kernels
-    ! Compute eddy viscosity
+    ! Compute eddy viscosity (on CPU)
+    !$acc update self(Uo,Vo,Wo)
     Call compute_eddy_viscosity(Uo,Vo,Wo,avg_nu_t,nu_t)
-    ! Compute LES wall model
+    ! Compute LES wall model (on CPU)
     Call compute_wall_model(Uo,Vo,Wo)
+    !$acc update device(Uo,Vo,Wo,nu_t,avg_nu_t,alpha_x,alpha_y,alpha_z,V_bottom)
     ! compute rhs for U
     Call compute_rhs_u(Uo,Vo,Wo,rhs_uo)
 
@@ -124,8 +126,10 @@ Contains
 
     ! step 1
     rk_step = 1
+    !$acc update self(U,V,W)
     Call compute_eddy_viscosity(U,V,W,avg_nu_t,nu_t)
     Call compute_wall_model(U,V,W)
+    !$acc update device(U,V,W,nu_t,avg_nu_t,alpha_x,alpha_y,alpha_z,V_bottom)
     Call compute_rhs_u(U,V,W,Fu1)
     Call compute_rhs_v(U,V,W,Fv1)
     Call compute_rhs_w(U,V,W,Fw1)
@@ -147,9 +151,12 @@ Contains
 
     ! step 2
     rk_step = 2
+    !$acc update self(U,V,W)
     Call compute_eddy_viscosity(U,V,W,avg_nu_t,nu_t)
     Call compute_wall_model(U,V,W)
+    !$acc update device(U,V,W,nu_t,avg_nu_t,alpha_x,alpha_y,alpha_z,V_bottom)
     Call compute_rhs_u(U,V,W,Fu2)
+    ! (GPU data synced above)
     Call compute_rhs_v(U,V,W,Fv2)
     Call compute_rhs_w(U,V,W,Fw2)
 
@@ -189,8 +196,10 @@ Contains
 
     ! step 1
     rk_step = 1
+    !$acc update self(U,V,W)
     Call compute_eddy_viscosity(U,V,W,avg_nu_t,nu_t)
     Call compute_wall_model(U,V,W)
+    !$acc update device(U,V,W,nu_t,avg_nu_t,alpha_x,alpha_y,alpha_z,V_bottom)
     Call compute_rhs_u(U,V,W,Fu1)
     Call compute_rhs_v(U,V,W,Fv1)
     Call compute_rhs_w(U,V,W,Fw1)
@@ -212,8 +221,10 @@ Contains
 
     ! step 2
     rk_step = 2
+    !$acc update self(U,V,W)
     Call compute_eddy_viscosity(U,V,W,avg_nu_t,nu_t)
     Call compute_wall_model(U,V,W)
+    !$acc update device(nu_t,avg_nu_t,alpha_x,alpha_y,alpha_z,V_bottom)
     Call compute_rhs_u(U,V,W,Fu2)
     Call compute_rhs_v(U,V,W,Fv2)
     Call compute_rhs_w(U,V,W,Fw2)
@@ -235,8 +246,10 @@ Contains
 
     ! step 3
     rk_step = 3
+    !$acc update self(U,V,W)
     Call compute_eddy_viscosity(U,V,W,avg_nu_t,nu_t)
     Call compute_wall_model(U,V,W)
+    !$acc update device(U,V,W,nu_t,avg_nu_t,alpha_x,alpha_y,alpha_z,V_bottom)
     Call compute_rhs_u(U,V,W,Fu3)
     Call compute_rhs_v(U,V,W,Fv3)
     Call compute_rhs_w(U,V,W,Fw3)
@@ -331,7 +344,7 @@ Contains
     lUmax = 0d0
     lVmax = 0d0
     lWmax = 0d0
-    !$acc parallel loop collapse(3) default(present) reduction(max:lUmax,lVmax,lWmax)
+    !$acc update self(U,V,W)
     Do i=2,nxg-1
        Do j=2,nyg-1
           Do k=2,nzg-1

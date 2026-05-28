@@ -19,11 +19,17 @@ Contains
   !--------------------------------------------!
   Subroutine compute_projection_step
 
+    ! Transfer velocities to CPU for entire projection step
+    !$acc update self(U,V,W)
+
     Call compute_pseudo_pressure_rhs
 
     Call solve_poisson_equation
 
     Call project_velocity
+
+    ! Transfer corrected velocities back to GPU
+    !$acc update device(U,V,W)
 
   End Subroutine compute_projection_step
 
@@ -41,8 +47,7 @@ Contains
 
     Integer(Int32) :: i, j, k
 
-    ! rhs_p locate at cell centers
-    !$acc parallel loop collapse(3) default(present)
+    ! rhs_p locate at cell centers (on CPU)
     Do k = 2, nzg-1
        Do j = 2, nyg-1
           Do i = 2, nxg-1
@@ -81,9 +86,6 @@ Contains
 
     ! Lapack function for solving tridiagonal systems
     External :: zgesv
-
-    ! Transfer rhs_p from GPU to CPU for FFT operations
-    !$acc update self(rhs_p)
 
     ! cosine tranform in x and Fourier transform in x (interior points)
     Do j = 2, nyg-1
@@ -158,9 +160,6 @@ Contains
        End Do
     End Do
 
-    ! Transfer rhs_p back from CPU to GPU
-    !$acc update device(rhs_p)
-
     ! periodic boundary conditions in z
     Call apply_periodic_z_pressure
 
@@ -169,7 +168,6 @@ Contains
 
     ! save pressure for statistics
     If ( rk_step == 1 ) Then
-       !$acc kernels default(present)
        P( 2:nxg-1, 2:nyg-1, 2:nzg-1 ) = rhs_p/(dt*rk2_coef(1,1)) ! to be checked
        P(  1,:,:) = P(    2,:,:)
        P(nxg,:,:) = P(nxg-1,:,:)
@@ -177,7 +175,6 @@ Contains
        P(:,nyg,:) = P(:,nyg-1,:)
        P(:,:,  1) = P(:,:,    2)
        P(:,:,nzg) = P(:,:,nzg-1)
-       !$acc end kernels
     End If
 
   End Subroutine solve_poisson_equation
@@ -188,12 +185,9 @@ Contains
   Subroutine apply_periodic_z_pressure
 
     ! compute compute last point from Neumann BC (All processors, no MPI needed)
-    !$acc kernels default(present)
     rhs_p( nxg-1, :, : ) = rhs_p( nxg-2, :, : )
-    !$acc end kernels
 
     ! apply periodicity in z (Only first and last processor, MPI needed)
-    !$acc update self(rhs_p)
     If     ( myid==0 ) Then
        buffer_p = rhs_p ( 2:nxg-1, :, 2 )
        ! send data to nprocs-1
@@ -205,7 +199,6 @@ Contains
             MPI_COMM_WORLD,istat,ierr)
        rhs_p ( 2:nxg-1, :, nzp+1+1 ) = buffer_p
     End If
-    !$acc update device(rhs_p)
 
   End Subroutine apply_periodic_z_pressure
 
@@ -231,13 +224,11 @@ Contains
        recvfrom = MPI_PROC_NULL
        tagfrom  = MPI_ANY_TAG
     End If
-    !$acc update self(rhs_p(:,:,2))
     buffer_ps = rhs_p(:,:,2)  ! send buffer
     Call Mpi_sendrecv(buffer_ps, (nxg-2)*(nyg-2), Mpi_real8, sendto, tagto,        &
          buffer_pr, (nxg-2)*(nyg-2), Mpi_real8, recvfrom, tagfrom, MPI_COMM_WORLD, &
          istat, ierr)
     If ( myid/=nprocs-1 ) rhs_p(:,:,nzg) = buffer_pr ! received buffer
-    !$acc update device(rhs_p(:,:,nzg))
 
   End Subroutine update_ghost_interior_planes_pressure
 
@@ -256,21 +247,18 @@ Contains
     Integer(Int32) :: i, j, k
 
     ! project U (interior points)
-    !$acc parallel loop default(present)
     Do i = 2, nx-1
        U(i,2:nyg-1,2:nzg-1) = U(i,2:nyg-1,2:nzg-1) - &
             ( rhs_p(i+1,2:nyg-1,2:nzg-1) - rhs_p(i,2:nyg-1,2:nzg-1) )/( xg(i+1) - xg(i) )
     End Do
 
     ! project V (interior points)
-    !$acc parallel loop default(present)
     Do j = 2, ny-1
        V(2:nxg-1,j,2:nzg-1) = V(2:nxg-1,j,2:nzg-1) - &
             ( rhs_p(2:nxg-1,j+1,2:nzg-1) - rhs_p(2:nxg-1,j,2:nzg-1) )/( yg(j+1) - yg(j) )
     End Do
 
     ! project W (interior points)
-    !$acc parallel loop default(present)
     Do k = 2, nz-1
        W(2:nxg-1,2:nyg-1,k) = W(2:nxg-1,2:nyg-1,k) - &
             ( rhs_p(2:nxg-1,2:nyg-1,k+1) - rhs_p(2:nxg-1,2:nyg-1,k) )/( zg(k+1) - zg(k) )
@@ -294,7 +282,6 @@ Contains
 
     ! compute divergence interior points
     div = 0d0
-    !$acc parallel loop collapse(3) default(present) reduction(max:div)
     Do k = 2, nzg-1
        Do j = 2, nyg-1
           Do i = 2, nxg-2 ! last x-plane is dummy, not projected
