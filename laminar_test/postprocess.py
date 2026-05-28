@@ -166,8 +166,10 @@ def main():
     Rex = U_inf * x / nu
     Cf_blasius = 0.664 / np.sqrt(Rex)
 
-    ax.plot(Rex[2:-2], Cf[2:-2], 'bo', markersize=3, label='Simulation')
-    ax.plot(Rex[2:-2], Cf_blasius[2:-2], 'r-', linewidth=1.5, label=r'Blasius: $C_f = 0.664 / \sqrt{Re_x}$')
+    # Exclude first 3 and last 5 points (inlet/outflow buffer zones)
+    s = slice(3, -5)
+    ax.plot(Rex[s], Cf[s], 'bo', markersize=3, label='Simulation')
+    ax.plot(Rex[s], Cf_blasius[s], 'r-', linewidth=1.5, label=r'Blasius: $C_f = 0.664 / \sqrt{Re_x}$')
     ax.set_xlabel(r'$Re_x$', fontsize=12)
     ax.set_ylabel(r'$C_f$', fontsize=12)
     ax.legend(fontsize=10)
@@ -198,10 +200,14 @@ def main():
         yg[0] = snap['ym'][0] - 2*(snap['ym'][0] - snap['y'][0])
         yg[-1] = snap['ym'][-1] + 2*(snap['y'][-1] - snap['ym'][-1])
 
-        fig, axes = plt.subplots(3, 1, figsize=(10, 8))
+        # Exclude last 5 x-stations (outflow buffer)
+        ix_end = -5
+
+        fig, axes = plt.subplots(2, 1, figsize=(10, 5))
 
         # U
-        im = axes[0].pcolormesh(snap['x'], yg, U_plane.T,
+        im = axes[0].pcolormesh(snap['x'][:ix_end], yg,
+                                U_plane[:ix_end, :].T,
                                 cmap='RdBu_r', shading='auto', vmin=0, vmax=1.1)
         axes[0].set_ylabel('y')
         axes[0].set_title(f'U velocity (t = {snap["t"]:.4f})')
@@ -209,21 +215,13 @@ def main():
 
         # V at mid-z
         V_plane = snap['V'][:, :, kz_mid]
-        im = axes[1].pcolormesh(xg, snap['y'], V_plane.T,
+        im = axes[1].pcolormesh(xg[:ix_end], snap['y'],
+                                V_plane[:ix_end, :].T,
                                 cmap='RdBu_r', shading='auto')
+        axes[1].set_xlabel('x')
         axes[1].set_ylabel('y')
         axes[1].set_title('V velocity')
         plt.colorbar(im, ax=axes[1], label='V')
-
-        # W at mid-z plane
-        nz = snap['W'].shape[2]
-        W_plane = snap['W'][:, :, nz // 2]
-        im = axes[2].pcolormesh(xg, yg, W_plane.T,
-                                cmap='RdBu_r', shading='auto')
-        axes[2].set_xlabel('x')
-        axes[2].set_ylabel('y')
-        axes[2].set_title('W velocity')
-        plt.colorbar(im, ax=axes[2], label='W')
 
         fig.tight_layout()
         fig.savefig(f'{figdir}/snapshot_UVW.png', dpi=150)

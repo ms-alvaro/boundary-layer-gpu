@@ -3,7 +3,7 @@
 
 ! Grid: nx=102, ny=32, nz=4
 ! nx even, nz even, nz-2=2 divisible by nprocs=1 or 2
-nxyz = 102 64 8
+nxyz = 302 64 8
 
 ! Fixed time step (negative CFL = fixed dt)
 CFL = -5e-5
@@ -46,7 +46,7 @@ init_rand = 1
 ! Domain size: Lx=1.0 (domain from x=1 to x=2), Ly=0.40, Lz=0.2
 ! x starts at x=1 (distance from leading edge)
 ! Stretching alpha=2.5 in y
-boxsize = 1.0 0.10 0.2 3.0
+boxsize = 10.0 0.10 0.2 3.0
 
 init_step = 0
 
