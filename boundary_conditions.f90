@@ -274,34 +274,36 @@ Contains
 
     ! local variables
     Integer(Int32) :: j, k
+    Real   (Int64) :: Amp_loc
 
+    ! Apply Blasius + random perturbations once per time step
+    ! (step_beginning=1 at the start of each step, set to 0 after first BC call)
+    ! Perturbations are weighted by (1-U/U_inf) to concentrate inside BL
     If ( step_beginning == 1 ) Then
 
-       ! compute temporal component of the inflow
-       Call compute_temporal_inflow
-       
-       ! variables at centers 
        Do j=1,nyg
+          Amp_loc = Amplitude_perturbations * (1d0 - U_inlet(j))
           Do k=1,nzg
-             U_(1,j,k) = U_inlet(j) + Amplitude_perturbations*(rand()-0.5d0)
+             U_(1,j,k) = U_inlet(j) + Amp_loc*(rand()-0.5d0)
           End Do
        End Do
        Do j=1,nyg
+          Amp_loc = Amplitude_perturbations * (1d0 - U_inlet(j))
           Do k=1,nz
-             W_(1,j,k) = W_inlet(j) + Amplitude_perturbations*(rand()-0.5d0)
+             W_(1,j,k) = W_inlet(j) + Amp_loc*(rand()-0.5d0)
           End Do
        End Do
-       ! variables at faces
        Do j=1,ny
+          Amp_loc = Amplitude_perturbations * (1d0 - U_inlet(min(j,nyg)))
           Do k=1,nzg
-             V_(1,j,k) = V_inlet(j) + Amplitude_perturbations*(rand()-0.5d0)
+             V_(1,j,k) = V_inlet(j) + Amp_loc*(rand()-0.5d0)
           End Do
        End Do
 
        step_beginning = 0
 
     End If
-       
+
   End Subroutine apply_inflow_bc_x_Blasius_random
 
   !-------------------------------------------------!

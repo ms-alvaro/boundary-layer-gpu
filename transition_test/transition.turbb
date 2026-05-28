@@ -1,0 +1,76 @@
+! Boundary layer transition test case
+! Blasius + random perturbations at inlet to trigger transition
+! 3D domain with sufficient spanwise resolution
+
+! Grid: nx=302, ny=64, nz=34
+! nz-2=32 divisible by 2 or 4 procs
+nxyz = 302 64 34
+
+! Fixed time step
+CFL = -5e-5
+
+! Viscosity: Rex_inlet = 1e5
+nu = 1e-5
+
+! Time integration: RK2
+RKscheme = 2
+
+! No SGS model (DNS)
+LES = 0
+
+! No wall model (no-slip)
+WM = 0
+
+! No pressure gradient
+dPdx = 0.0
+dPdz = 0.0
+
+! Top BC: impose velocity (Blasius)
+top_flag = 0
+
+! Blowing/suction params (not used with top_flag=0)
+Vmax = 0.0
+x0 = 0.0
+sigma = 1.0
+phi = 0.0
+
+! Simulation control
+nsteps   = 200000
+nsave    = 50000
+nstats   = 10000
+nmonitor = 5000
+
+! Random initial condition with Blasius profile
+init_rand = 1
+
+! Domain: Lx=10 (x from 1 to 11), Ly=0.10, Lz=0.10 (~3*delta99)
+! Stretching alpha=3.0 in y
+boxsize = 10.0 0.10 0.10 3.0
+
+init_step = 0
+
+! Output
+fileout =./data/BL_transition
+
+! Amplitude of random perturbations at inlet (fraction of U_inf)
+Amplitude = 0.05
+
+! Inflow: Blasius + random perturbations (flag=4)
+inflow_flag = 4
+
+! Blasius self-similar solution
+inflow_file =blasius_solution.dat
+
+! No temporal perturbation file
+timeinflow_file =**TO DO**
+
+! Lund params (not used but needed by parser)
+Lund_ix = 30
+Lund_deltai = 0.03
+Lund_T = 0.5
+
+! Eddy viscosity BC
+nutBC = 1
+
+! Wall stress model
+TauwModel = 0
