@@ -5,6 +5,7 @@ Module input_output
 
   ! Modules
   Use iso_fortran_env, Only : error_unit, Int32, Int64
+  Use ieee_arithmetic, Only : ieee_is_nan
   Use global
   Use mpi
   !Use ifport  ! removed for gfortran compatibility
@@ -479,9 +480,9 @@ Contains
     Wo = W
 
     ! Sanity check
-    If ( Any( Isnan(U) ) ) Stop 'Error U NaNs!'
-    If ( Any( Isnan(V) ) ) Stop 'Error V NaNs!'
-    If ( Any( Isnan(W) ) ) Stop 'Error W NaNs!'
+    If ( Any( ieee_is_nan(U) ) ) Stop 'Error U NaNs!'
+    If ( Any( ieee_is_nan(V) ) ) Stop 'Error V NaNs!'
+    If ( Any( ieee_is_nan(W) ) ) Stop 'Error W NaNs!'
     
   End Subroutine read_input_data
 

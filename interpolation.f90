@@ -34,8 +34,10 @@ Contains
     n2 = n(2)
     n3 = n(3)
 
+    !$acc kernels default(present)
     ui = 0d0
     ui( 1:n1-1, 1:n2, 1:n3) = 0.5d0*( u(1:n1-1,:,:) + u(2:n1,:,:) )
+    !$acc end kernels
 
   End Subroutine interpolate_x
 
@@ -60,12 +62,17 @@ Contains
     n2 = n(2)
     n3 = n(3)
 
+    !$acc kernels default(present)
     ui = 0d0
+    !$acc end kernels
     If ( di==1 ) Then
        ! faces to centers (normal average)
-       ui(1:n1, 1:n2-1, 1:n3) = 0.5d0*( u(:,1:n2-1,:) + u(:,2:n2,:) ) 
+       !$acc kernels default(present)
+       ui(1:n1, 1:n2-1, 1:n3) = 0.5d0*( u(:,1:n2-1,:) + u(:,2:n2,:) )
+       !$acc end kernels
     Elseif ( di==2 ) Then
        ! centers to faces (weighted average)
+       !$acc parallel loop collapse(2) default(present)
        Do i1 = 1, n1
           Do i3 = 1, n3
              ui(i1, 1:n2-1, i3) = weight_y_0*u(i1,1:n2-1,i3) + weight_y_1*u(i1,2:n2,i3)
@@ -74,7 +81,7 @@ Contains
     Else
        Stop 'Error: invalid interpolation'
     End If
-   
+
   End Subroutine interpolate_y
 
   !-------------------------------------------------------!
@@ -99,9 +106,11 @@ Contains
     n2 = n(2)
     n3 = n(3)
 
+    !$acc kernels default(present)
     ui = 0d0
     ui(1:n1, 1:n2, 1:n3-1) = 0.5d0*( u(:,:,1:n3-1) + u(:,:,2:n3) )
-    
+    !$acc end kernels
+
   End Subroutine interpolate_z
 
 
@@ -128,8 +137,11 @@ Contains
     nn = shape(yi)
     n2 = nn(1)
 
-    ui = 0d0    
+    !$acc kernels default(present)
+    ui = 0d0
+    !$acc end kernels
     ! middle points
+    !$acc parallel loop default(present) private(yref, w0, w1, w2)
     Do j = 2, n2-1
        yref = yi(j)
        w0   = ( yref - y(j)   )*( yref - y(j+1) )/( ( y(j-1) - y(j)   )*( y(j-1) - y(j+1) ) )
@@ -144,7 +156,9 @@ Contains
     w0   = ( yref - y(j)   )*( yref - y(j+1) )/( ( y(j-1) - y(j)   )*( y(j-1) - y(j+1) ) )
     w1   = ( yref - y(j-1) )*( yref - y(j+1) )/( ( y(j  ) - y(j-1) )*( y(j)   - y(j+1) ) )
     w2   = ( yref - y(j-1) )*( yref - y(j  ) )/( ( y(j+1) - y(j-1) )*( y(j+1) - y(j)   ) )
+    !$acc kernels default(present)
     ui(1:n1, 1, 1:n3) = w0*u(1:n1,j-1,1:n3) + w1*u(1:n1,j,1:n3) +  w2*u(1:n1,j+1,1:n3)
+    !$acc end kernels
 
     ! last point
     j    = n2-1
@@ -152,7 +166,9 @@ Contains
     w0   = ( yref - y(j)   )*( yref - y(j+1) )/( ( y(j-1) - y(j)   )*( y(j-1) - y(j+1) ) )
     w1   = ( yref - y(j-1) )*( yref - y(j+1) )/( ( y(j  ) - y(j-1) )*( y(j)   - y(j+1) ) )
     w2   = ( yref - y(j-1) )*( yref - y(j  ) )/( ( y(j+1) - y(j-1) )*( y(j+1) - y(j)   ) )
+    !$acc kernels default(present)
     ui(1:n1, n2, 1:n3) = w0*u(1:n1,j-1,1:n3) + w1*u(1:n1,j,1:n3) +  w2*u(1:n1,j+1,1:n3)
+    !$acc end kernels
 
   End Subroutine interpolate_y_2nd
 
@@ -179,8 +195,11 @@ Contains
     nn = shape(yi)
     n1 = nn(1)
 
-    ui = 0d0    
+    !$acc kernels default(present)
+    ui = 0d0
+    !$acc end kernels
     ! middle points
+    !$acc parallel loop default(present) private(yref, w0, w1, w2)
     Do j = 2, n1-1
        yref = yi(j)
        w0   = ( yref - y(j)   )*( yref - y(j+1) )/( ( y(j-1) - y(j)   )*( y(j-1) - y(j+1) ) )
@@ -195,7 +214,9 @@ Contains
     w0   = ( yref - y(j)   )*( yref - y(j+1) )/( ( y(j-1) - y(j)   )*( y(j-1) - y(j+1) ) )
     w1   = ( yref - y(j-1) )*( yref - y(j+1) )/( ( y(j  ) - y(j-1) )*( y(j)   - y(j+1) ) )
     w2   = ( yref - y(j-1) )*( yref - y(j  ) )/( ( y(j+1) - y(j-1) )*( y(j+1) - y(j)   ) )
+    !$acc kernels default(present)
     ui(1, 1:n2, 1:n3) = w0*u(j-1,1:n2,1:n3) + w1*u(j,1:n2,1:n3) +  w2*u(j+1,1:n2,1:n3)
+    !$acc end kernels
 
     ! last point
     j    = n1-1
@@ -203,7 +224,9 @@ Contains
     w0   = ( yref - y(j)   )*( yref - y(j+1) )/( ( y(j-1) - y(j)   )*( y(j-1) - y(j+1) ) )
     w1   = ( yref - y(j-1) )*( yref - y(j+1) )/( ( y(j  ) - y(j-1) )*( y(j)   - y(j+1) ) )
     w2   = ( yref - y(j-1) )*( yref - y(j  ) )/( ( y(j+1) - y(j-1) )*( y(j+1) - y(j)   ) )
+    !$acc kernels default(present)
     ui(n1, 1:n2, 1:n3) = w0*u(j-1,1:n2,1:n3) + w1*u(j,1:n2,1:n3) +  w2*u(j+1,1:n2,1:n3)
+    !$acc end kernels
 
   End Subroutine interpolate_x_2nd
 
@@ -230,8 +253,11 @@ Contains
     nn = shape(yi)
     n3 = nn(1)
 
-    ui = 0d0    
+    !$acc kernels default(present)
+    ui = 0d0
+    !$acc end kernels
     ! middle points
+    !$acc parallel loop default(present) private(yref, w0, w1, w2)
     Do j = 2, n3-1
        yref = yi(j)
        w0   = ( yref - y(j)   )*( yref - y(j+1) )/( ( y(j-1) - y(j)   )*( y(j-1) - y(j+1) ) )
@@ -246,7 +272,9 @@ Contains
     w0   = ( yref - y(j)   )*( yref - y(j+1) )/( ( y(j-1) - y(j)   )*( y(j-1) - y(j+1) ) )
     w1   = ( yref - y(j-1) )*( yref - y(j+1) )/( ( y(j  ) - y(j-1) )*( y(j)   - y(j+1) ) )
     w2   = ( yref - y(j-1) )*( yref - y(j  ) )/( ( y(j+1) - y(j-1) )*( y(j+1) - y(j)   ) )
+    !$acc kernels default(present)
     ui(1:n1, 1:n2, 1) = w0*u(1:n1,1:n2,j-1) + w1*u(1:n1,1:n2,j) + w2*u(1:n1,1:n2,j+1)
+    !$acc end kernels
 
     ! last point
     j    = n3-1
@@ -254,7 +282,9 @@ Contains
     w0   = ( yref - y(j)   )*( yref - y(j+1) )/( ( y(j-1) - y(j)   )*( y(j-1) - y(j+1) ) )
     w1   = ( yref - y(j-1) )*( yref - y(j+1) )/( ( y(j  ) - y(j-1) )*( y(j)   - y(j+1) ) )
     w2   = ( yref - y(j-1) )*( yref - y(j  ) )/( ( y(j+1) - y(j-1) )*( y(j+1) - y(j)   ) )
+    !$acc kernels default(present)
     ui( 1:n1, 1:n2, n3) = w0*u(1:n1,1:n2,j-1) + w1*u(1:n1,1:n2,j) + w2*u(1:n1,1:n2,j+1)
+    !$acc end kernels
 
   End Subroutine interpolate_z_2nd
 

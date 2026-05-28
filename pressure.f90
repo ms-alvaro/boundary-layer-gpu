@@ -17,11 +17,11 @@ Contains
 
   !----------------------------------------------------!
   !              Compute actual pressure               !
-  !----------------------------------------------------! 
+  !----------------------------------------------------!
   Subroutine compute_pressure
 
     Call compute_pressure_BC
-  
+
     Call compute_pressure_rhs
 
     Call solve_poisson_equation_for_pressure
@@ -45,7 +45,7 @@ Contains
     Integer(Int32) :: i, j, k
     Real   (Int64) :: maxerr
 
-    ! compute rhs terms 
+    ! compute rhs terms
     Call compute_rhs_u( U, V, W, rhs_uf(2:nx-1, 2:nyg-1,2:nzg-1) )
     Call compute_rhs_v( U, V, W, rhs_vf(2:nxg-1,2:ny-1, 2:nzg-1) )
     Call compute_rhs_w( U, V, W, rhs_wf(2:nxg-1,2:nyg-1,2:nz-1 ) )
@@ -56,7 +56,10 @@ Contains
     Call apply_periodic_bc_z   ( rhs_wf, 3 )
 
     ! compute divergence of rhs terms
+    !$acc kernels default(present)
     rhs_p = 0d0
+    !$acc end kernels
+    !$acc parallel loop collapse(3) default(present)
     Do k = 2, nzg-1
        Do j = 2, nyg-1
           Do i = 2, nxg-1
@@ -71,25 +74,6 @@ Contains
 
   !----------------------------------------------------!
   !              Solve pressure equation               !
-  !                                                    !
-  !   Equation:                                        !
-  !     Laplacian(p) = rhs_p = div(rhs terms)          !
-  !                                                    !
-  !   Boundary conditions: (valid if V=0 at the wall)  !
-  !     dP/dy = d/dy(nu dV/dy) at bottom wall          !
-  !     dP/dy = d/dy(nu dV/dy) at top    wall          !
-  !                                                    !
-  !         This is particular for channels:           !
-  !               Fast Poisson solver                  !
-  !                                                    !
-  ! Input:  rhs_p (right-hand side for the pressure)   !
-  ! Output: P                                          !
-  !                                                    !
-  ! Note:                  doesn't affect prms         !
-  !                                |                   !
-  !       p_total = p - dPdx*x - <V^2>                 !
-  !                 |     |        |                   !
-  !              (kx,kz) Grad    (0,0) mode            !
   !----------------------------------------------------!
   Subroutine solve_poisson_equation_for_pressure
 
@@ -97,6 +81,9 @@ Contains
     Real   (Int64) :: maxerr
 
     External :: zgesv
+
+    ! Transfer data from GPU to CPU for FFT operations
+    !$acc update self(rhs_p, V, bc_1, bc_2)
 
     ! 2D Fourier transform interior points rhs_p
     Do j = 2, nyg-1
@@ -117,9 +104,9 @@ Contains
     ! solve for each mode
     Do k = 0, mz
        Do i = 0, mx
-          ! mapping to x-mode 
+          ! mapping to x-mode
           i_global = imode_map_fft( i, k )
-          ! mapping to z-mode 
+          ! mapping to z-mode
           k_global = kmode_map_fft( i, k )
           ! form matrix
           Do j = 2, nyg-1 ! diagonal
@@ -134,7 +121,7 @@ Contains
           ! remove singularity 00 mode (set a reference pressure)
           if ( i_global==0 .And. k_global==0 ) D(2) = 3d0/2d0*D(2)
           ! rhs with boundary conditions for pressure
-          rhs_aux        = rhs_p_hat(i,:,k) 
+          rhs_aux        = rhs_p_hat(i,:,k)
           rhs_aux(    2) = rhs_aux(    2) + coef_bc_1*(yg(  2)-yg(    1))*bc_1_hat(i,k)
           rhs_aux(nyg-1) = rhs_aux(nyg-1) - coef_bc_2*(yg(nyg)-yg(nyg-1))*bc_2_hat(i,k)
           ! solve M*u = rhs (solution stored in rhs_p_hat)
@@ -150,24 +137,20 @@ Contains
        P(2:nxg-2,j,2:nzg-2) = plane/Real(nxp_global*nzp_global,8)
     End Do
 
+    ! Transfer P back to GPU
+    !$acc update device(P)
+
     ! extend values to ghost cells in y
-    ! p(1)   = p(2)     - ( yg(  2)-yg(    1) )*d/dy(nu dV/dy)
-    ! p(nyg) = p(nyg-1) + ( yg(nyg)-yg(nyg-1) )*d/dy(nu dV/dy) 
-    ! bc_1   = d/dy(nu dV/dy) bottom wall
-    ! bc_2   = d/dy(nu dV/dy) top    wall
+    !$acc kernels default(present)
     P(:,  1,:) = P(:,    2,:) - ( yg(  2)-yg(    1) )*bc_1
     P(:,nyg,:) = P(:,nyg-1,:) + ( yg(nyg)-yg(nyg-1) )*bc_2
+    !$acc end kernels
 
     ! apply periodicity in x and z
     Call apply_periodic_xz_pressure
 
     ! update ghost interior planes
-    Call update_ghost_interior_planes_pressure   
-
-    ! Add mean pressure gradient (not for Prms)
-    !Do i = 2, nxg-1
-    !   P(i,:,:) = P(i,:,:) + dPdx*xg(i)
-    !End Do
+    Call update_ghost_interior_planes_pressure
 
   End Subroutine solve_poisson_equation_for_pressure
 
@@ -177,11 +160,14 @@ Contains
   Subroutine apply_periodic_xz_pressure
 
     ! apply periodicity in x (All processors, no MPI needed)
+    !$acc kernels default(present)
     P ( nxg-1, :, : ) = P ( 2, :, : )
+    !$acc end kernels
 
-    ! apply periodicity in z (Only first and last processor, MPI needed) 
+    ! apply periodicity in z (Only first and last processor, MPI needed)
+    !$acc update self(P)
     If     ( myid==0 ) Then
-       buffer_p = P ( 2:nxg-1, :, 2 ) 
+       buffer_p = P ( 2:nxg-1, :, 2 )
        ! send data to nprocs-1
        Call Mpi_send(buffer_p, (nxg-2)*(nyg-2), MPI_real8, nprocs-1, 0, &
              MPI_COMM_WORLD,ierr)
@@ -191,6 +177,7 @@ Contains
             MPI_COMM_WORLD,istat,ierr)
        P ( 2:nxg-1, :, nzp+1+1 ) = buffer_p
     End If
+    !$acc update device(P)
 
   End Subroutine apply_periodic_xz_pressure
 
@@ -201,13 +188,13 @@ Contains
 
     Integer(Int32) :: sendto, recvfrom
     Integer(Int32) :: tagto,  tagfrom
-    
-    !----------------------update P-----------------------!    
+
+    !----------------------update P-----------------------!
     ! send to bottom processor, receive from top one
     sendto   = myid - 1
     tagto    = myid - 1
     recvfrom = myid + 1
-    tagfrom  = myid 
+    tagfrom  = myid
     If ( myid==0 ) Then
        sendto = MPI_PROC_NULL
        tagto  = 0
@@ -216,56 +203,35 @@ Contains
        recvfrom = MPI_PROC_NULL
        tagfrom  = MPI_ANY_TAG
     End If
+    !$acc update self(P(:,:,2))
     buffer_ps = P(:,:,2)  ! send buffer
     Call Mpi_sendrecv(buffer_ps, (nxg-2)*(nyg-2), Mpi_real8, sendto, tagto,        &
          buffer_pr, (nxg-2)*(nyg-2), Mpi_real8, recvfrom, tagfrom, MPI_COMM_WORLD, &
-         istat, ierr)   
-    If ( myid/=nprocs-1 ) P(:,:,nzg) = buffer_pr ! received buffer 
+         istat, ierr)
+    If ( myid/=nprocs-1 ) P(:,:,nzg) = buffer_pr ! received buffer
+    !$acc update device(P(:,:,nzg))
 
   End Subroutine update_ghost_interior_planes_pressure
 
   !----------------------------------------------------------!
   !          Compute rhs for V at the y-boundaries           !
-  !                                                          !
-  ! Equation: (valid if V=0 at the wall)                     !
-  !    rhs_v(boundary) = d/dy(nu dV/dy)                      !
-  !                                                          !
-  ! Input:  rhs_v (interior points)                          !
-  ! Output: rhs_v (interior+boundary points)                 !
-  !                                                          !
   !----------------------------------------------------------!
   Subroutine compute_rhs_v_boundary(rhs_v)
 
     Real(Int64), Dimension(1:nxg,1:ny,1:nzg), Intent(InOut) :: rhs_v
-    
+
+    !$acc kernels default(present)
     ! bottom wall
     rhs_v(2:nxg-1, 1,2:nzg-1) = bc_1
 
     ! top wall
     rhs_v(2:nxg-1,ny,2:nzg-1) = bc_2
+    !$acc end kernels
 
   End Subroutine compute_rhs_v_boundary
 
   !----------------------------------------------------------!
   !     Compute boundary conditions for actual pressure      !
-  !                                                          !
-  ! Boundary conditions: (valid if V=0 at the wall)          !
-  !     dP/dy = d/dy(nu dV/dy) at bottom wall                !
-  !     dP/dy = d/dy(nu dV/dy) at top    wall                !
-  !                                                          !
-  ! Boundary conditions general case: <- Not used here       !     
-  !     dP/dy = d/dy(nu dV/dy) - dV/dt + NL_v                !
-  !                                                          !           
-  ! d/dy(nu dV/dy) = dnu/dy*dV/dy  +  nu*d^2V/dy^2           !
-  !                                                          !
-  ! Numerical approx: 2nd order                              !
-  !                                                          !
-  ! Input:  V, nu, nu_t                                      !
-  ! Output: bc_1 ( d/dy(nu dV/dy) at bottom wall )           !
-  !         bc_2 ( d/dy(nu dV/dy) at top    wall )           !
-  !                                                          !
-  ! NOTE: using avg_nu_t instead of nu_t                     !
-  !                                                          !
   !----------------------------------------------------------!
   Subroutine compute_pressure_BC
 
@@ -279,27 +245,28 @@ Contains
     !-------------------------------------------------!
     ! Part 1: bottom wall
 
-    ! metric factor for first derivative dy/dzeta 
+    ! metric factor for first derivative dy/dzeta
     g  = ( -3d0*y(1) + 4d0*y(2) - y(3) )/(2d0*dzeta)
 
     ! metric factor for second derivative d^2y/dzeta^2
     g2 = ( 2d0*y(1) - 5d0*y(2) + 4d0*y(3) - 1d0*y(4) )/dzeta**2d0
 
+    !$acc parallel loop collapse(2) default(present) private(nui,dnu,dV,ddV)
     Do k = 2, nzg-1
        Do i = 2, nxg-1
 
-          ! interpolated nu at faces 
+          ! interpolated nu at faces
           nui = nu + 0.5d0*( avg_nu_t(1,1,1) + avg_nu_t(1,2,1) )
 
-          ! derivative of nu at the wall 
+          ! derivative of nu at the wall
           dnu = ( avg_nu_t(1,2,1) - avg_nu_t(1,1,1) ) / ( yg(2)-yg(1) )
 
-          ! derivative of V at the wall 
-          dV = ( -3d0*V(i,1,k) + 4d0*V(i,2,k) - V(i,3,k) )/(2d0*dzeta)*1d0/g 
+          ! derivative of V at the wall
+          dV = ( -3d0*V(i,1,k) + 4d0*V(i,2,k) - V(i,3,k) )/(2d0*dzeta)*1d0/g
 
-          ! second derivative of V at the wall 
+          ! second derivative of V at the wall
           ddV = ( 2d0*V(i,1,k) - 5d0*V(i,2,k) + 4d0*V(i,3,k) - 1d0*V(i,4,k) )/dzeta**2d0
-          ddV = ( ddV - dV*g2 )/g**2d0 
+          ddV = ( ddV - dV*g2 )/g**2d0
 
           ! boundary conditions
           bc_1(i,k) = dnu*dV + nui*ddV
@@ -310,27 +277,28 @@ Contains
     !-------------------------------------------------!
     ! Part 2: top wall
 
-    ! metric factor for first derivative dy/dzeta 
+    ! metric factor for first derivative dy/dzeta
     g  = ( 3d0*y(ny) - 4d0*y(ny-1) + y(ny-2) )/(2d0*dzeta)
 
-    ! metric factor for second derivative d^2y/dzeta^2 
+    ! metric factor for second derivative d^2y/dzeta^2
     g2 = ( 2d0*y(ny) - 5d0*y(ny-1) + 4d0*y(ny-2) - 1d0*y(ny-3) )/dzeta**2d0
 
+    !$acc parallel loop collapse(2) default(present) private(nui,dnu,dV,ddV)
     Do k = 2, nzg-1
        Do i = 2, nxg-1
 
-          ! interpolated nu at faces 
+          ! interpolated nu at faces
           nui = nu + 0.5d0*( avg_nu_t(1,nyg,1) + avg_nu_t(1,nyg-1,1) )
 
-          ! derivative of nu at the wall 
+          ! derivative of nu at the wall
           dnu = ( avg_nu_t(1,nyg,1) - avg_nu_t(1,nyg-1,1) ) / ( yg(nyg)-yg(nyg-1) )
 
-          ! derivative of V at the wall 
-          dV = ( 3d0*V(i,ny,k) - 4d0*V(i,ny-1,k) + V(i,ny-2,k) )/(2d0*dzeta)*1d0/g 
+          ! derivative of V at the wall
+          dV = ( 3d0*V(i,ny,k) - 4d0*V(i,ny-1,k) + V(i,ny-2,k) )/(2d0*dzeta)*1d0/g
 
-          ! second derivative of V at the wall 
+          ! second derivative of V at the wall
           ddV = ( 2d0*V(i,ny,k) - 5d0*V(i,ny-1,k) + 4d0*V(i,ny-2,k) - 1d0*V(i,ny-3,k) )/dzeta**2d0
-          ddV = ( ddV - dV*g2 )/g**2d0 
+          ddV = ( ddV - dV*g2 )/g**2d0
 
           ! boundary conditions
           bc_2(i,k) = dnu*dV + nui*ddV
