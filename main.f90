@@ -2,7 +2,7 @@
 ! My boundary layer :)                                 !
 !                                                      !
 ! Solve incompression Navier-Stokes eqs.               !
-!                                                      !    
+!                                                      !
 ! Spatial discretization:                              !
 !        - 2nd order finite differences                !
 !        - Staggered mesh                              !
@@ -23,15 +23,18 @@
 !                                                      !
 ! Parallelization:                                     !
 !        - MPI, z-slices                               !
+!        - OpenACC GPU offloading                      !
 !                                                      !
 ! Required:                                            !
 !       - FFTW 3.X                                     !
 !       - LAPACK 3.X                                   !
+!       - NVIDIA HPC SDK (for GPU)                     !
 !                                                      !
-! Parallel, Version 0.7.1                              !
+! Parallel, Version 0.8.0-gpu                          !
 !                                                      !
 ! Adrian Lozano Duran                                  !
 ! 2016                                                 !
+! GPU port 2026                                        !
 !------------------------------------------------------!
 Program boundary_layer_FD
 
@@ -44,7 +47,7 @@ Program boundary_layer_FD
   Use monitor
   Use statistics
   Use finalization
-  
+
   ! prevent implicit typing
   Implicit None
 
@@ -53,10 +56,26 @@ Program boundary_layer_FD
 
   ! small summary of input parameters
   Call summary
-     
+
+  ! Copy main arrays to GPU
+  !$acc data copy(U,V,W,P,Uo,Vo,Wo) &
+  !$acc      copyin(x,xm,xg,y,ym,yg,z,zm,zg,yg_m,yg_mm) &
+  !$acc      copyin(weight_y_0,weight_y_1) &
+  !$acc      copyin(xg_global,yg_global,zg_global) &
+  !$acc      copyin(kxx,kzz,Dyy,imode_map,kmode_map) &
+  !$acc      copyin(rk_coef,rk_t,rk2_coef,rk2_t) &
+  !$acc      create(term,term_1,term_2) &
+  !$acc      create(rhs_uo,rhs_vo,rhs_wo,rhs_p) &
+  !$acc      copy(nu_t,avg_nu_t) &
+  !$acc      create(Fu1,Fu2,Fv1,Fv2,Fw1,Fw2) &
+  !$acc      copy(alpha_x,alpha_y,alpha_z) &
+  !$acc      copy(alpha_xo,alpha_yo,alpha_zo) &
+  !$acc      copy(V_bottom) &
+  !$acc      copyin(bc_1,bc_2)
+
   ! temporal loop
   Do istep = 1, nsteps
-     
+
      ! compute dt based on CFL
      Call compute_dt
 
@@ -70,7 +89,8 @@ Program boundary_layer_FD
      End If
 
      ! compute a few statistics
-     Call compute_statistics 
+     !$acc update self(U,V,W,P,nu_t)
+     Call compute_statistics
      !Call compute_statistics_z_modes
 
      ! output some key values
@@ -80,6 +100,8 @@ Program boundary_layer_FD
      Call output_data
 
   End Do
+
+  !$acc end data
 
   ! finalize stuff
   Call finalize

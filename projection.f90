@@ -20,7 +20,7 @@ Contains
   Subroutine compute_projection_step
 
     Call compute_pseudo_pressure_rhs
- 
+
     Call solve_poisson_equation
 
     Call project_velocity
@@ -42,10 +42,11 @@ Contains
     Integer(Int32) :: i, j, k
 
     ! rhs_p locate at cell centers
+    !$acc parallel loop collapse(3) default(present)
     Do k = 2, nzg-1
        Do j = 2, nyg-1
           Do i = 2, nxg-1
-             rhs_p(i,j,k)  = ( U(i,j,k) - U(i-1,j,k) )/( x(i)-x(i-1) ) + & ! du*/dx 
+             rhs_p(i,j,k)  = ( U(i,j,k) - U(i-1,j,k) )/( x(i)-x(i-1) ) + & ! du*/dx
                              ( V(i,j,k) - V(i,j-1,k) )/( y(j)-y(j-1) ) + & ! dv*/dy
                              ( W(i,j,k) - W(i,j,k-1) )/( z(k)-z(k-1) )     ! dw*/dz
           End Do
@@ -81,17 +82,10 @@ Contains
     ! Lapack function for solving tridiagonal systems
     External :: zgesv
 
+    ! Transfer rhs_p from GPU to CPU for FFT operations
+    !$acc update self(rhs_p)
+
     ! cosine tranform in x and Fourier transform in x (interior points)
-    ! cosine transform:
-    ! Signal [a, b, c, d] becomes
-    ! [0, a, 0, b, 0,  c,  0,  d,  0,  d,  0,  c, 0, b, 0, a].
-    ! Then take the FFT to get the spectrum
-    ! [A, B, C, D, 0, -D, -C, -B, -A, -B, -C, -D, 0, D, C, B]
-    ! then throw away everything but the first [A, B, C, D], and you're done
-    ! Sizes: 
-    ! plane_short = plane_short(1:nxp   ,1:nzp  )
-    ! plane       = plane      (1:nxpe  ,1:nzp  )
-    ! plane_hat   = plane_hat  (0:nxpe-1,0:nzp-1)
     Do j = 2, nyg-1
        plane_short = dcmplx( rhs_p ( 2:nxp+1, j, 2:nzp+1 ) )
        plane       = (0d0,0d0)
@@ -106,21 +100,21 @@ Contains
           ii = ii + 1
        End Do
        Call fftw_mpi_execute_dft(plan_d, plane, plane_hat)
-       rhs_p_hat(:, j, :) = plane_hat(0:mx,:) 
+       rhs_p_hat(:, j, :) = plane_hat(0:mx,:)
     End Do
 
     ! solve for each mode
     Do k = 0, mz
        Do i = 0, mx
-          ! mapping to x-mode 
+          ! mapping to x-mode
           !i_global = imode_map_fft( i, k )
           i_global = imode_map( i )
-          ! mapping to z-mode 
+          ! mapping to z-mode
           !k_global = kmode_map_fft( i, k )
           k_global = kmode_map( k )
-          ! form matrix          
+          ! form matrix
           Do j = 2, nyg-1 ! diagonal
-             D(j) = Dyy(j,j) + kxx(i_global) + kzz(k_global) 
+             D(j) = Dyy(j,j) + kxx(i_global) + kzz(k_global)
           End Do
           Do j = 2, nyg-2 ! lower diagonal
              DL(j) = Dyy(j+1,j)
@@ -129,25 +123,15 @@ Contains
              DU(j) = Dyy(j,j+1)
           End Do
           ! remove singularity 00 mode (set a reference pseudo-pressure)
-          If ( i_global==0 .And. k_global==0 ) D(2) = 3d0/2d0*D(2) 
+          If ( i_global==0 .And. k_global==0 ) D(2) = 3d0/2d0*D(2)
           ! solve M*u = rhs (solution stored in rhs_p_hat)
           rhs_aux = rhs_p_hat (i, :, k)
-          Call Zgtsv( nr, nrhs, DL, D, DU, rhs_aux, nr, info) 
+          Call Zgtsv( nr, nrhs, DL, D, DU, rhs_aux, nr, info)
           rhs_p_hat (i, :, k) = rhs_aux
        End Do
     End Do
 
     ! inverse cosine transform in x and Fourier in z
-    ! inverse cosine transform:
-    ! Signal [A, B, C, D] becomes
-    ! [A, B, C, D, 0, -D, -C, -B, -A, -B, -C, -D, 0, D, C, B]
-    ! Then take the iFFT to get the spectrum
-    ! [0, a, 0, b, 0,  c,  0,  d,  0,  d,  0,  c, 0, b, 0, a].
-    ! then throw away everything but the first [a, b, c, d], and you're done.
-    ! Sizes: 
-    ! plane_short = plane_short(1:nxp   ,1:nzp  )
-    ! plane       = plane      (1:nxpe  ,1:nzp  )
-    ! plane_hat   = plane_hat  (0:nxpe-1,0:nzp-1)
     Do j = 2, nyg-1
        plane_hat            = (0d0,0d0)
        plane_hat(0:nxp-1,:) = rhs_p_hat(:,j,:)
@@ -174,14 +158,18 @@ Contains
        End Do
     End Do
 
+    ! Transfer rhs_p back from CPU to GPU
+    !$acc update device(rhs_p)
+
     ! periodic boundary conditions in z
-    Call apply_periodic_z_pressure 
+    Call apply_periodic_z_pressure
 
     ! update ghost interior planes
     Call update_ghost_interior_planes_pressure
 
     ! save pressure for statistics
     If ( rk_step == 1 ) Then
+       !$acc kernels default(present)
        P( 2:nxg-1, 2:nyg-1, 2:nzg-1 ) = rhs_p/(dt*rk2_coef(1,1)) ! to be checked
        P(  1,:,:) = P(    2,:,:)
        P(nxg,:,:) = P(nxg-1,:,:)
@@ -189,8 +177,9 @@ Contains
        P(:,nyg,:) = P(:,nyg-1,:)
        P(:,:,  1) = P(:,:,    2)
        P(:,:,nzg) = P(:,:,nzg-1)
+       !$acc end kernels
     End If
-    
+
   End Subroutine solve_poisson_equation
 
   !--------------------------------------------------!
@@ -199,11 +188,14 @@ Contains
   Subroutine apply_periodic_z_pressure
 
     ! compute compute last point from Neumann BC (All processors, no MPI needed)
+    !$acc kernels default(present)
     rhs_p( nxg-1, :, : ) = rhs_p( nxg-2, :, : )
- 
-    ! apply periodicity in z (Only first and last processor, MPI needed) 
+    !$acc end kernels
+
+    ! apply periodicity in z (Only first and last processor, MPI needed)
+    !$acc update self(rhs_p)
     If     ( myid==0 ) Then
-       buffer_p = rhs_p ( 2:nxg-1, :, 2 ) 
+       buffer_p = rhs_p ( 2:nxg-1, :, 2 )
        ! send data to nprocs-1
        Call Mpi_send(buffer_p, (nxg-2)*(nyg-2), MPI_real8, nprocs-1, 0, &
              MPI_COMM_WORLD,ierr)
@@ -213,6 +205,7 @@ Contains
             MPI_COMM_WORLD,istat,ierr)
        rhs_p ( 2:nxg-1, :, nzp+1+1 ) = buffer_p
     End If
+    !$acc update device(rhs_p)
 
   End Subroutine apply_periodic_z_pressure
 
@@ -223,13 +216,13 @@ Contains
 
     Integer(Int32) :: sendto, recvfrom
     Integer(Int32) :: tagto,  tagfrom
-    
-    !----------------------update P-----------------------!    
+
+    !----------------------update P-----------------------!
     ! send to bottom processor, receive from top one
     sendto   = myid - 1
     tagto    = myid - 1
     recvfrom = myid + 1
-    tagfrom  = myid 
+    tagfrom  = myid
     If ( myid==0 ) Then
        sendto = MPI_PROC_NULL
        tagto  = 0
@@ -238,11 +231,13 @@ Contains
        recvfrom = MPI_PROC_NULL
        tagfrom  = MPI_ANY_TAG
     End If
+    !$acc update self(rhs_p(:,:,2))
     buffer_ps = rhs_p(:,:,2)  ! send buffer
     Call Mpi_sendrecv(buffer_ps, (nxg-2)*(nyg-2), Mpi_real8, sendto, tagto,        &
          buffer_pr, (nxg-2)*(nyg-2), Mpi_real8, recvfrom, tagfrom, MPI_COMM_WORLD, &
-         istat, ierr)   
-    If ( myid/=nprocs-1 ) rhs_p(:,:,nzg) = buffer_pr ! received buffer 
+         istat, ierr)
+    If ( myid/=nprocs-1 ) rhs_p(:,:,nzg) = buffer_pr ! received buffer
+    !$acc update device(rhs_p(:,:,nzg))
 
   End Subroutine update_ghost_interior_planes_pressure
 
@@ -261,20 +256,23 @@ Contains
     Integer(Int32) :: i, j, k
 
     ! project U (interior points)
+    !$acc parallel loop default(present)
     Do i = 2, nx-1
-       U(i,2:nyg-1,2:nzg-1) = U(i,2:nyg-1,2:nzg-1) - & 
+       U(i,2:nyg-1,2:nzg-1) = U(i,2:nyg-1,2:nzg-1) - &
             ( rhs_p(i+1,2:nyg-1,2:nzg-1) - rhs_p(i,2:nyg-1,2:nzg-1) )/( xg(i+1) - xg(i) )
     End Do
 
     ! project V (interior points)
+    !$acc parallel loop default(present)
     Do j = 2, ny-1
-       V(2:nxg-1,j,2:nzg-1) = V(2:nxg-1,j,2:nzg-1) - & 
+       V(2:nxg-1,j,2:nzg-1) = V(2:nxg-1,j,2:nzg-1) - &
             ( rhs_p(2:nxg-1,j+1,2:nzg-1) - rhs_p(2:nxg-1,j,2:nzg-1) )/( yg(j+1) - yg(j) )
     End Do
 
     ! project W (interior points)
+    !$acc parallel loop default(present)
     Do k = 2, nz-1
-       W(2:nxg-1,2:nyg-1,k) = W(2:nxg-1,2:nyg-1,k) - & 
+       W(2:nxg-1,2:nyg-1,k) = W(2:nxg-1,2:nyg-1,k) - &
             ( rhs_p(2:nxg-1,2:nyg-1,k+1) - rhs_p(2:nxg-1,2:nyg-1,k) )/( zg(k+1) - zg(k) )
     End Do
 
@@ -292,20 +290,21 @@ Contains
     Real(Int64), Intent(Out) :: max_divergence
 
     Real   (Int64) :: max_divergence_local, div
-    Integer(Int32) :: i, j, k    
+    Integer(Int32) :: i, j, k
 
     ! compute divergence interior points
     div = 0d0
-    Do k = 2, nzg-1     
-       Do j = 2, nyg-1 
-          Do i = 2, nxg-2 ! last x-plane is dummy, not projected 
-             div  = Max( div, Abs( ( U(i,j,k) - U(i-1,j,k) )/( x(i)-x(i-1) ) + &   ! du/dx 
+    !$acc parallel loop collapse(3) default(present) reduction(max:div)
+    Do k = 2, nzg-1
+       Do j = 2, nyg-1
+          Do i = 2, nxg-2 ! last x-plane is dummy, not projected
+             div  = Max( div, Abs( ( U(i,j,k) - U(i-1,j,k) )/( x(i)-x(i-1) ) + &   ! du/dx
                                    ( V(i,j,k) - V(i,j-1,k) )/( y(j)-y(j-1) ) + &   ! dv/dy
-                                   ( W(i,j,k) - W(i,j,k-1) )/( z(k)-z(k-1) )   ) ) ! dw/dz 
+                                   ( W(i,j,k) - W(i,j,k-1) )/( z(k)-z(k-1) )   ) ) ! dw/dz
           End Do
        End Do
     End Do
- 
+
     ! get maximum
     max_divergence_local = div
 

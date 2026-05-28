@@ -274,7 +274,7 @@ Contains
 
     ! local variables
     Integer(Int32) :: j, k
-    Real   (Int64) :: Amp_loc
+    Real   (Int64) :: Amp_loc, rr
 
     ! Apply Blasius + random perturbations once per time step
     ! (step_beginning=1 at the start of each step, set to 0 after first BC call)
@@ -284,19 +284,22 @@ Contains
        Do j=1,nyg
           Amp_loc = Amplitude_perturbations * (1d0 - U_inlet(j))
           Do k=1,nzg
-             U_(1,j,k) = U_inlet(j) + Amp_loc*(rand()-0.5d0)
+             Call random_number(rr)
+             U_(1,j,k) = U_inlet(j) + Amp_loc*(rr-0.5d0)
           End Do
        End Do
        Do j=1,nyg
           Amp_loc = Amplitude_perturbations * (1d0 - U_inlet(j))
           Do k=1,nz
-             W_(1,j,k) = W_inlet(j) + Amp_loc*(rand()-0.5d0)
+             Call random_number(rr)
+             W_(1,j,k) = W_inlet(j) + Amp_loc*(rr-0.5d0)
           End Do
        End Do
        Do j=1,ny
           Amp_loc = Amplitude_perturbations * (1d0 - U_inlet(min(j,nyg)))
           Do k=1,nzg
-             V_(1,j,k) = V_inlet(j) + Amp_loc*(rand()-0.5d0)
+             Call random_number(rr)
+             V_(1,j,k) = V_inlet(j) + Amp_loc*(rr-0.5d0)
           End Do
        End Do
 
@@ -319,7 +322,7 @@ Contains
     Real(Int64), Dimension(:,:,:), Intent(InOut) :: U_ , V_,  W_
 
     ! local variables
-    Real   (Int64) :: Amp_per
+    Real   (Int64) :: Amp_per, rr
     Integer(Int32) :: j, k
 
     If ( step_beginning == 1 ) Then
@@ -327,24 +330,27 @@ Contains
        ! compute temporal component of the inflow
        !Call compute_temporal_inflow
 
-       ! perturbation 
+       ! perturbation
        Amp_per = Amplitude_perturbations
-       
-       ! variables at centers 
+
+       ! variables at centers
        Do j=1,nyg
           Do k=1,nzg
-             U_(1,j,k) = U_inlet(j) + Amp_per*(rand()-0.5d0)*(U_inlet(ny)-U_inlet(j))
+             Call random_number(rr)
+             U_(1,j,k) = U_inlet(j) + Amp_per*(rr-0.5d0)*(U_inlet(ny)-U_inlet(j))
           End Do
        End Do
        Do j=1,nyg
           Do k=1,nz
-             W_(1,j,k) = W_inlet(j) + Amp_per*(rand()-0.5d0)*(U_inlet(ny)-U_inlet(j))
+             Call random_number(rr)
+             W_(1,j,k) = W_inlet(j) + Amp_per*(rr-0.5d0)*(U_inlet(ny)-U_inlet(j))
           End Do
        End Do
        ! variables at faces
        Do j=1,ny
           Do k=1,nzg
-             V_(1,j,k) = V_inlet(j) + Amp_per*(rand()-0.5d0)*(U_inlet(ny)-U_inlet(j))
+             Call random_number(rr)
+             V_(1,j,k) = V_inlet(j) + Amp_per*(rr-0.5d0)*(U_inlet(ny)-U_inlet(j))
           End Do
        End Do
 

@@ -1966,13 +1966,13 @@ Contains
     ! solve equation at each x-location
     Do i = 2, nx_global-1
        utau_model0       = utau_model(i)
-       If ( Isnan(utau_model(i)) ) utau_model(i) = 0d0
+       If ( utau_model(i) /= utau_model(i) ) utau_model(i) = 0d0
        Umean_model_local = Sum( U_(i,jref,2:nzg-1) )
        Call MPI_Allreduce(Umean_model_local,Umean_model,1,MPI_real8,MPI_sum,MPI_COMM_WORLD,ierr)
        Umean_model = Umean_model/Real( nzg_global-2, 8) 
        Call Newton_iter_solver(f_law_of_wall, df_law_of_wall, utau_model0, utau_model1, iters, .false.)
        utau_model(i) = utau_model1
-       If ( Isnan(utau_model(i)) ) utau_model(i) = 0d0
+       If ( utau_model(i) /= utau_model(i) ) utau_model(i) = 0d0
        iters_max     = Max(iters_max,iters)
     End Do
     utau_model(1)         = utau_model(2)

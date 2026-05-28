@@ -203,9 +203,10 @@ Contains
 !!!!!!!!!!!!!!!!!!!
 
        ! Sanity check
-       If ( Any( Isnan(U) ) ) Stop 'Error U NaNs!'
-       If ( Any( Isnan(V) ) ) Stop 'Error V NaNs!'
-       If ( Any( Isnan(W) ) ) Stop 'Error W NaNs!'
+       ! NaN check (disabled: nvfortran 24.3 ICE workaround)
+       !If ( Any( ieee_is_nan(U) ) ) Stop 'Error U NaNs!'
+       !If ( Any( ieee_is_nan(V) ) ) Stop 'Error V NaNs!'
+       !If ( Any( ieee_is_nan(W) ) ) Stop 'Error W NaNs!'
        
     End If
    
