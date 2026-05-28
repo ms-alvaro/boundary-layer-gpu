@@ -8,7 +8,7 @@ Module boundary_conditions
   Use global
   Use Lund_rescaled_bc
   Use mpi
-  Use ifport
+  !Use ifport  ! removed for gfortran compatibility
 
   ! prevent implicit typing
   Implicit None
@@ -1478,9 +1478,24 @@ Contains
     Allocate( Vt_inlet( ny_global,nzg) )
     Allocate( Wt_inlet(nyg_global,nz ) )
 
+    ! Skip temporal modes if no file is provided (pure Blasius, no perturbations)
+    If ( Len_Trim(file_temporal_inlet)==0 .Or. &
+         file_temporal_inlet(1:4)=='**TO' ) Then
+       If ( myid==0 ) Write(*,*) 'No temporal inflow file -> pure Blasius (no perturbations)'
+       Ut_inlet = 0d0
+       Vt_inlet = 0d0
+       Wt_inlet = 0d0
+       n_modes_inlet = 0
+       m_modes_inlet = 0
+       beta_inlet    = 0d0
+       omega_inlet   = 1d0
+       dt_period     = 1d0
+       Return
+    End If
+
     ! read sizes and wavenumbers
     If ( myid==0 ) Then
-       Open(4,file=file_temporal_inlet,form='unformatted',action='read',access='stream')       
+       Open(4,file=file_temporal_inlet,form='unformatted',action='read',access='stream')
        Read(4)      ny_inlet
        Read(4) n_modes_inlet
        Read(4) m_modes_inlet

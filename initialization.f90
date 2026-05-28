@@ -291,16 +291,16 @@ Contains
     ! create MPI plan for forward DFT (note dimension reversal and transposed_out/in and x4 for cosine transform)
     ! uses imode_map_fft and kmode_map_fft
 !    plan_d = fftw_mpi_plan_dft_2d( nzp_global, nxpe_global, plane, plane_hat,          & 
-!             MPI_COMM_WORLD,  FFTW_FORWARD, ior(FFTW_MEASURE, FFTW_MPI_TRANSPOSED_OUT) ) 
+!             MPI_COMM_WORLD,  FFTW_FORWARD, ior(FFTW_ESTIMATE, FFTW_MPI_TRANSPOSED_OUT) ) 
 !    plan_i = fftw_mpi_plan_dft_2d( nzp_global, nxpe_global, plane_hat, plane,          & 
-!             MPI_COMM_WORLD, FFTW_BACKWARD, ior(FFTW_MEASURE, FFTW_MPI_TRANSPOSED_IN)  ) 
+!             MPI_COMM_WORLD, FFTW_BACKWARD, ior(FFTW_ESTIMATE, FFTW_MPI_TRANSPOSED_IN)  ) 
 
     ! create MPI plan for forward DFT (note dimension reversal and x4 for cosine transform)
     ! uses imode_map, kmode_map
     plan_d = fftw_mpi_plan_dft_2d( nzp_global, nxpe_global, plane, plane_hat, & 
-             MPI_COMM_WORLD,  FFTW_FORWARD, FFTW_MEASURE ) 
+             MPI_COMM_WORLD,  FFTW_FORWARD, FFTW_ESTIMATE ) 
     plan_i = fftw_mpi_plan_dft_2d( nzp_global, nxpe_global, plane_hat, plane, & 
-             MPI_COMM_WORLD, FFTW_BACKWARD, FFTW_MEASURE ) 
+             MPI_COMM_WORLD, FFTW_BACKWARD, FFTW_ESTIMATE ) 
 
     ! global Fourier coeficients with modified wave-number for the second derivative
     Allocate ( kxx(0:mx_global), kzz(0:mz_global) ) 
@@ -325,7 +325,9 @@ Contains
     Allocate ( kmode_map(0:mz) ) 
     imode_map = 0
     kmode_map = 0
-    imode_map = (/0:mx/)
+    Do i = 0, mx
+       imode_map(i) = i
+    End Do
     Do k = 0, mz
        kmode_map(k) = k + myid*nslices_z
     End Do
@@ -547,11 +549,11 @@ Contains
        If ( myid==0 ) Write(*,*) 'initializing turbulent boundary conditions...' 
        Call compute_turbulent_solution_for_bc
     Else
-       If ( myid==0 ) Write(*,*) 'initializing blasius boundary conditions...' 
+       If ( myid==0 ) Write(*,*) 'initializing blasius boundary conditions...'
        Call compute_blasius_solution_for_bc
     End If
 
-    If ( myid==0 ) Write(*,*) 'initializating some statistics...' 
+    If ( myid==0 ) Write(*,*) 'initializating some statistics...'
     !--------------Means for Lund's rescaling inflow-----------!    
     Allocate(Umean_resc_T       (nyg,1), Vmean_resc_T       (ny,1))
     Allocate(Umean_resc_T_local (nyg,1), Vmean_resc_T_local (ny,1))

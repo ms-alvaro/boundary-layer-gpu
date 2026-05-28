@@ -11,7 +11,7 @@ EXE = boundary_layer_1.1
 ## source code path
 SRC = pwd
 
-F90=mpifort
+F90=mpifort -ffree-line-length-none
 
 ####################################################################
 # END INPUT ########################################################
@@ -32,7 +32,7 @@ FFTFLAGS = -I$(FFTWDIR)/include/
 #################################################### linker flags
 
 ## general 
-FFT_LFLAGS = -L$(FFTWDIR)/lib/ -lfftw3_mpi -lfftw3 -lm -lmpi
+FFT_LFLAGS = -L$(FFTWDIR)/lib/ -lfftw3_mpi -lfftw3 -lm
 LAPACK_LFLAGS = -L$(LAPACKDIR) -llapack
 
 LFLAGS += $(FFT_LFLAGS) 
@@ -45,8 +45,9 @@ LFLAGS += $(LAPACK_LFLAGS)
 ## test    -> -O0 -g -traceback -check all -check bounds
 ## profile -> -pg -O0 -fno-inline-functions
 ## run     -> -O3 -ipo
-FEXDEB = -O0 -g -traceback -check all -check bounds
-FEXOPT = -O3 -ipo
+## GFORTRAN FLAGS
+FEXDEB = -O0 -g -fbacktrace -fcheck=all -fbounds-check -Wall
+FEXOPT = -O2
 
 debug:  FEX = $(FEXDEB)
 $(EXE): FEX = $(FEXOPT)

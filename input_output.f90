@@ -7,12 +7,15 @@ Module input_output
   Use iso_fortran_env, Only : error_unit, Int32, Int64
   Use global
   Use mpi
-  Use ifport
+  !Use ifport  ! removed for gfortran compatibility
   Use pressure
   Use boundary_conditions, Only : apply_periodic_bc_z
 
   ! prevent implicit typing
   Implicit None
+
+  ! fseek constants for gfortran
+  Integer, Parameter :: seek_set = 0, seek_cur = 1, seek_end = 2
 
 Contains
 
@@ -95,6 +98,11 @@ Contains
     Call Mpi_bcast (Amplitude_perturbations,1,MPI_real8,0,MPI_COMM_WORLD,ierr )
     Call Mpi_bcast (           beta_hartree,1,MPI_real8,0,MPI_COMM_WORLD,ierr )
 
+    Call Mpi_bcast ( file_inflow,         200,MPI_character,0,MPI_COMM_WORLD,ierr )
+    Call Mpi_bcast ( file_temporal_inlet,  200,MPI_character,0,MPI_COMM_WORLD,ierr )
+    Call Mpi_bcast ( filein,              200,MPI_character,0,MPI_COMM_WORLD,ierr )
+    Call Mpi_bcast ( fileout,             200,MPI_character,0,MPI_COMM_WORLD,ierr )
+
     !  Vbs_max, x_bs, sigma_bs, phi_bs, dummy
     Call Mpi_bcast (  Vbs_max,1,MPI_real8,0,MPI_COMM_WORLD,ierr )
     Call Mpi_bcast (     x_bs,1,MPI_real8,0,MPI_COMM_WORLD,ierr )
@@ -119,12 +127,18 @@ Contains
   !                                                !
   !------------------------------------------------!
   Subroutine init_flow
-  
+
     Integer(Int32) :: ll, ii, jj, kk, i, j, k
     Real   (Int64) :: alpha
 
+    ! Blasius IC variables
+    Integer(Int32) :: n_source, j0, j1
+    Real   (Int64), Allocatable, Dimension(:) :: eta_source, f_source, df_source
+    Real   (Int64) :: eta_local, w0, w1, U_inf, Rex_ref
+    Real   (Int64), Allocatable, Dimension(:) :: xg_init, yg_init
+
     If (myid==0) Then
-       Write(*,*) 'Generating random initial condition'
+       Write(*,*) 'Generating initial condition'
     End If
 
     ! start time
@@ -136,8 +150,8 @@ Contains
        x_global(i) = Real(i-1,8)
     End Do
     x_global = x_global - x_global(1)
-    x_global = 1d0 + x_global/Maxval(x_global)*Lx_rand 
-    
+    x_global = 1d0 + x_global/Maxval(x_global)*Lx_rand
+
     ! zmesh
     Do k=1,nz_global
        z_global(k) = Real(k-1,8)
@@ -151,50 +165,102 @@ Contains
     End Do
     y_global = y_global - y_global(1)
     y_global = y_global/Maxval(y_global)
-    !If ( iwall_model == 0 ) Then
        alpha = alpha_rand
        Do i=1,ny_global
           y_global(i) = dsinh(alpha*y_global(i))/dsinh(alpha)
        End Do
-    !End If
     y_global = y_global - y_global(1)
     y_global = y_global/Maxval(y_global)*Ly_rand
 
-    ! U
-    U = 1d0
-!    Do jj=1,ny_global/10
-!       U(:,jj,:) = ( y_global(jj)/y_global(ny_global/10) )**2d0
-!    end Do
+    ! ---- Compute center grids (yg, xg) needed for IC ----
+    ! xg_init: center points + ghost for U (at x-faces, y-centers)
+    ! yg_init: center points + ghost for U,W (at x-centers/faces, y-centers)
+    Allocate( yg_init(nyg_global) )
+    Do j=1,nym_global
+       yg_init(j+1) = 0.5d0*( y_global(j) + y_global(j+1) )
+    End Do
+    yg_init(1)           = yg_init(2)          - 2d0*(yg_init(2)-y_global(1))
+    yg_init(nyg_global)  = yg_init(nym_global+1) + 2d0*(y_global(ny_global)-yg_init(nym_global+1))
+
+    Allocate( xg_init(nxg_global) )
+    Do i=1,nxm_global
+       xg_init(i+1) = 0.5d0*( x_global(i) + x_global(i+1) )
+    End Do
+    xg_init(1)           = xg_init(2)          - 2d0*(xg_init(2)-x_global(1))
+    xg_init(nxg_global)  = xg_init(nxm_global+1) + 2d0*(x_global(nx_global)-xg_init(nxm_global+1))
+
+    ! ---- Read Blasius self-similar solution ----
+    U_inf = 1d0
+
+    Open(4,file=file_inflow,form='formatted',action='read')
+    Read(4,*) n_source
+    Allocate(eta_source(n_source), f_source(n_source), df_source(n_source))
+    Read(4,*) eta_source
+    Read(4,*) f_source
+    Read(4,*) df_source
+    Close(4)
+
+    If (myid==0) Write(*,*) '   Blasius IC: read ', n_source, ' points from ', Trim(file_inflow)
+
+    ! ---- Initialize U with Blasius: U(x,y) = U_inf * f'(eta) ----
+    ! U is at x-faces (x_global), y-centers (yg_init)
+    U = U_inf
     Do ii=1,nx_global
        Do jj=1,nyg_global
-          Do kk=1,nzg
-             U(ii,jj,kk) =  U(ii,jj,kk) + 0.1*(rand()-0.5)*( real(nyg_global-jj)/real(nyg_global) )**8d0
+          eta_local = yg_init(jj) * dsqrt( U_inf/(2d0*nu*x_global(ii)) )
+          j0 = 0
+          Do k=2,n_source
+             If ( eta_source(k) > eta_local ) Then
+                j0 = k - 1
+                j1 = k
+                w1 = (eta_local - eta_source(j0))/(eta_source(j1) - eta_source(j0))
+                w0 = 1d0 - w1
+                Exit
+             End If
           End Do
+          If ( j0 > 0 ) Then
+             U(ii,jj,:) = U_inf * (w0*df_source(j0) + w1*df_source(j1))
+          Else
+             U(ii,jj,:) = U_inf
+          End If
        End Do
     End Do
 
-    ! V
+    ! ---- Initialize V with Blasius: V(x,y) = U_inf/sqrt(2*Rex)*(eta*f'-f) ----
+    ! V is at x-centers (xg_init), y-faces (y_global)
     V = 0d0
     Do ii=1,nxg_global
+       Rex_ref = U_inf*xg_init(ii)/nu
        Do jj=1,ny_global
-          Do kk=1,nzg
-             V(ii,jj,kk) = V(ii,jj,kk) + 0.1*(rand()-0.5)*( real(nyg_global-jj)/real(nyg_global) )**8d0
+          eta_local = y_global(jj) * dsqrt( U_inf/(2d0*nu*xg_init(ii)) )
+          j0 = 0
+          Do k=2,n_source
+             If ( eta_source(k) > eta_local ) Then
+                j0 = k - 1
+                j1 = k
+                w1 = (eta_local - eta_source(j0))/(eta_source(j1) - eta_source(j0))
+                w0 = 1d0 - w1
+                Exit
+             End If
           End Do
+          If ( j0 > 0 ) Then
+             V(ii,jj,:) = U_inf/dsqrt(2d0*Rex_ref) * &
+                ( w0*(eta_source(j0)*df_source(j0)-f_source(j0)) + &
+                  w1*(eta_source(j1)*df_source(j1)-f_source(j1)) )
+          Else
+             V(ii,jj,:) = U_inf/dsqrt(2d0*Rex_ref) * &
+                (eta_source(n_source)*df_source(n_source)-f_source(n_source))
+          End If
        End Do
     End Do
 
-    ! W
+    ! W = 0 (2D laminar flow)
     W = 0d0
-    Do ii=1,nxg_global
-       Do jj=1,ny_global
-          Do kk=1,nz
-             W(ii,jj,kk) = W(ii,jj,kk) + 0.1*(rand()-0.5)*( real(nyg_global-jj)/real(nyg_global) )**8d0
-          End Do
-       End Do
-    End Do
+
+    Deallocate(eta_source, f_source, df_source, yg_init, xg_init)
 
     If ( myid==0 ) Then
-       Write(*,*) 'Random initial condition:'
+       Write(*,*) 'Blasius initial condition:'
        Write(*,*) '   Lx     : ',Lx_rand
        Write(*,*) '   Ly     : ',Ly_rand
        Write(*,*) '   Lz     : ',Lz_rand
@@ -203,7 +269,7 @@ Contains
        Write(*,*) '   Max U : ',MaxVal(U)
        Write(*,*) '   Max V : ',MaxVal(V)
        Write(*,*) '   Max W : ',MaxVal(W)
-       
+
        Write(*,*) '   Mean U : ',sum(U)/Real(nx_global*nyg_global*nzg_global,8)
        Write(*,*) '   Mean V : ',sum(V)/Real(nxg_global*ny_global*nzg_global,8)
        Write(*,*) '   Mean W : ',sum(W)/Real(nxg_global*nyg_global*nz_global,8)
@@ -299,11 +365,11 @@ Contains
        Do iproc = 1, nprocs-1
           nzge = kg2_global(iproc) - kg1_global(iproc) + 1 ! local size in z for processor iproc
           If ( iproc<nprocs-1 ) Then
-             ndum = fseek(1,-2*nx_global*nyg_global*8,seek_cur) ! ghost cell
+             call fseek(1,-2*nx_global*nyg_global*8,seek_cur) ! ghost cell
              Read(1) Uo(:,:,1:nzge)
              Call Mpi_send(Uo,nx*nyg*nzge,Mpi_real8,iproc,iproc,MPI_COMM_WORLD,ierr)
           Else ! especial case: U has different size for last processor
-             ndum = fseek(1,-2*nx_global*nyg_global*8,seek_cur) ! ghost cell
+             call fseek(1,-2*nx_global*nyg_global*8,seek_cur) ! ghost cell
              Read(1) Uoo(:,:,1:nzge)
              Call Mpi_send(Uoo,nx*nyg*nzge,Mpi_real8,iproc,iproc,MPI_COMM_WORLD,ierr)
           End If
@@ -315,7 +381,7 @@ Contains
     ! V
     If ( myid==0 ) Then
        ! go to correct position. I dont know, if I dont do this it gets lost
-       ndum = fseek(1,pos_header+3*4+nsize_U,seek_set)
+       call fseek(1,pos_header+3*4+nsize_U,seek_set)
        ! read dummy
        Read(1) nn
        ! read data for processor 0
@@ -325,11 +391,11 @@ Contains
        Do iproc = 1, nprocs-1
           nzge = kg2_global(iproc) - kg1_global(iproc) + 1 ! local size in z for processor iproc
           If ( iproc<nprocs-1 ) Then
-             ndum = fseek(1,-2*nxg_global*ny_global*8,seek_cur) ! ghost cell
+             call fseek(1,-2*nxg_global*ny_global*8,seek_cur) ! ghost cell
              Read(1) Vo(:,:,1:nzge) 
              Call Mpi_send(Vo,nxg*ny*nzge,Mpi_real8,iproc,iproc,MPI_COMM_WORLD,ierr)
           Else ! especial case: V has different size for last processor
-             ndum = fseek(1,-2*nxg_global*ny_global*8,seek_cur) ! ghost cell
+             call fseek(1,-2*nxg_global*ny_global*8,seek_cur) ! ghost cell
              Read(1) Voo(:,:,1:nzge) 
              Call Mpi_send(Voo,nxg*ny*nzge,Mpi_real8,iproc,iproc,MPI_COMM_WORLD,ierr)
           End If
@@ -341,7 +407,7 @@ Contains
     ! W
     If ( myid==0 ) Then
        ! go to correct position. I dont know, if I dont do this it gets lost
-       ndum = fseek(1,pos_header+3*4+nsize_U+3*4+nsize_V,seek_set)
+       call fseek(1,pos_header+3*4+nsize_U+3*4+nsize_V,seek_set)
        ! read dummy
        Read(1) nn
        ! read data for processor 0
@@ -351,11 +417,11 @@ Contains
        Do iproc = 1, nprocs-1
           nze = k2_global(iproc) - k1_global(iproc) + 1 ! local size in z for processor iproc
           If ( iproc<nprocs-1 ) Then
-             ndum = fseek(1,-2*nxg_global*nyg_global*8,seek_cur) ! ghost cell
+             call fseek(1,-2*nxg_global*nyg_global*8,seek_cur) ! ghost cell
              Read(1) Wo(:,:,1:nzge)
              Call Mpi_send(Wo,nxg*nyg*nze,Mpi_real8,iproc,iproc,MPI_COMM_WORLD,ierr)
           Else ! especial case: W has different size for last processor
-             ndum = fseek(1,-2*nxg_global*nyg_global*8,seek_cur) ! ghost cell
+             call fseek(1,-2*nxg_global*nyg_global*8,seek_cur) ! ghost cell
              Read(1) Woo(:,:,1:nzge)
              Call Mpi_send(Woo,nxg*nyg*nze,Mpi_real8,iproc,iproc,MPI_COMM_WORLD,ierr)
           End If
@@ -432,7 +498,7 @@ Contains
     Character(8)     :: ext
     Integer  (Int32) :: iproc, nze, nzge
     
-    integer(4) status_, system ! to create a softlink
+    integer(4) status_ ! to create a softlink
     Character(200)   :: fname_symlnk
     Character(400)   :: string_link
     logical :: exists
@@ -590,11 +656,11 @@ Contains
           if (exists) then
               ! Open the file for writing
               !command = trim(adjustl('rm '//trim(adjustl(filename))
-              status_ = system( 'rm '//fname_symlnk )
+              call system( 'rm '//fname_symlnk )
           end if
 
           string_link = 'ln -s '//Trim(Adjustl(fname))//' '//Trim(fname_symlnk)
-          status_ = system( string_link )
+          call system( string_link )
 
        End If
 
@@ -633,7 +699,7 @@ Contains
        Write(*,*) 'writting ',Trim(Adjustl(fname))
        Open(3,file=fname,form='formatted',action='write') 
        !
-       Write(3,'(A,2F15.8,4I)') '%',t, nu, nx_global, ny_global, nz_global, istep
+       Write(3,'(A,2F15.8,4I8)') '%',t, nu, nx_global, ny_global, nz_global, istep
 
        my_format = '('//Trim(Adjustl(ext_nx))//'F15.8)'
        Write(3,my_format) Cf

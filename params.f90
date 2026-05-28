@@ -79,7 +79,7 @@
 
       use params
       use global
-      use ifport, only : MAKEDIRQQ
+      !use ifport, only : MAKEDIRQQ  ! removed for gfortran compatibility
 
       implicit none
 
@@ -105,12 +105,12 @@
             end select
         i = i+1
       end do
-      if (f.eq..FALSE.) then
+      if (f.eqv..FALSE.) then
           stop 'No input file provided. Use *.exe -i <input_file>'
       endif
 
       INQUIRE(FILE= paramsfilename, EXIST= f )
-      if ( f.eq..false. ) then
+      if ( f.eqv..false. ) then
           write(*,*) 'input file: ', &
              adjustl(trim(paramsfilename)), ' does not exist'
           stop
@@ -136,7 +136,7 @@
       call get_int('top_flag'     , top_boundary_flag, f)
 
       call get_str('inflow_file'     , file_inflow         , 200, f)
-      if (f.eq..FALSE.) then
+      if (f.eqv..FALSE.) then
           stop ' ERROR: you must specify a BL profile in inflow_file '
       endif
 
@@ -162,7 +162,7 @@
       call get_int('init_step'    , nstep_init_input, f)
       call get_int('init_rand'    , random_init     , f)
       call get_str('filein'       , filein,      200, f1)
-      if ( (random_init.eq.1) .and. (f1.eq..TRUE.) ) then
+      if ( (random_init.eq.1) .and. (f1.eqv..TRUE.) ) then
           stop ' ERROR: init_rand = 1, but filein exists'
       endif
       ! Assign input number if given
@@ -187,8 +187,8 @@
       write(*,*) fileout, Nout, fileout(1:i)
 
       inquire( FILE=trim( adjustl( fileout(1:i) ) ), EXIST=f1 )
-      if (f1.eqv..false.) then
-          f = MAKEDIRQQ ( trim( adjustl( fileout(1:i) ) ) )    
+      if (f1.eqv..FALSE.) then
+          call system( 'mkdir -p '//trim( adjustl( fileout(1:i) ) ) )
       endif
     
       call get_str('timeinflow_file' , file_temporal_inlet, 200, f)
@@ -196,7 +196,7 @@
       call get_int('RKscheme'        , itime_step   , f)        
 
       call get_dbl_arr('alphas'   , alphas, ndim+2 , f)
-      if (f.eq..TRUE.) then
+      if (f.eqv..TRUE.) then
           alpha_mean_x = alphas(1)
           alpha_mean_y = alphas(2)
           alpha_mean_z = alphas(3)
