@@ -45,10 +45,11 @@ WM = 0 ! (*)
 dPdx = 0.0 ! (*)
 dPdz = 0.0 ! (*)
 
-! Boundary condition for the top wall 
-!   0 -> Falkner-Skan, 
+! Boundary condition for the top wall
+!   0 -> impose velocity
 !   1 -> Coleman2018
 !   2 -> Abe2017
+!   3 -> Falkner-Skan
 top_flag = 1 ! (*)
 
 ! If top_flag is 1 or 2 we have to define additional inputs. Their definition 
