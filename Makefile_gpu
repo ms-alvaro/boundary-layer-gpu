@@ -23,7 +23,7 @@ WORK = $(PWD)
 PREBUILD = $(WORK)/prebuild
 OBJ = $(WORK)/build
 
-FFTWDIR=/home/alvaroms/opt/fftw-3.3.10
+FFTWDIR=/home/alvaroms/opt/fftw-3.3.10-nvhpc
 
 #################################################### compiler flags
 

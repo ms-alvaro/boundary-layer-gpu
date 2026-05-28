@@ -65,7 +65,7 @@ Program boundary_layer_FD
   !$acc      copyin(kxx,kzz,Dyy,imode_map,kmode_map) &
   !$acc      copyin(rk_coef,rk_t,rk2_coef,rk2_t) &
   !$acc      create(term,term_1,term_2) &
-  !$acc      create(rhs_uo,rhs_vo,rhs_wo,rhs_p) &
+  !$acc      create(rhs_uo,rhs_vo,rhs_wo) &
   !$acc      copy(nu_t,avg_nu_t) &
   !$acc      create(Fu1,Fu2,Fv1,Fv2,Fw1,Fw2) &
   !$acc      copy(alpha_x,alpha_y,alpha_z) &
