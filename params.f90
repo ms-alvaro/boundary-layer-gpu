@@ -159,6 +159,8 @@
       call get_int('WMnutflag'    , iwall_model_nut,  f)
       call get_int('WMnut'        , frac_vis_wall_model,  f)
 
+      call get_dbl('Amplitude'    , Amplitude_perturbations, f)
+
       call get_int('init_step'    , nstep_init_input, f)
       call get_int('init_rand'    , random_init     , f)
       call get_str('filein'       , filein,      200, f1)
