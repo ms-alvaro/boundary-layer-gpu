@@ -131,6 +131,9 @@ Module global
   Complex(C_DOUBLE_COMPLEX), Pointer,     Dimension(:,:) :: plane, plane_hat
   Complex(C_DOUBLE_COMPLEX), Allocatable, Dimension(:,:) :: plane_short
 
+  ! GPU workspace for cuFFT pressure solver
+  Complex(C_DOUBLE_COMPLEX), Allocatable, Dimension(:,:) :: plane_gpu
+
   ! Fourier points and wave numbers 
   Integer(C_INTPTR_T) :: nxp_global, nxpe_global, nzp_global, local_k_offset
   Integer(C_INTPTR_T) :: nxp, nxpe, nzp

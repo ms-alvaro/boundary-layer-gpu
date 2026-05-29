@@ -7,6 +7,7 @@ Module finalization
   Use iso_fortran_env, Only : error_unit, Int32, Int64
   Use global
   Use mpi
+  Use cufft_solver
   
   ! prevent implicit typing
   Implicit None
@@ -18,6 +19,8 @@ Contains
   !-------------------------------------------!
   Subroutine finalize
   
+    ! finalize cuFFT
+    Call cufft_destroy_plans
     ! finalize FFTW
     Call dfftw_destroy_plan(plan_d)
     Call dfftw_destroy_plan(plan_i)
