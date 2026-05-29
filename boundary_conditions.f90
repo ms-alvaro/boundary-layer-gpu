@@ -119,6 +119,101 @@ Contains
     Call apply_global_mass_conservation(U,V,W)
 
   End Subroutine apply_boundary_conditions
+
+  !---------------------------------------------------------!
+  !  GPU version: all BCs on GPU using module variables     !
+  !  For nprocs=1, iwall_model=0, top_flag=0, inflow_flag=1 !
+  !---------------------------------------------------------!
+  Subroutine apply_boundary_conditions_gpu
+
+    Integer(Int32) :: i, j, k
+    Real   (Int64) :: Uc, Qx_local, Qy_local, Q_local, Q_total, Delta_U, length_y
+    Integer(Int32) :: kk
+
+    ! Ghost cell updates: nprocs=1 -> no-op
+
+    ! Inflow BC (temporal modes + Blasius) — CPU side
+    Call compute_temporal_inflow
+    Do j=1,nyg
+       U(1,j,:) = U_inlet(j) + Ut_inlet(j,:)
+       W(1,j,:) = W_inlet(j) + Wt_inlet(j,:)
+    End Do
+    Do j=1,ny
+       V(1,j,:) = V_inlet(j) + Vt_inlet(j,:)
+    End Do
+    !$acc update device(U(1,:,:), V(1,:,:), W(1,:,:))
+
+    ! Outflow BC — on GPU
+    Uc = U_top(nx)
+    !$acc kernels default(present)
+    U( nx-1,:,:) = Uo( nx-1,:,:) - rk_t(rk_step)*dt*Uc*( Uo( nx-1,:,:) - Uo( nx-2,:,:) )/(x(nx-1)-x(nx-2))
+    V(nxg-1,:,:) = Vo(nxg-1,:,:) - rk_t(rk_step)*dt*Uc*( Vo(nxg-1,:,:) - Vo(nxg-2,:,:) )/(xg(nxg-1)-xg(nxg-2))
+    W(nxg-1,:,:) = Wo(nxg-1,:,:) - rk_t(rk_step)*dt*Uc*( Wo(nxg-1,:,:) - Wo(nxg-2,:,:) )/(xg(nxg-1)-xg(nxg-2))
+    U( nx,:,:) = U( nx-1,:,:)
+    V(nxg,:,:) = V(nxg-1,:,:)
+    W(nxg,:,:) = W(nxg-1,:,:)
+    !$acc end kernels
+
+    ! Periodic BC in z (nprocs=1) — on GPU
+    !$acc kernels default(present)
+    ! U (id=1): centers
+    U(:,:,1)     = U(:,:,nzg-2)
+    U(:,:,nzg-1) = U(:,:,2)
+    U(:,:,nzg)   = U(:,:,3)
+    ! V (id=2): centers
+    V(:,:,1)     = V(:,:,nzg-2)
+    V(:,:,nzg-1) = V(:,:,2)
+    V(:,:,nzg)   = V(:,:,3)
+    ! W (id=3): faces
+    W(:,:,1)  = W(:,:,nz-1)
+    W(:,:,nz) = W(:,:,2)
+    !$acc end kernels
+
+    ! Top BC (top_flag=0) — on GPU
+    !$acc parallel loop default(present)
+    Do i=1,nx
+       U(i,nyg,:) = U_top(i)
+    End Do
+    !$acc parallel loop default(present)
+    Do i=1,nxg
+       V(i, ny,:) = V_top(i)
+       W(i,nyg,:) = W_top(i)
+    End Do
+
+    ! Wall BC (iwall_model=0): Dirichlet — on GPU
+    !$acc kernels default(present)
+    ! U: center in y -> antisymmetric
+    U(:,1,:) = -U(:,2,:)
+    ! V: face in y -> zero
+    V(:,1,:) = 0d0
+    ! W: center in y -> antisymmetric
+    W(:,1,:) = -W(:,2,:)
+    !$acc end kernels
+
+    ! Global mass conservation — GPU reduction
+    Qx_local  = 0d0
+    length_y  = 0d0
+    kk        = 1
+    If ( myid==(nprocs-1) ) kk = 2
+    !$acc parallel loop default(present) reduction(+:Qx_local,length_y)
+    Do j = 2, nyg-1
+       Qx_local = Qx_local + Sum( (U(1,j,2:nzg-kk)-U(nx-1,j,2:nzg-kk))*(y(j)-y(j-1)) )
+       length_y = length_y + y(j)-y(j-1)
+    End Do
+    Qy_local = 0d0
+    !$acc parallel loop default(present) reduction(+:Qy_local)
+    Do i=2,nxg-2
+       Qy_local = Qy_local + Sum( (V(i,1,2:nzg-kk)-V(i,ny,2:nzg-kk))*(x(i)-x(i-1)) )
+    End Do
+    Q_local = Qx_local + Qy_local
+    Call MPI_Allreduce(Q_local,Q_total,1,MPI_real8,MPI_sum,MPI_COMM_WORLD,ierr)
+    Delta_U = Q_total/length_y/Real(nzg_global-3,8)
+    !$acc kernels default(present)
+    U(nx-1,:,:) = U(nx-1,:,:) + Delta_U
+    U(nx,:,:) = U(nx-1,:,:)
+    !$acc end kernels
+
+  End Subroutine apply_boundary_conditions_gpu
  
   Subroutine zero_wz_top( U_, V_, W_ )
      Real(Int64), Dimension(:,:,:), Intent(InOut) :: U_, W_

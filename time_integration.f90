@@ -67,17 +67,13 @@ Contains
     t = t + dt
 
     ! boundary conditions
-    !$acc update self(U,V,W,Uo,Vo,Wo)
     Call apply_boundary_conditions
-    !$acc update device(U,V,W)
 
     ! projection step
     Call compute_projection_step
 
     ! boundary conditions
-    !$acc update self(U,V,W,Uo,Vo,Wo)
     Call apply_boundary_conditions
-    !$acc update device(U,V,W)
 
   End Subroutine compute_time_step_Euler
 
@@ -143,13 +139,9 @@ Contains
     !$acc end kernels
     t = to + rk2_t(rk_step)*dt
 
-    !$acc update self(U,V,W,Uo,Vo,Wo)
-    Call apply_boundary_conditions
-    !$acc update device(U,V,W)
+    Call apply_boundary_conditions_gpu
     Call compute_projection_step
-    !$acc update self(U,V,W,Uo,Vo,Wo)
-    Call apply_boundary_conditions
-    !$acc update device(U,V,W)
+    Call apply_boundary_conditions_gpu
 
     ! step 2 — eddy viscosity on CPU (1 transfer pair)
     rk_step = 2
@@ -169,13 +161,9 @@ Contains
     !$acc end kernels
     t = to + rk2_t(rk_step)*dt
 
-    !$acc update self(U,V,W,Uo,Vo,Wo)
-    Call apply_boundary_conditions
-    !$acc update device(U,V,W)
+    Call apply_boundary_conditions_gpu
     Call compute_projection_step
-    !$acc update self(U,V,W,Uo,Vo,Wo)
-    Call apply_boundary_conditions
-    !$acc update device(U,V,W)
+    Call apply_boundary_conditions_gpu
 
   End Subroutine compute_time_step_RK2
 
@@ -213,13 +201,9 @@ Contains
     !$acc end kernels
     t = to + rk_t(rk_step)*dt
 
-    !$acc update self(U,V,W,Uo,Vo,Wo)
-    Call apply_boundary_conditions
-    !$acc update device(U,V,W)
+    Call apply_boundary_conditions_gpu
     Call compute_projection_step
-    !$acc update self(U,V,W,Uo,Vo,Wo)
-    Call apply_boundary_conditions
-    !$acc update device(U,V,W)
+    Call apply_boundary_conditions_gpu
 
     ! step 2
     rk_step = 2
@@ -238,13 +222,9 @@ Contains
     !$acc end kernels
     t = to + rk_t(rk_step)*dt
 
-    !$acc update self(U,V,W,Uo,Vo,Wo)
-    Call apply_boundary_conditions
-    !$acc update device(U,V,W)
+    Call apply_boundary_conditions_gpu
     Call compute_projection_step
-    !$acc update self(U,V,W,Uo,Vo,Wo)
-    Call apply_boundary_conditions
-    !$acc update device(U,V,W)
+    Call apply_boundary_conditions_gpu
 
     ! step 3
     rk_step = 3
@@ -266,13 +246,9 @@ Contains
     !$acc end kernels
     t = to + rk_t(rk_step)*dt
 
-    !$acc update self(U,V,W,Uo,Vo,Wo)
-    Call apply_boundary_conditions
-    !$acc update device(U,V,W)
+    Call apply_boundary_conditions_gpu
     Call compute_projection_step
-    !$acc update self(U,V,W,Uo,Vo,Wo)
-    Call apply_boundary_conditions
-    !$acc update device(U,V,W)
+    Call apply_boundary_conditions_gpu
 
   End Subroutine compute_time_step_RK3
 
