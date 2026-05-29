@@ -124,12 +124,14 @@ Contains
     Wo = W
     !$acc end kernels
 
-    ! step 1
+    ! step 1 — eddy viscosity on CPU (1 transfer pair)
     rk_step = 1
     !$acc update self(U,V,W)
     Call compute_eddy_viscosity(U,V,W,avg_nu_t,nu_t)
     Call compute_wall_model(U,V,W)
-    !$acc update device(U,V,W,nu_t,avg_nu_t,alpha_x,alpha_y,alpha_z,V_bottom)
+    !$acc update device(nu_t,avg_nu_t,alpha_x,alpha_y,alpha_z,V_bottom)
+
+    ! RHS, advance, BC, projection — all on GPU (only rhs_p transfers for FFT)
     Call compute_rhs_u(U,V,W,Fu1)
     Call compute_rhs_v(U,V,W,Fv1)
     Call compute_rhs_w(U,V,W,Fw1)
@@ -149,14 +151,14 @@ Contains
     Call apply_boundary_conditions
     !$acc update device(U,V,W)
 
-    ! step 2
+    ! step 2 — eddy viscosity on CPU (1 transfer pair)
     rk_step = 2
     !$acc update self(U,V,W)
     Call compute_eddy_viscosity(U,V,W,avg_nu_t,nu_t)
     Call compute_wall_model(U,V,W)
-    !$acc update device(U,V,W,nu_t,avg_nu_t,alpha_x,alpha_y,alpha_z,V_bottom)
+    !$acc update device(nu_t,avg_nu_t,alpha_x,alpha_y,alpha_z,V_bottom)
+
     Call compute_rhs_u(U,V,W,Fu2)
-    ! (GPU data synced above)
     Call compute_rhs_v(U,V,W,Fv2)
     Call compute_rhs_w(U,V,W,Fw2)
 
