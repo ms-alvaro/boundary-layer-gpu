@@ -67,7 +67,7 @@ Contains
     t = t + dt
 
     ! boundary conditions
-    !$acc update self(U,V,W)
+    !$acc update self(U,V,W,Uo,Vo,Wo)
     Call apply_boundary_conditions
     !$acc update device(U,V,W)
 
@@ -75,7 +75,7 @@ Contains
     Call compute_projection_step
 
     ! boundary conditions
-    !$acc update self(U,V,W)
+    !$acc update self(U,V,W,Uo,Vo,Wo)
     Call apply_boundary_conditions
     !$acc update device(U,V,W)
 
@@ -141,11 +141,11 @@ Contains
     !$acc end kernels
     t = to + rk2_t(rk_step)*dt
 
-    !$acc update self(U,V,W)
+    !$acc update self(U,V,W,Uo,Vo,Wo)
     Call apply_boundary_conditions
     !$acc update device(U,V,W)
     Call compute_projection_step
-    !$acc update self(U,V,W)
+    !$acc update self(U,V,W,Uo,Vo,Wo)
     Call apply_boundary_conditions
     !$acc update device(U,V,W)
 
@@ -167,11 +167,11 @@ Contains
     !$acc end kernels
     t = to + rk2_t(rk_step)*dt
 
-    !$acc update self(U,V,W)
+    !$acc update self(U,V,W,Uo,Vo,Wo)
     Call apply_boundary_conditions
     !$acc update device(U,V,W)
     Call compute_projection_step
-    !$acc update self(U,V,W)
+    !$acc update self(U,V,W,Uo,Vo,Wo)
     Call apply_boundary_conditions
     !$acc update device(U,V,W)
 
@@ -211,11 +211,11 @@ Contains
     !$acc end kernels
     t = to + rk_t(rk_step)*dt
 
-    !$acc update self(U,V,W)
+    !$acc update self(U,V,W,Uo,Vo,Wo)
     Call apply_boundary_conditions
     !$acc update device(U,V,W)
     Call compute_projection_step
-    !$acc update self(U,V,W)
+    !$acc update self(U,V,W,Uo,Vo,Wo)
     Call apply_boundary_conditions
     !$acc update device(U,V,W)
 
@@ -236,11 +236,11 @@ Contains
     !$acc end kernels
     t = to + rk_t(rk_step)*dt
 
-    !$acc update self(U,V,W)
+    !$acc update self(U,V,W,Uo,Vo,Wo)
     Call apply_boundary_conditions
     !$acc update device(U,V,W)
     Call compute_projection_step
-    !$acc update self(U,V,W)
+    !$acc update self(U,V,W,Uo,Vo,Wo)
     Call apply_boundary_conditions
     !$acc update device(U,V,W)
 
@@ -264,11 +264,11 @@ Contains
     !$acc end kernels
     t = to + rk_t(rk_step)*dt
 
-    !$acc update self(U,V,W)
+    !$acc update self(U,V,W,Uo,Vo,Wo)
     Call apply_boundary_conditions
     !$acc update device(U,V,W)
     Call compute_projection_step
-    !$acc update self(U,V,W)
+    !$acc update self(U,V,W,Uo,Vo,Wo)
     Call apply_boundary_conditions
     !$acc update device(U,V,W)
 
