@@ -20,7 +20,8 @@ Contains
   Subroutine compute_projection_step
 
     ! Transfer velocities to CPU for entire projection step
-    !!acc update self(U,V,W)
+    !$acc wait
+    !$acc update self(U,V,W)
 
     Call compute_pseudo_pressure_rhs
 
@@ -29,7 +30,7 @@ Contains
     Call project_velocity
 
     ! Transfer corrected velocities back to GPU
-    !!acc update device(U,V,W)
+    !$acc update device(U,V,W)
 
   End Subroutine compute_projection_step
 
