@@ -20,6 +20,7 @@ Module cufft_solver
   Private
   Public :: use_cufft, cufft_plan_fwd, cufft_plan_inv
   Public :: cufft_init_plans, cufft_destroy_plans
+  Public :: cufftExecZ2Z, CUFFT_FORWARD, CUFFT_INVERSE, CUFFT_SUCCESS
 
 Contains
 

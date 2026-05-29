@@ -10,6 +10,7 @@ Module initialization
   Use mpi
   Use input_output
   Use fftz
+  Use cufft_solver
   Use boundary_conditions, Only : apply_periodic_bc_z
  
   ! prevent implicit typing
@@ -302,7 +303,14 @@ Contains
     plan_d = fftw_mpi_plan_dft_2d( nzp_global, nxpe_global, plane, plane, &
              MPI_COMM_WORLD,  FFTW_FORWARD, FFTW_ESTIMATE )
     plan_i = fftw_mpi_plan_dft_2d( nzp_global, nxpe_global, plane, plane, &
-             MPI_COMM_WORLD, FFTW_BACKWARD, FFTW_ESTIMATE ) 
+             MPI_COMM_WORLD, FFTW_BACKWARD, FFTW_ESTIMATE )
+
+    ! Initialize cuFFT plans for single-rank GPU solver
+    If ( nprocs == 1 ) Then
+       Call cufft_init_plans(Int(nzp_global), Int(nxpe_global))
+       Allocate( plane_gpu(nxpe, nzp) )
+       If (myid==0) Write(*,*) 'cuFFT plans created for GPU pressure solver'
+    End If 
 
     ! global Fourier coeficients with modified wave-number for the second derivative
     Allocate ( kxx(0:mx_global), kzz(0:mz_global) ) 

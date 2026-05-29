@@ -72,7 +72,8 @@ Program boundary_layer_FD
   !$acc      copy(alpha_xo,alpha_yo,alpha_zo) &
   !$acc      copy(V_bottom) &
   !$acc      copyin(bc_1,bc_2) &
-  !$acc      copyin(U_top,V_top,W_top,U_inlet,V_inlet,W_inlet)
+  !$acc      copyin(U_top,V_top,W_top,U_inlet,V_inlet,W_inlet) &
+  !$acc      create(plane_gpu,rhs_p_hat,rhs_aux,D,DL,DU,plane_short)
 
   ! temporal loop
   Do istep = 1, nsteps

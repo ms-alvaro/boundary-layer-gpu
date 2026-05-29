@@ -7,6 +7,7 @@ Module projection
   Use iso_fortran_env, Only : error_unit, Int32, Int64
   Use global
   Use mpi
+  Use cufft_solver
 
   ! prevent implicit typing
   Implicit None
@@ -18,9 +19,6 @@ Contains
   !         fractional step method             !
   !--------------------------------------------!
   Subroutine compute_projection_step
-
-    ! Everything runs on GPU except FFT solve
-    ! No U,V,W transfers needed — they stay on GPU
 
     Call compute_pseudo_pressure_rhs
 
@@ -37,7 +35,6 @@ Contains
 
     Integer(Int32) :: i, j, k
 
-    ! rhs_p at cell centers — on GPU
     !$acc parallel loop collapse(3) default(present)
     Do k = 2, nzg-1
        Do j = 2, nyg-1
@@ -58,14 +55,148 @@ Contains
 
     Integer(Int32) :: ii, i, j, k, k_global, i_global, info
     Real   (Int64) :: dum, dumref, maxerr
+    Integer :: istat
 
-    ! Lapack function for solving tridiagonal systems
+    External :: zgesv
+
+    If ( use_cufft ) Then
+       Call solve_poisson_gpu
+    Else
+       Call solve_poisson_cpu
+    End If
+
+    ! periodic boundary conditions in z
+    Call apply_periodic_z_pressure
+
+    ! update ghost interior planes
+    Call update_ghost_interior_planes_pressure
+
+    ! save pressure for statistics
+    If ( rk_step == 1 ) Then
+       !$acc kernels default(present)
+       P( 2:nxg-1, 2:nyg-1, 2:nzg-1 ) = rhs_p/(dt*rk2_coef(1,1))
+       P(  1,:,:) = P(    2,:,:)
+       P(nxg,:,:) = P(nxg-1,:,:)
+       P(:,  1,:) = P(:,    2,:)
+       P(:,nyg,:) = P(:,nyg-1,:)
+       P(:,:,  1) = P(:,:,    2)
+       P(:,:,nzg) = P(:,:,nzg-1)
+       !$acc end kernels
+    End If
+
+  End Subroutine solve_poisson_equation
+
+  !----------------------------------------------------!
+  !     GPU pressure solver using cuFFT               !
+  !     All operations on GPU, no host transfers       !
+  !----------------------------------------------------!
+  Subroutine solve_poisson_gpu
+
+    Integer(Int32) :: ii, i, j, k, i_global, k_global, info, jj
+    Integer :: istat
+
+    External :: zgesv
+
+    ! Forward cosine+Fourier transform per y-slice (on GPU)
+    Do j = 2, nyg-1
+       ! Pack rhs_p into plane_short
+       !$acc kernels default(present)
+       plane_short = dcmplx( rhs_p ( 2:nxp+1, j, 2:nzp+1 ) )
+       plane_gpu   = (0d0,0d0)
+       !$acc end kernels
+
+       ! Cosine extension
+       !$acc parallel loop default(present)
+       Do ii = 1, Int(nxp)
+          plane_gpu(2*ii,   1:nzp) = plane_short(ii, 1:nzp)
+          plane_gpu(4*Int(nxp)-2*ii+2, 1:nzp) = plane_short(ii, 1:nzp)
+       End Do
+
+       ! cuFFT forward (in-place on GPU)
+       !$acc host_data use_device(plane_gpu)
+       istat = cufftExecZ2Z(cufft_plan_fwd, plane_gpu, plane_gpu, CUFFT_FORWARD)
+       !$acc end host_data
+
+       ! Extract modes (0-indexed modes -> 1-indexed plane_gpu)
+       !$acc kernels default(present)
+       rhs_p_hat(0:mx, j, 0:mz) = plane_gpu(1:mx+1, 1:mz+1)
+       !$acc end kernels
+    End Do
+
+    ! Tridiagonal solve per mode — on CPU (small data transfer)
+    !$acc update self(rhs_p_hat)
+    Do k = 0, Int(mz)
+       Do i = 0, Int(mx)
+          i_global = imode_map( i )
+          k_global = kmode_map( k )
+          Do jj = 2, nyg-1
+             D(jj) = Dyy(jj,jj) + kxx(i_global) + kzz(k_global)
+          End Do
+          Do jj = 2, nyg-2
+             DL(jj) = Dyy(jj+1,jj)
+          End Do
+          Do jj = 2, nyg-2
+             DU(jj) = Dyy(jj,jj+1)
+          End Do
+          If ( i_global==0 .And. k_global==0 ) D(2) = 3d0/2d0*D(2)
+          rhs_aux = rhs_p_hat(i, :, k)
+          Call Zgtsv( nr, nrhs, DL, D, DU, rhs_aux, nr, info)
+          rhs_p_hat(i, :, k) = rhs_aux
+       End Do
+    End Do
+    !$acc update device(rhs_p_hat)
+
+    ! Inverse cosine+Fourier transform per y-slice (on GPU)
+    Do j = 2, nyg-1
+       ! Build full spectrum for inverse cosine transform
+       !$acc kernels default(present)
+       plane_gpu = (0d0,0d0)
+       plane_gpu(1:nxp, 1:nzp) = rhs_p_hat(0:nxp-1, j, 0:mz)
+       !$acc end kernels
+
+       !$acc parallel loop default(present)
+       Do ii = Int(nxp)-1, 0, -1
+          plane_gpu(Int(nxp)+2-1-Int(nxp)+1+ii, 1:nzp) = -rhs_p_hat(Int(nxp)-1-ii, j, 0:mz)
+       End Do
+
+       !$acc parallel loop default(present)
+       Do ii = 1, Int(nxp)-1
+          plane_gpu(2*Int(nxp)+2-1+ii-1, 1:nzp) = -rhs_p_hat(ii, j, 0:mz)
+       End Do
+
+       !$acc parallel loop default(present)
+       Do ii = Int(nxp)-1, 1, -1
+          plane_gpu(4*Int(nxp)-Int(nxp)+2-1+Int(nxp)-1-ii, 1:nzp) = rhs_p_hat(ii, j, 0:mz)
+       End Do
+
+       ! cuFFT inverse (in-place on GPU)
+       !$acc host_data use_device(plane_gpu)
+       istat = cufftExecZ2Z(cufft_plan_inv, plane_gpu, plane_gpu, CUFFT_INVERSE)
+       !$acc end host_data
+
+       ! Extract real part from even positions
+       !$acc parallel loop default(present)
+       Do ii = 1, Int(nxp)
+          rhs_p( ii+1, j, 2:nzp+1 ) = Real(plane_gpu(2*ii,:), 8)/Real(nxpe_global*nzp_global, 8)
+       End Do
+    End Do
+
+  End Subroutine solve_poisson_gpu
+
+  !----------------------------------------------------!
+  !     CPU pressure solver using FFTW-MPI            !
+  !     Fallback for multi-rank runs                  !
+  !----------------------------------------------------!
+  Subroutine solve_poisson_cpu
+
+    Integer(Int32) :: ii, i, j, k, k_global, i_global, info
+
     External :: zgesv
 
     ! Transfer rhs_p from GPU to CPU for FFT
     !$acc update self(rhs_p)
 
-    ! cosine tranform in x and Fourier transform in z (interior points)
+    ! Forward cosine+Fourier transform
     Do j = 2, nyg-1
        plane_short = dcmplx( rhs_p ( 2:nxp+1, j, 2:nzp+1 ) )
        plane       = (0d0,0d0)
@@ -83,7 +214,7 @@ Contains
        rhs_p_hat(0:mx, j, 0:mz) = plane(1:mx+1, 1:mz+1)
     End Do
 
-    ! solve for each mode
+    ! Tridiagonal solve
     Do k = 0, mz
        Do i = 0, mx
           i_global = imode_map( i )
@@ -104,7 +235,7 @@ Contains
        End Do
     End Do
 
-    ! inverse cosine transform in x and Fourier in z
+    ! Inverse cosine+Fourier transform
     Do j = 2, nyg-1
        plane               = (0d0,0d0)
        plane(1:nxp, 1:nzp) = rhs_p_hat(0:nxp-1,j,0:mz)
@@ -131,41 +262,20 @@ Contains
        End Do
     End Do
 
-    ! Transfer rhs_p (now pseudo-pressure) back to GPU
+    ! Transfer rhs_p back to GPU
     !$acc update device(rhs_p)
 
-    ! periodic boundary conditions in z
-    Call apply_periodic_z_pressure
-
-    ! update ghost interior planes
-    Call update_ghost_interior_planes_pressure
-
-    ! save pressure for statistics
-    If ( rk_step == 1 ) Then
-       !$acc kernels default(present)
-       P( 2:nxg-1, 2:nyg-1, 2:nzg-1 ) = rhs_p/(dt*rk2_coef(1,1))
-       P(  1,:,:) = P(    2,:,:)
-       P(nxg,:,:) = P(nxg-1,:,:)
-       P(:,  1,:) = P(:,    2,:)
-       P(:,nyg,:) = P(:,nyg-1,:)
-       P(:,:,  1) = P(:,:,    2)
-       P(:,:,nzg) = P(:,:,nzg-1)
-       !$acc end kernels
-    End If
-
-  End Subroutine solve_poisson_equation
+  End Subroutine solve_poisson_cpu
 
   !--------------------------------------------------!
   ! Periodic boundary conditions for pseudo-pressure !
   !--------------------------------------------------!
   Subroutine apply_periodic_z_pressure
 
-    ! Neumann BC (all processors)
     !$acc kernels default(present)
     rhs_p( nxg-1, :, : ) = rhs_p( nxg-2, :, : )
     !$acc end kernels
 
-    ! Single-processor: direct copy on GPU
     If ( nprocs==1 ) Then
        !$acc kernels default(present)
        rhs_p( 2:nxg-1, :, nzp+1+1 ) = rhs_p ( 2:nxg-1, :, 2 )
@@ -173,7 +283,6 @@ Contains
        Return
     End If
 
-    ! Multi-processor: MPI (needs CPU data)
     !$acc update self(rhs_p)
     If     ( myid==0 ) Then
        buffer_p = rhs_p ( 2:nxg-1, :, 2 )
@@ -196,7 +305,6 @@ Contains
     Integer(Int32) :: sendto, recvfrom
     Integer(Int32) :: tagto,  tagfrom
 
-    ! Single processor: no ghost exchange needed
     If ( nprocs==1 ) Return
 
     sendto   = myid - 1
@@ -271,7 +379,6 @@ Contains
     End Do
 
     max_divergence_local = div
-
     Call MPI_Reduce(max_divergence_local,max_divergence,1,MPI_real8,MPI_max,0,MPI_COMM_WORLD,ierr)
 
   End Subroutine check_divergence

@@ -38,14 +38,15 @@ FFTFLAGS = -I$(FFTWDIR)/include/
 ## FFTW (CPU, for pressure solver until cuFFT replacement is complete)
 FFT_LFLAGS = -L$(FFTWDIR)/lib/ -lfftw3_mpi -lfftw3 -lm
 
-## cuFFT and cuSPARSE (for future phases)
-## CUDA_LFLAGS = -cudalib=cufft,cusparse
+## cuFFT
+CUDA_LFLAGS = -cudalib=cufft
 
 ## LAPACK (from NVHPC)
 LAPACK_LFLAGS = -llapack
 
 LFLAGS += $(FFT_LFLAGS)
 LFLAGS += $(LAPACK_LFLAGS)
+LFLAGS += $(CUDA_LFLAGS)
 
 #################################################### extra flags
 
@@ -56,7 +57,7 @@ debug:  FEX = $(FEXDEB)
 $(EXE): FEX = $(FEXOPT)
 
 #################################################### objects alpha
-OBJECTS = $(OBJ)/mpi.o $(OBJ)/global.o $(OBJ)/Newton_solver.o $(OBJ)/interpolation.o \
+OBJECTS = $(OBJ)/mpi.o $(OBJ)/global.o $(OBJ)/cufft_solver.o $(OBJ)/Newton_solver.o $(OBJ)/interpolation.o \
 	$(OBJ)/equations.o $(OBJ)/rescaled_inlet_bc.o $(OBJ)/boundary_conditions.o \
 	$(OBJ)/pressure.o $(OBJ)/input_output.o $(OBJ)/fftz.o $(OBJ)/statistics.o \
 	$(OBJ)/initialization.o $(OBJ)/subgrid.o $(OBJ)/wallmodel.o $(OBJ)/finalization.o \
