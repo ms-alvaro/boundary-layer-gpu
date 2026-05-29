@@ -122,10 +122,12 @@ Contains
 
     ! step 1 — eddy viscosity on CPU (1 transfer pair)
     rk_step = 1
-    !$acc update self(U,V,W)
-    Call compute_eddy_viscosity(U,V,W,avg_nu_t,nu_t)
-    Call compute_wall_model(U,V,W)
-    !$acc update device(nu_t,avg_nu_t,alpha_x,alpha_y,alpha_z,V_bottom)
+    If ( LES_model > 0 .Or. iwall_model > 0 ) Then
+       !$acc update self(U,V,W)
+       Call compute_eddy_viscosity(U,V,W,avg_nu_t,nu_t)
+       Call compute_wall_model(U,V,W)
+       !$acc update device(U,V,W,nu_t,avg_nu_t,alpha_x,alpha_y,alpha_z,V_bottom)
+    End If
 
     ! RHS, advance, BC, projection — all on GPU (only rhs_p transfers for FFT)
     Call compute_rhs_u(U,V,W,Fu1)
@@ -145,10 +147,12 @@ Contains
 
     ! step 2 — eddy viscosity on CPU (1 transfer pair)
     rk_step = 2
-    !$acc update self(U,V,W)
-    Call compute_eddy_viscosity(U,V,W,avg_nu_t,nu_t)
-    Call compute_wall_model(U,V,W)
-    !$acc update device(nu_t,avg_nu_t,alpha_x,alpha_y,alpha_z,V_bottom)
+    If ( LES_model > 0 .Or. iwall_model > 0 ) Then
+       !$acc update self(U,V,W)
+       Call compute_eddy_viscosity(U,V,W,avg_nu_t,nu_t)
+       Call compute_wall_model(U,V,W)
+       !$acc update device(U,V,W,nu_t,avg_nu_t,alpha_x,alpha_y,alpha_z,V_bottom)
+    End If
 
     Call compute_rhs_u(U,V,W,Fu2)
     Call compute_rhs_v(U,V,W,Fv2)
@@ -207,10 +211,12 @@ Contains
 
     ! step 2
     rk_step = 2
-    !$acc update self(U,V,W)
-    Call compute_eddy_viscosity(U,V,W,avg_nu_t,nu_t)
-    Call compute_wall_model(U,V,W)
-    !$acc update device(nu_t,avg_nu_t,alpha_x,alpha_y,alpha_z,V_bottom)
+    If ( LES_model > 0 .Or. iwall_model > 0 ) Then
+       !$acc update self(U,V,W)
+       Call compute_eddy_viscosity(U,V,W,avg_nu_t,nu_t)
+       Call compute_wall_model(U,V,W)
+       !$acc update device(U,V,W,nu_t,avg_nu_t,alpha_x,alpha_y,alpha_z,V_bottom)
+    End If
     Call compute_rhs_u(U,V,W,Fu2)
     Call compute_rhs_v(U,V,W,Fv2)
     Call compute_rhs_w(U,V,W,Fw2)
