@@ -54,6 +54,9 @@ Contains
        ! interpolate P in y -> term_3
       ! Call interpolate_y(P,term,2)
 
+       ! Transfer interpolated fields from GPU to CPU for statistics
+       !$acc update self(term,term_1,term_2)
+
        ! compute local statistics
        Do ii=1,nx
           Do jj=1,ny
