@@ -82,20 +82,18 @@ def read_snapshot(fname):
         nyg = nym + 2
         nzg = nzm + 2
 
-        # U
-        nu_, nv_, nw_ = struct.unpack('iii', f.read(12))
-        U = np.array(struct.unpack(f'{nu_*nv_*nw_}d', f.read(8*nu_*nv_*nw_)))
-        U = U.reshape((nw_, nv_, nu_)).transpose(2, 1, 0)  # (nx, nyg, nzg)
+        def read_field(f):
+            """Read a 3D field: header (3 ints) + data (n3-1 planes).
+            The code writes n3-1 z-planes (excluding the last ghost cell)."""
+            n1, n2, n3 = struct.unpack('iii', f.read(12))
+            n3_actual = n3 - 1  # code writes (:,:,1:nz-1) or (:,:,1:nzg-1)
+            total = n1 * n2 * n3_actual
+            arr = np.frombuffer(f.read(8 * total), dtype=np.float64).copy()
+            return arr.reshape((n3_actual, n2, n1)).transpose(2, 1, 0)
 
-        # V
-        nu_, nv_, nw_ = struct.unpack('iii', f.read(12))
-        V = np.array(struct.unpack(f'{nu_*nv_*nw_}d', f.read(8*nu_*nv_*nw_)))
-        V = V.reshape((nw_, nv_, nu_)).transpose(2, 1, 0)  # (nxg, ny, nzg)
-
-        # W
-        nu_, nv_, nw_ = struct.unpack('iii', f.read(12))
-        W = np.array(struct.unpack(f'{nu_*nv_*nw_}d', f.read(8*nu_*nv_*nw_)))
-        W = W.reshape((nw_, nv_, nu_)).transpose(2, 1, 0)  # (nxg, nyg, nz)
+        U = read_field(f)
+        V = read_field(f)
+        W = read_field(f)
 
     return {'t': t, 'nu': nu, 'x': x, 'y': y, 'z': z,
             'xm': xm, 'ym': ym, 'zm': zm,
