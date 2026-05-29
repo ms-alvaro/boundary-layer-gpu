@@ -1,0 +1,38 @@
+ ----------------------------------------------------------------------
+  
+     My boundary layer ^^, parallel version 0.7.2 with separation      
+  
+ ----------------------------------------------------------------------
+ reading parameters...
+ ./data/BL_laminar                                                                                                                                                                                       
+            17 ./data
+ allocating...
+ initializing initial condition...
+ Generating initial condition
+    Blasius IC: read          1000  points from blasius_solution.dat
+ Blasius initial condition:
+    Lx     :     10.00000000000000     
+    Ly     :    0.1000000000000000     
+    Lz     :    0.2000000000000000     
+    alpha  :     3.000000000000000     
+    Max U :     1.000000016524059     
+    Max V :    2.7436877395120283E-003
+    Max W :     0.000000000000000     
+    Mean U :    0.6769754351831779     
+    Mean V :    7.4967089519724296E-004
+    Mean W :     0.000000000000000     
+hostptr=0x7f0601759020,stride=1,size=176670,eltsize=8,name=f(:,:,:),flags=0x20000200=present+implicit,async=-1,threadid=1
+FATAL ERROR: data in PRESENT clause was not found on device 1: name=f(:,:,:) host:0x7f0601759020
+ file:/home/alvaroms/tbl-gpu/prebuild/boundary_conditions.f90 apply_periodic_bc_z line:605
+
+--------------------------------------------------------------------------
+Primary job  terminated normally, but 1 process returned
+a non-zero exit code. Per user-direction, the job has been aborted.
+--------------------------------------------------------------------------
+--------------------------------------------------------------------------
+mpirun detected that one or more processes exited with non-zero status, thus causing
+the job to be terminated. The first process to do so was:
+
+  Process name: [[48757,1],0]
+  Exit code:    1
+--------------------------------------------------------------------------
