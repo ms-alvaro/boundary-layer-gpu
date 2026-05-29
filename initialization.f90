@@ -297,9 +297,11 @@ Contains
 
     ! create MPI plan for forward DFT (note dimension reversal and x4 for cosine transform)
     ! uses imode_map, kmode_map
-    plan_d = fftw_mpi_plan_dft_2d( nzp_global, nxpe_global, plane, plane_hat, & 
-             MPI_COMM_WORLD,  FFTW_FORWARD, FFTW_ESTIMATE ) 
-    plan_i = fftw_mpi_plan_dft_2d( nzp_global, nxpe_global, plane_hat, plane, & 
+    ! NOTE: use plane for both in/out (in-place plans) to avoid nvfortran
+    !       pointer alias bug with plane_hat(0:,0:) => plane
+    plan_d = fftw_mpi_plan_dft_2d( nzp_global, nxpe_global, plane, plane, &
+             MPI_COMM_WORLD,  FFTW_FORWARD, FFTW_ESTIMATE )
+    plan_i = fftw_mpi_plan_dft_2d( nzp_global, nxpe_global, plane, plane, &
              MPI_COMM_WORLD, FFTW_BACKWARD, FFTW_ESTIMATE ) 
 
     ! global Fourier coeficients with modified wave-number for the second derivative

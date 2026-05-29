@@ -20,7 +20,7 @@ Contains
   Subroutine compute_projection_step
 
     ! Transfer velocities to CPU for entire projection step
-    !$acc update self(U,V,W)
+    !!acc update self(U,V,W)
 
     Call compute_pseudo_pressure_rhs
 
@@ -29,7 +29,7 @@ Contains
     Call project_velocity
 
     ! Transfer corrected velocities back to GPU
-    !$acc update device(U,V,W)
+    !!acc update device(U,V,W)
 
   End Subroutine compute_projection_step
 
@@ -101,8 +101,9 @@ Contains
           plane(i,:) = plane_short(ii,:)
           ii = ii + 1
        End Do
-       Call fftw_mpi_execute_dft(plan_d, plane, plane_hat)
-       rhs_p_hat(:, j, :) = plane_hat(0:mx,:)
+       Call fftw_mpi_execute_dft(plan_d, plane, plane)
+       ! plane_hat(0:mx, 0:mz) = plane(1:mx+1, 1:mz+1)
+       rhs_p_hat(0:mx, j, 0:mz) = plane(1:mx+1, 1:mz+1)
     End Do
 
     ! solve for each mode
@@ -134,25 +135,27 @@ Contains
     End Do
 
     ! inverse cosine transform in x and Fourier in z
+    ! NOTE: use plane directly (1-indexed), NOT plane_hat (0-indexed alias)
+    !       nvfortran passes wrong address for pointer-remapped arrays to C functions
     Do j = 2, nyg-1
-       plane_hat            = (0d0,0d0)
-       plane_hat(0:nxp-1,:) = rhs_p_hat(:,j,:)
+       plane               = (0d0,0d0)
+       plane(1:nxp, 1:nzp) = rhs_p_hat(0:nxp-1,j,0:mz)
        ii = nxp+2-1
        Do i=nxp-1,1-1,-1
-          plane_hat(ii,:) = -rhs_p_hat(i,j,:)
+          plane(ii+1, 1:nzp) = -rhs_p_hat(i,j,0:mz)
           ii = ii + 1
        End Do
        ii = 2-1
        Do i=2*nxp+2-1,3*nxp-1
-          plane_hat(i,:) = -rhs_p_hat(ii,j,:)
+          plane(i+1, 1:nzp) = -rhs_p_hat(ii,j,0:mz)
           ii = ii + 1
        End Do
        ii = 4*nxp-nxp+2-1
        Do i=nxp-1,2-1,-1
-          plane_hat(ii,:) = rhs_p_hat(i,j,:)
+          plane(ii+1, 1:nzp) = rhs_p_hat(i,j,0:mz)
           ii = ii + 1
        End Do
-       Call fftw_mpi_execute_dft(plan_i, plane_hat, plane)
+       Call fftw_mpi_execute_dft(plan_i, plane, plane)
        ii = 2
        Do i=2,2*nxp,2
           rhs_p( ii, j, 2:nzp+1 ) = plane(i,:)/Real( nxpe_global*nzp_global, 8)
@@ -186,6 +189,12 @@ Contains
 
     ! compute compute last point from Neumann BC (All processors, no MPI needed)
     rhs_p( nxg-1, :, : ) = rhs_p( nxg-2, :, : )
+
+    ! Single-processor: direct copy
+    If ( nprocs==1 ) Then
+       rhs_p( 2:nxg-1, :, nzp+1+1 ) = rhs_p ( 2:nxg-1, :, 2 )
+       Return
+    End If
 
     ! apply periodicity in z (Only first and last processor, MPI needed)
     If     ( myid==0 ) Then

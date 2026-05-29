@@ -86,20 +86,21 @@ Contains
     !$acc update self(rhs_p, V, bc_1, bc_2)
 
     ! 2D Fourier transform interior points rhs_p
+    ! NOTE: use plane as both in/out (in-place) to avoid nvfortran pointer alias bug
     Do j = 2, nyg-1
        plane = dcmplx( rhs_p(2:nxp+1,j,2:nzp+1) ) ! nxp+1 = nxg-2, nzp+1 = nzg-2
-       Call fftw_mpi_execute_dft(plan_d,plane,plane_hat)
-       rhs_p_hat(:,j,:) = plane_hat
+       Call fftw_mpi_execute_dft(plan_d,plane,plane)
+       rhs_p_hat(:,j,:) = plane(1:mx+1, 1:mz+1)
     End Do
 
     ! 2D Fourier transform boundary conditions
     plane = dcmplx( bc_1(2:nxp+1,2:nzp+1) )
-    Call fftw_mpi_execute_dft(plan_d,plane,plane_hat)
-    bc_1_hat = plane_hat
+    Call fftw_mpi_execute_dft(plan_d,plane,plane)
+    bc_1_hat = plane(1:mx+1, 1:mz+1)
 
     plane = dcmplx( bc_2(2:nxp+1,2:nzp+1) )
-    Call fftw_mpi_execute_dft(plan_d,plane,plane_hat)
-    bc_2_hat = plane_hat
+    Call fftw_mpi_execute_dft(plan_d,plane,plane)
+    bc_2_hat = plane(1:mx+1, 1:mz+1)
 
     ! solve for each mode
     Do k = 0, mz
@@ -131,9 +132,11 @@ Contains
     End Do
 
     ! 2D inverse Fourier transform
+    ! NOTE: use plane as both in/out (in-place) to avoid nvfortran pointer alias bug
     Do j = 2, nyg-1
-       plane_hat = rhs_p_hat(:,j,:)
-       Call fftw_mpi_execute_dft(plan_i,plane_hat,plane)
+       plane = (0d0,0d0)
+       plane(1:mx+1, 1:mz+1) = rhs_p_hat(:,j,:)
+       Call fftw_mpi_execute_dft(plan_i,plane,plane)
        P(2:nxg-2,j,2:nzg-2) = plane/Real(nxp_global*nzp_global,8)
     End Do
 

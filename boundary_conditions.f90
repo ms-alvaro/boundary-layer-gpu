@@ -593,6 +593,28 @@ Contains
     Real   (Int64), Intent(InOut) :: F(:,:,:)
     Integer(Int32), Intent(In)    :: id
     Integer(Int64) :: n(3)
+
+    ! Single-processor shortcut: direct copy, no MPI needed
+    If ( nprocs==1 ) Then
+       If (id == 3) Then
+          F(:,:,1)  = F(:,:,nz-1)
+          F(:,:,nz) = F(:,:,2)
+       Elseif (id == 1) Then
+          F(:,:,1)     = F(:,:,nzg-2)
+          F(:,:,nzg-1) = F(:,:,2)
+          F(:,:,nzg)   = F(:,:,3)
+       Elseif (id == 2) Then
+          F(:,:,1)     = F(:,:,nzg-2)
+          F(:,:,nzg-1) = F(:,:,2)
+          F(:,:,nzg)   = F(:,:,3)
+       Elseif (id == 4) Then
+          F(:,:,1)     = F(:,:,nzg-2)
+          F(:,:,nzg-1) = F(:,:,2)
+          F(:,:,nzg)   = F(:,:,3)
+       End If
+       Return
+    End If
+
     ! save planes
     If ( myid==0 ) Then
       ! begin planes
