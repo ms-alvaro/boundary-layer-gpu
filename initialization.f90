@@ -306,13 +306,16 @@ Contains
              MPI_COMM_WORLD, FFTW_BACKWARD, FFTW_ESTIMATE )
 
     ! Initialize cuFFT plans for single-rank GPU solver
-    ! DISABLED for debugging — use FFTW-CPU fallback
-    !If ( nprocs == 1 ) Then
-    !   Call cufft_init_plans(Int(nzp_global), Int(nxpe_global))
-    !   Allocate( plane_gpu(nxpe, nzp) )
-    !   If (myid==0) Write(*,*) 'cuFFT plans created for GPU pressure solver'
-    !End If
-    Allocate( plane_gpu(1, 1) )  ! dummy allocation for data region 
+    If ( nprocs == 1 ) Then
+       Call cufft_init_plans(Int(nzp_global), Int(nxpe_global))
+       Allocate( plane_gpu(nxpe, nzp) )
+       ! Standard-bound GPU array for FFT modes: (mx+1, nyg-2, mz+1)
+       Allocate( rhs_hat_gpu(mx+1, nyg-2, mz+1) )
+       If (myid==0) Write(*,*) 'cuFFT plans created for GPU pressure solver'
+    Else
+       Allocate( plane_gpu(1, 1) )  ! dummy
+       Allocate( rhs_hat_gpu(1, 1, 1) )  ! dummy
+    End If 
 
     ! global Fourier coeficients with modified wave-number for the second derivative
     Allocate ( kxx(0:mx_global), kzz(0:mz_global) ) 

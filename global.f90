@@ -133,6 +133,8 @@ Module global
 
   ! GPU workspace for cuFFT pressure solver
   Complex(C_DOUBLE_COMPLEX), Allocatable, Dimension(:,:) :: plane_gpu
+  ! GPU workspace for FFT modes (standard 1-based bounds, avoids nvfortran bug)
+  Complex(C_DOUBLE_COMPLEX), Allocatable, Dimension(:,:,:) :: rhs_hat_gpu
 
   ! Fourier points and wave numbers 
   Integer(C_INTPTR_T) :: nxp_global, nxpe_global, nzp_global, local_k_offset

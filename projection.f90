@@ -92,43 +92,45 @@ Contains
   !----------------------------------------------------!
   Subroutine solve_poisson_gpu
 
-    Integer(Int32) :: ii, i, j, k, i_global, k_global, info, jj
+    Integer(Int32) :: ii, i, j, k, i_global, k_global, info, jj, nm
     Integer :: istat
 
     External :: zgesv
 
+    nm = Int(nyg) - 2  ! number of y-modes = nyg-2
+
     ! Forward cosine+Fourier transform per y-slice (on GPU)
     Do j = 2, nyg-1
-       ! Pack rhs_p into plane_short
        !$acc kernels default(present)
-       plane_short = dcmplx( rhs_p ( 2:nxp+1, j, 2:nzp+1 ) )
-       plane_gpu   = (0d0,0d0)
+       plane_gpu = (0d0,0d0)
        !$acc end kernels
 
-       ! Cosine extension
+       ! Cosine extension directly from rhs_p
        !$acc parallel loop default(present)
        Do ii = 1, Int(nxp)
-          plane_gpu(2*ii,   1:nzp) = plane_short(ii, 1:nzp)
-          plane_gpu(4*Int(nxp)-2*ii+2, 1:nzp) = plane_short(ii, 1:nzp)
+          plane_gpu(2*ii,   1:nzp) = dcmplx(rhs_p(ii+1, j, 2:nzp+1))
+          plane_gpu(4*Int(nxp)-2*ii+2, 1:nzp) = dcmplx(rhs_p(ii+1, j, 2:nzp+1))
        End Do
 
-       ! cuFFT forward (in-place on GPU)
+       ! cuFFT forward
        !$acc host_data use_device(plane_gpu)
        istat = cufftExecZ2Z(cufft_plan_fwd, plane_gpu, plane_gpu, CUFFT_FORWARD)
        !$acc end host_data
 
-       ! Extract modes (0-indexed modes -> 1-indexed plane_gpu)
+       ! Extract modes into standard-bound array (1-based)
        !$acc kernels default(present)
-       rhs_p_hat(0:mx, j, 0:mz) = plane_gpu(1:mx+1, 1:mz+1)
+       rhs_hat_gpu(1:mx+1, j-1, 1:mz+1) = plane_gpu(1:mx+1, 1:mz+1)
        !$acc end kernels
     End Do
 
-    ! Tridiagonal solve per mode — on CPU (small data transfer)
-    !$acc update self(rhs_p_hat)
-    Do k = 0, Int(mz)
-       Do i = 0, Int(mx)
-          i_global = imode_map( i )
-          k_global = kmode_map( k )
+    ! Transfer modes to CPU for tridiagonal solve
+    !$acc update self(rhs_hat_gpu)
+
+    ! Tridiagonal solve per mode on CPU
+    Do k = 1, Int(mz)+1
+       Do i = 1, Int(mx)+1
+          i_global = imode_map( i-1 )
+          k_global = kmode_map( k-1 )
           Do jj = 2, nyg-1
              D(jj) = Dyy(jj,jj) + kxx(i_global) + kzz(k_global)
           End Do
@@ -139,42 +141,51 @@ Contains
              DU(jj) = Dyy(jj,jj+1)
           End Do
           If ( i_global==0 .And. k_global==0 ) D(2) = 3d0/2d0*D(2)
-          rhs_aux = rhs_p_hat(i, :, k)
+          rhs_aux(2:nyg-1) = rhs_hat_gpu(i, 1:nm, k)
           Call Zgtsv( nr, nrhs, DL, D, DU, rhs_aux, nr, info)
-          rhs_p_hat(i, :, k) = rhs_aux
+          rhs_hat_gpu(i, 1:nm, k) = rhs_aux(2:nyg-1)
        End Do
     End Do
-    !$acc update device(rhs_p_hat)
+
+    ! Transfer solved modes back to GPU
+    !$acc update device(rhs_hat_gpu)
 
     ! Inverse cosine+Fourier transform per y-slice (on GPU)
     Do j = 2, nyg-1
-       ! Build full spectrum for inverse cosine transform
+       ! Reproduce EXACTLY the CPU inverse cosine packing:
+       ! plane(1:nxp) = modes(0:nxp-1)  ->  rhs_hat_gpu(1:nxp)
+       ! plane(nxp+2 .. 2*nxp+1) = -modes(nxp-1 .. 0) [reversed]
+       ! plane(2*nxp+2 .. 3*nxp) = -modes(1 .. nxp-1)
+       ! plane(3*nxp+2 .. 4*nxp) = +modes(nxp-1 .. 1) [reversed]
        !$acc kernels default(present)
        plane_gpu = (0d0,0d0)
-       plane_gpu(1:nxp, 1:nzp) = rhs_p_hat(0:nxp-1, j, 0:mz)
+       plane_gpu(1:nxp, 1:nzp) = rhs_hat_gpu(1:nxp, j-1, 1:mz+1)
        !$acc end kernels
 
+       ! plane(nxp+2) = -mode(nxp-1), plane(nxp+3) = -mode(nxp-2), ..., plane(2*nxp+1) = -mode(0)
        !$acc parallel loop default(present)
-       Do ii = Int(nxp)-1, 0, -1
-          plane_gpu(Int(nxp)+2-1-Int(nxp)+1+ii, 1:nzp) = -rhs_p_hat(Int(nxp)-1-ii, j, 0:mz)
+       Do ii = 0, Int(nxp)-1
+          plane_gpu(Int(nxp)+2+ii, 1:nzp) = -rhs_hat_gpu(Int(nxp)-ii, j-1, 1:mz+1)
        End Do
 
+       ! plane(2*nxp+2) = -mode(1), ..., plane(3*nxp) = -mode(nxp-1)
        !$acc parallel loop default(present)
        Do ii = 1, Int(nxp)-1
-          plane_gpu(2*Int(nxp)+2-1+ii-1, 1:nzp) = -rhs_p_hat(ii, j, 0:mz)
+          plane_gpu(2*Int(nxp)+1+ii, 1:nzp) = -rhs_hat_gpu(ii+1, j-1, 1:mz+1)
        End Do
 
+       ! plane(3*nxp+2) = +mode(nxp-1), ..., plane(4*nxp) = +mode(1)
        !$acc parallel loop default(present)
-       Do ii = Int(nxp)-1, 1, -1
-          plane_gpu(4*Int(nxp)-Int(nxp)+2-1+Int(nxp)-1-ii, 1:nzp) = rhs_p_hat(ii, j, 0:mz)
+       Do ii = 1, Int(nxp)-1
+          plane_gpu(3*Int(nxp)+1+ii, 1:nzp) = rhs_hat_gpu(Int(nxp)+1-ii, j-1, 1:mz+1)
        End Do
 
-       ! cuFFT inverse (in-place on GPU)
+       ! cuFFT inverse
        !$acc host_data use_device(plane_gpu)
        istat = cufftExecZ2Z(cufft_plan_inv, plane_gpu, plane_gpu, CUFFT_INVERSE)
        !$acc end host_data
 
-       ! Extract real part from even positions
+       ! Extract from even positions
        !$acc parallel loop default(present)
        Do ii = 1, Int(nxp)
           rhs_p( ii+1, j, 2:nzp+1 ) = Real(plane_gpu(2*ii,:), 8)/Real(nxpe_global*nzp_global, 8)
