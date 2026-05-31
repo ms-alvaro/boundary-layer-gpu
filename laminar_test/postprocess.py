@@ -201,23 +201,46 @@ def main():
         # Exclude last 5 x-stations (outflow buffer)
         ix_end = -5
 
-        fig, axes = plt.subplots(2, 1, figsize=(10, 5))
+        fig, axes = plt.subplots(2, 1, figsize=(14, 6))
 
-        # U
-        im = axes[0].pcolormesh(snap['x'][:ix_end], yg,
-                                U_plane[:ix_end, :].T,
-                                cmap='RdBu_r', shading='auto', vmin=0, vmax=1.1)
-        axes[0].set_ylabel('y')
+        # Interpolate onto regular y/delta99 grid for visualization
+        from scipy.interpolate import interp1d
+        x_arr = snap['x'][:ix_end]
+        delta99_x = 5.0 * np.sqrt(snap['nu'] * np.maximum(x_arr, 0.1))
+        eta_grid = np.linspace(0, 2.5, 100)  # y/delta99
+
+        # Interpolate U onto (x, y/delta99) grid
+        U_eta = np.zeros((len(x_arr), len(eta_grid)))
+        for i in range(len(x_arr)):
+            eta_local = yg / delta99_x[i]
+            mask = eta_local <= 3.0
+            if np.sum(mask) > 2:
+                f_interp = interp1d(eta_local[mask], U_plane[i, mask],
+                                    bounds_error=False, fill_value=(0, 1.0))
+                U_eta[i, :] = f_interp(eta_grid)
+
+        im = axes[0].contourf(x_arr, eta_grid, U_eta.T, levels=20,
+                              cmap='RdBu_r', vmin=0, vmax=1.1)
+        axes[0].set_ylabel(r'$y / \delta_{99}$')
         axes[0].set_title(f'U velocity (t = {snap["t"]:.4f})')
         plt.colorbar(im, ax=axes[0], label='U')
 
         # V at mid-z
         V_plane = snap['V'][:, :, kz_mid]
-        im = axes[1].pcolormesh(xg[:ix_end], snap['y'],
-                                V_plane[:ix_end, :].T,
-                                cmap='RdBu_r', shading='auto')
+        V_eta = np.zeros((len(xg[:ix_end]), len(eta_grid)))
+        delta99_xg = 5.0 * np.sqrt(snap['nu'] * np.maximum(xg[:ix_end], 0.1))
+        for i in range(len(xg[:ix_end])):
+            eta_local = snap['y'] / delta99_xg[i]
+            mask = eta_local <= 3.0
+            if np.sum(mask) > 2:
+                f_interp = interp1d(eta_local[mask], V_plane[i, mask],
+                                    bounds_error=False, fill_value=0)
+                V_eta[i, :] = f_interp(eta_grid)
+
+        im = axes[1].contourf(xg[:ix_end], eta_grid, V_eta.T, levels=20,
+                              cmap='RdBu_r')
         axes[1].set_xlabel('x')
-        axes[1].set_ylabel('y')
+        axes[1].set_ylabel(r'$y / \delta_{99}$')
         axes[1].set_title('V velocity')
         plt.colorbar(im, ax=axes[1], label='V')
 
