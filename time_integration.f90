@@ -122,10 +122,12 @@ Contains
 
     ! step 1 — eddy viscosity on CPU (1 transfer pair)
     rk_step = 1
-    !$acc update self(U,V,W)
-    Call compute_eddy_viscosity(U,V,W,avg_nu_t,nu_t)
-    Call compute_wall_model(U,V,W)
-    !$acc update device(U,V,W,nu_t,avg_nu_t,alpha_x,alpha_y,alpha_z,V_bottom)
+    If ( LES_model > 0 .Or. iwall_model > 0 ) Then
+       !$acc update self(U,V,W)
+       Call compute_eddy_viscosity(U,V,W,avg_nu_t,nu_t)
+       Call compute_wall_model(U,V,W)
+       !$acc update device(U,V,W,nu_t,avg_nu_t,alpha_x,alpha_y,alpha_z,V_bottom)
+    End If
 
     ! RHS, advance, BC, projection — all on GPU (only rhs_p transfers for FFT)
     Call compute_rhs_u(U,V,W,Fu1)
@@ -139,20 +141,18 @@ Contains
     !$acc end kernels
     t = to + rk2_t(rk_step)*dt
 
-    !$acc update self(U,V,W,Uo,Vo,Wo)
-    Call apply_boundary_conditions
-    !$acc update device(U,V,W)
+    Call apply_boundary_conditions_gpu
     Call compute_projection_step
-    !$acc update self(U,V,W,Uo,Vo,Wo)
-    Call apply_boundary_conditions
-    !$acc update device(U,V,W)
+    Call apply_boundary_conditions_gpu
 
     ! step 2 — eddy viscosity on CPU (1 transfer pair)
     rk_step = 2
-    !$acc update self(U,V,W)
-    Call compute_eddy_viscosity(U,V,W,avg_nu_t,nu_t)
-    Call compute_wall_model(U,V,W)
-    !$acc update device(U,V,W,nu_t,avg_nu_t,alpha_x,alpha_y,alpha_z,V_bottom)
+    If ( LES_model > 0 .Or. iwall_model > 0 ) Then
+       !$acc update self(U,V,W)
+       Call compute_eddy_viscosity(U,V,W,avg_nu_t,nu_t)
+       Call compute_wall_model(U,V,W)
+       !$acc update device(U,V,W,nu_t,avg_nu_t,alpha_x,alpha_y,alpha_z,V_bottom)
+    End If
 
     Call compute_rhs_u(U,V,W,Fu2)
     Call compute_rhs_v(U,V,W,Fv2)
@@ -165,13 +165,9 @@ Contains
     !$acc end kernels
     t = to + rk2_t(rk_step)*dt
 
-    !$acc update self(U,V,W,Uo,Vo,Wo)
-    Call apply_boundary_conditions
-    !$acc update device(U,V,W)
+    Call apply_boundary_conditions_gpu
     Call compute_projection_step
-    !$acc update self(U,V,W,Uo,Vo,Wo)
-    Call apply_boundary_conditions
-    !$acc update device(U,V,W)
+    Call apply_boundary_conditions_gpu
 
   End Subroutine compute_time_step_RK2
 
@@ -194,10 +190,12 @@ Contains
 
     ! step 1
     rk_step = 1
-    !$acc update self(U,V,W)
-    Call compute_eddy_viscosity(U,V,W,avg_nu_t,nu_t)
-    Call compute_wall_model(U,V,W)
-    !$acc update device(U,V,W,nu_t,avg_nu_t,alpha_x,alpha_y,alpha_z,V_bottom)
+    If ( LES_model > 0 .Or. iwall_model > 0 ) Then
+       !$acc update self(U,V,W)
+       Call compute_eddy_viscosity(U,V,W,avg_nu_t,nu_t)
+       Call compute_wall_model(U,V,W)
+       !$acc update device(U,V,W,nu_t,avg_nu_t,alpha_x,alpha_y,alpha_z,V_bottom)
+    End If
     Call compute_rhs_u(U,V,W,Fu1)
     Call compute_rhs_v(U,V,W,Fv1)
     Call compute_rhs_w(U,V,W,Fw1)
@@ -209,20 +207,18 @@ Contains
     !$acc end kernels
     t = to + rk_t(rk_step)*dt
 
-    !$acc update self(U,V,W,Uo,Vo,Wo)
-    Call apply_boundary_conditions
-    !$acc update device(U,V,W)
+    Call apply_boundary_conditions_gpu
     Call compute_projection_step
-    !$acc update self(U,V,W,Uo,Vo,Wo)
-    Call apply_boundary_conditions
-    !$acc update device(U,V,W)
+    Call apply_boundary_conditions_gpu
 
     ! step 2
     rk_step = 2
-    !$acc update self(U,V,W)
-    Call compute_eddy_viscosity(U,V,W,avg_nu_t,nu_t)
-    Call compute_wall_model(U,V,W)
-    !$acc update device(U,V,W,nu_t,avg_nu_t,alpha_x,alpha_y,alpha_z,V_bottom)
+    If ( LES_model > 0 .Or. iwall_model > 0 ) Then
+       !$acc update self(U,V,W)
+       Call compute_eddy_viscosity(U,V,W,avg_nu_t,nu_t)
+       Call compute_wall_model(U,V,W)
+       !$acc update device(U,V,W,nu_t,avg_nu_t,alpha_x,alpha_y,alpha_z,V_bottom)
+    End If
     Call compute_rhs_u(U,V,W,Fu2)
     Call compute_rhs_v(U,V,W,Fv2)
     Call compute_rhs_w(U,V,W,Fw2)
@@ -234,20 +230,18 @@ Contains
     !$acc end kernels
     t = to + rk_t(rk_step)*dt
 
-    !$acc update self(U,V,W,Uo,Vo,Wo)
-    Call apply_boundary_conditions
-    !$acc update device(U,V,W)
+    Call apply_boundary_conditions_gpu
     Call compute_projection_step
-    !$acc update self(U,V,W,Uo,Vo,Wo)
-    Call apply_boundary_conditions
-    !$acc update device(U,V,W)
+    Call apply_boundary_conditions_gpu
 
     ! step 3
     rk_step = 3
-    !$acc update self(U,V,W)
-    Call compute_eddy_viscosity(U,V,W,avg_nu_t,nu_t)
-    Call compute_wall_model(U,V,W)
-    !$acc update device(U,V,W,nu_t,avg_nu_t,alpha_x,alpha_y,alpha_z,V_bottom)
+    If ( LES_model > 0 .Or. iwall_model > 0 ) Then
+       !$acc update self(U,V,W)
+       Call compute_eddy_viscosity(U,V,W,avg_nu_t,nu_t)
+       Call compute_wall_model(U,V,W)
+       !$acc update device(U,V,W,nu_t,avg_nu_t,alpha_x,alpha_y,alpha_z,V_bottom)
+    End If
     Call compute_rhs_u(U,V,W,Fu3)
     Call compute_rhs_v(U,V,W,Fv3)
     Call compute_rhs_w(U,V,W,Fw3)
@@ -262,13 +256,9 @@ Contains
     !$acc end kernels
     t = to + rk_t(rk_step)*dt
 
-    !$acc update self(U,V,W,Uo,Vo,Wo)
-    Call apply_boundary_conditions
-    !$acc update device(U,V,W)
+    Call apply_boundary_conditions_gpu
     Call compute_projection_step
-    !$acc update self(U,V,W,Uo,Vo,Wo)
-    Call apply_boundary_conditions
-    !$acc update device(U,V,W)
+    Call apply_boundary_conditions_gpu
 
   End Subroutine compute_time_step_RK3
 
