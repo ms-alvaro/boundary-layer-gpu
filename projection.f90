@@ -94,8 +94,8 @@ Contains
 
     Integer(Int32) :: ii, i, j, k, i_global, k_global, info, jj, nm
     Integer :: istat
-
-    External :: zgesv
+    ! Local arrays for GPU Thomas solver (max size 512 should be enough)
+    Complex(Int64) :: D_loc(512), DL_loc(512), DU_loc(512), rhs_loc(512)
 
     nm = Int(nyg) - 2  ! number of y-modes = nyg-2
 
@@ -123,32 +123,44 @@ Contains
        !$acc end kernels
     End Do
 
-    ! Transfer modes to CPU for tridiagonal solve
-    !$acc update self(rhs_hat_gpu)
-
-    ! Tridiagonal solve per mode on CPU
+    ! Batched tridiagonal solve — all on GPU, zero transfers
+    ! Each (i,k) mode is independent: Thomas algorithm along y
+    !$acc parallel loop collapse(2) default(present) &
+    !$acc private(i_global, k_global, jj, D_loc, DL_loc, DU_loc, rhs_loc)
     Do k = 1, Int(mz)+1
        Do i = 1, Int(mx)+1
           i_global = imode_map( i-1 )
           k_global = kmode_map( k-1 )
-          Do jj = 2, nyg-1
-             D(jj) = Dyy(jj,jj) + kxx(i_global) + kzz(k_global)
+          ! Build tridiagonal system
+          Do jj = 1, nm
+             D_loc(jj) = Dyy(jj+1, jj+1) + kxx(i_global) + kzz(k_global)
           End Do
-          Do jj = 2, nyg-2
-             DL(jj) = Dyy(jj+1,jj)
+          Do jj = 1, nm-1
+             DL_loc(jj) = Dyy(jj+2, jj+1)
+             DU_loc(jj) = Dyy(jj+1, jj+2)
           End Do
-          Do jj = 2, nyg-2
-             DU(jj) = Dyy(jj,jj+1)
+          If ( i_global==0 .And. k_global==0 ) D_loc(1) = 3d0/2d0*D_loc(1)
+          ! RHS
+          Do jj = 1, nm
+             rhs_loc(jj) = rhs_hat_gpu(i, jj, k)
           End Do
-          If ( i_global==0 .And. k_global==0 ) D(2) = 3d0/2d0*D(2)
-          rhs_aux(2:nyg-1) = rhs_hat_gpu(i, 1:nm, k)
-          Call Zgtsv( nr, nrhs, DL, D, DU, rhs_aux, nr, info)
-          rhs_hat_gpu(i, 1:nm, k) = rhs_aux(2:nyg-1)
+          ! Thomas forward elimination
+          Do jj = 2, nm
+             DL_loc(jj-1) = DL_loc(jj-1) / D_loc(jj-1)
+             D_loc(jj) = D_loc(jj) - DL_loc(jj-1) * DU_loc(jj-1)
+             rhs_loc(jj) = rhs_loc(jj) - DL_loc(jj-1) * rhs_loc(jj-1)
+          End Do
+          ! Back substitution
+          rhs_loc(nm) = rhs_loc(nm) / D_loc(nm)
+          Do jj = nm-1, 1, -1
+             rhs_loc(jj) = (rhs_loc(jj) - DU_loc(jj) * rhs_loc(jj+1)) / D_loc(jj)
+          End Do
+          ! Store result
+          Do jj = 1, nm
+             rhs_hat_gpu(i, jj, k) = rhs_loc(jj)
+          End Do
        End Do
     End Do
-
-    ! Transfer solved modes back to GPU
-    !$acc update device(rhs_hat_gpu)
 
     ! Inverse cosine+Fourier transform per y-slice (on GPU)
     Do j = 2, nyg-1
