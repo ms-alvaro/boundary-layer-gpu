@@ -42,24 +42,15 @@ Contains
     ! interpolate u in x (faces to centers)
     Call interpolate_x(U_,term_1,in1)
 
-    ! u^2
-    !$acc kernels default(present)
-    term_1 = term_1**2d0
-    !$acc end kernels
-
-    ! -du^2/dx
+    ! -du^2/dx (squaring fused into derivative)
     !$acc parallel loop collapse(3) default(present)
     Do k=2,nzg-1
        Do j=2,nyg-1
           Do i=2,nx-1
-             term(i,j,k) = -(term_1(i,j,k)-term_1(i-1,j,k))/( xg(i+1) - xg(i) )
+             rhs_u(i,j,k) = -(term_1(i,j,k)**2-term_1(i-1,j,k)**2)/( xg(i+1) - xg(i) )
           End Do
        End Do
     End Do
-
-    !$acc kernels default(present)
-    rhs_u = term(2:nx-1,2:nyg-1,2:nzg-1)
-    !$acc end kernels
 
     ! 2)-----------compute -duv/dy--------------
 
@@ -69,24 +60,16 @@ Contains
     ! interpolate v in x (centers to faces)
     Call interpolate_x(V_,term_2,in2)
 
-    ! uv at faces
-    !$acc kernels default(present)
-    term_1 = term_1*term_2
-    !$acc end kernels
-
-    ! -duv/dy (this derivative goes to ym)
+    ! -duv/dy (multiply fused into derivative, accumulate into rhs_u)
     !$acc parallel loop collapse(3) default(present)
     Do k=2,nzg-1
        Do j=2,nyg-1
           Do i=2,nx-1
-             term(i,j,k) = -( term_1(i,j,k) - term_1(i,j-1,k) )/( y(j) - y(j-1) )
+             rhs_u(i,j,k) = rhs_u(i,j,k) &
+                - ( term_1(i,j,k)*term_2(i,j,k) - term_1(i,j-1,k)*term_2(i,j-1,k) )/( y(j) - y(j-1) )
           End Do
        End Do
     End Do
-
-    !$acc kernels default(present)
-    rhs_u = rhs_u + term(2:nx-1,2:nyg-1,2:nzg-1)
-    !$acc end kernels
 
     ! 3)--------------compute -duw/dz--------------
 
@@ -96,24 +79,16 @@ Contains
     ! interpolate w in x (centers to faces)
     Call interpolate_x(W_,term_2,in2)
 
-    ! uw at faces
-    !$acc kernels default(present)
-    term_1 = term_1*term_2
-    !$acc end kernels
-
-    ! -duw/dz
+    ! -duw/dz (multiply fused, accumulate into rhs_u)
     !$acc parallel loop collapse(3) default(present)
     Do k=2,nzg-1
        Do j=2,nyg-1
           Do i=2,nx-1
-             term(i,j,k) = -( term_1(i,j,k) - term_1(i,j,k-1) )/( z(k) - z(k-1) )
+             rhs_u(i,j,k) = rhs_u(i,j,k) &
+                - ( term_1(i,j,k)*term_2(i,j,k) - term_1(i,j,k-1)*term_2(i,j,k-1) )/( z(k) - z(k-1) )
           End Do
        End Do
     End Do
-
-    !$acc kernels default(present)
-    rhs_u = rhs_u + term(2:nx-1,2:nyg-1,2:nzg-1)
-    !$acc end kernels
 
     !--------------compute viscous terms------------!
 
@@ -161,23 +136,15 @@ Contains
              nu_z1 = nu + 0.25d0*(nu_t(i,j,k)+nu_t(i,j,k-1)+nu_t(i+1,j,k)+nu_t(i+1,j,k-1))
              nu_z2 = nu + 0.25d0*(nu_t(i,j,k)+nu_t(i,j,k+1)+nu_t(i+1,j,k)+nu_t(i+1,j,k+1))
 
-             ! viscous term
-             term(i,j,k) = 1d0/dx_3*(nu_x2*1d0/dx_2*(U_(i+1,j,k)-U_(i,j,k)) - nu_x1*1d0/dx_1*(U_(i,j,k)-U_(i-1,j,k)) ) + & ! d^2u/dx^2
-                           1d0/dy_3*(nu_y2*term_2(i,j,k)                    - nu_y1*term_2(i,j-1,k) )                  + & ! d^2u/dy^2
-                           1d0/dz_3*(nu_z2*1d0/dz_2*(U_(i,j,k+1)-U_(i,j,k)) - nu_z1*1d0/dz_1*(U_(i,j,k)-U_(i,j,k-1)) )     ! d^2u/dz^2
+             ! viscous term (accumulated directly into rhs_u with pressure gradient)
+             rhs_u(i,j,k) = rhs_u(i,j,k) + dPdx + &
+                           1d0/dx_3*(nu_x2*1d0/dx_2*(U_(i+1,j,k)-U_(i,j,k)) - nu_x1*1d0/dx_1*(U_(i,j,k)-U_(i-1,j,k)) ) + &
+                           1d0/dy_3*(nu_y2*term_2(i,j,k)                    - nu_y1*term_2(i,j-1,k) )                  + &
+                           1d0/dz_3*(nu_z2*1d0/dz_2*(U_(i,j,k+1)-U_(i,j,k)) - nu_z1*1d0/dz_1*(U_(i,j,k)-U_(i,j,k-1)) )
 
        End Do
     End Do
     End Do
-
-    !$acc kernels default(present)
-    rhs_u = rhs_u + term(2:nx-1,2:nyg-1,2:nzg-1)
-    !$acc end kernels
-
-    !--------------Constant pressure gradient-------------!
-    !$acc kernels default(present)
-    rhs_u = rhs_u + dPdx
-    !$acc end kernels
 
     !-------------------Rotating force--------------------!
     If ( Abs(Omega_z)>1d-6 ) Then
@@ -193,13 +160,12 @@ Contains
     End If
 
     !-----------------last plane is dummy----------------!
-    ! Boundary condition are applied at nx-1 and nxg-1
-    ! these points should not change.
-    ! I set this to 0, but maybe not needed
-    ! I did this to avoid changing more the pressure solver
-    !$acc kernels default(present)
-    rhs_u(nx-1,:,:) = 0d0
-    !$acc end kernels
+    !$acc parallel loop collapse(2) default(present)
+    Do k=2,nzg-1
+       Do j=2,nyg-1
+          rhs_u(nx-1,j,k) = 0d0
+       End Do
+    End Do
 
   End Subroutine compute_rhs_u
 

@@ -307,15 +307,15 @@ Contains
 
     ! Initialize cuFFT plans for single-rank GPU solver
     If ( nprocs == 1 ) Then
-       Call cufft_init_plans(Int(nzp_global), Int(nxpe_global))
-       Allocate( plane_gpu(nxpe, nzp) )
-       ! Standard-bound GPU array for FFT modes: (mx+1, nyg-2, mz+1)
+       ! Batched cuFFT: all nyg-2 interior y-planes at once
+       Call cufft_init_plans(Int(nzp_global), Int(nxpe_global), Int(nyg-2))
+       Allocate( plane_gpu(nxpe, nzp, nyg-2) )
        Allocate( rhs_hat_gpu(mx+1, nyg-2, mz+1) )
-       If (myid==0) Write(*,*) 'cuFFT plans created for GPU pressure solver'
+       If (myid==0) Write(*,*) 'cuFFT batched plans created:', nyg-2, 'y-planes'
     Else
-       Allocate( plane_gpu(1, 1) )  ! dummy
+       Allocate( plane_gpu(1, 1, 1) )  ! dummy
        Allocate( rhs_hat_gpu(1, 1, 1) )  ! dummy
-    End If 
+    End If
 
     ! global Fourier coeficients with modified wave-number for the second derivative
     Allocate ( kxx(0:mx_global), kzz(0:mz_global) ) 
@@ -415,6 +415,50 @@ Contains
     Dyy(nyg-1,nyg-1) = a + b
     Dyy(nyg-1,nyg-2) = c
     coef_bc_2        = a
+
+    ! Precompute Thomas LU factorization for all (i,k) modes
+    If ( nprocs == 1 ) Then
+       Block
+          Integer(Int32) :: ii, kk, jj, nm_loc, ig, kg
+          Complex(Int64) :: dd
+          nm_loc = Int(nyg) - 2
+          Allocate( thomas_dl_fact(nm_loc, mx+1, mz+1) )
+          Allocate( thomas_d_pivot(nm_loc, mx+1, mz+1) )
+          Allocate( thomas_du(nm_loc) )
+          ! DU is the same for all modes
+          Do jj = 1, nm_loc-1
+             thomas_du(jj) = dcmplx(Dyy(jj+1, jj+2))
+          End Do
+          thomas_du(nm_loc) = (0d0, 0d0)
+          ! Factorize each (i,k) mode
+          Do kk = 1, Int(mz)+1
+             Do ii = 1, Int(mx)+1
+                ig = imode_map(ii-1)
+                kg = kmode_map(kk-1)
+                ! Build D and DL for this mode
+                Do jj = 1, nm_loc
+                   thomas_d_pivot(jj, ii, kk) = dcmplx(Dyy(jj+1, jj+1) + kxx(ig) + kzz(kg))
+                End Do
+                Do jj = 1, nm_loc-1
+                   thomas_dl_fact(jj, ii, kk) = dcmplx(Dyy(jj+2, jj+1))
+                End Do
+                thomas_dl_fact(nm_loc, ii, kk) = (0d0, 0d0)
+                If ( ig==0 .And. kg==0 ) thomas_d_pivot(1, ii, kk) = 3d0/2d0 * thomas_d_pivot(1, ii, kk)
+                ! Forward elimination (factorize)
+                Do jj = 2, nm_loc
+                   dd = thomas_dl_fact(jj-1, ii, kk) / thomas_d_pivot(jj-1, ii, kk)
+                   thomas_dl_fact(jj-1, ii, kk) = dd
+                   thomas_d_pivot(jj, ii, kk) = thomas_d_pivot(jj, ii, kk) - dd * thomas_du(jj-1)
+                End Do
+                ! Invert D_pivot for multiply instead of divide at runtime
+                Do jj = 1, nm_loc
+                   thomas_d_pivot(jj, ii, kk) = (1d0, 0d0) / thomas_d_pivot(jj, ii, kk)
+                End Do
+             End Do
+          End Do
+          If (myid==0) Write(*,*) 'Thomas LU precomputed:', nm_loc, 'x', Int(mx)+1, 'x', Int(mz)+1
+       End Block
+    End If
 
     Allocate ( bc_1(2:nxg-1,2:nzg-1), bc_2(2:nxg-1,2:nzg-1) )
     Allocate ( bc_1_hat(0:mx,0:mz),   bc_2_hat(0:mx,0:mz)   )
