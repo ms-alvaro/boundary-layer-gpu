@@ -1,15 +1,16 @@
-! Boundary layer transition
-! Rex_inlet=5e5, 20% random noise at inlet, 3D
-! Long run: 10 flow-throughs
+! Boundary layer transition — TS modes inflow
+! Rex_inlet=1e5, 0.2% OS eigenmodes, 3D
+! DNS resolution: dx+=12, dy+=0.5, dz+=8 (Towne et al. 2022)
+! Ly = 3 x delta99_est, reduced amplitude for natural transition
 
-! Grid: nx=302, ny=96, nz=66
-nxyz = 302 96 66
+! Grid: nx=813, ny=125, nz=66
+nxyz = 814 125 66
 
-! Fixed time step
-CFL = -2e-5
+! Fixed time step (dt=4e-5)
+CFL = -4e-5
 
-! Viscosity: Rex_inlet = 1/2e-6 = 5e5
-nu = 2e-6
+! Viscosity: Rex_inlet = 1/1e-5 = 1e5
+nu = 1e-5
 
 ! Time integration: RK2
 RKscheme = 2
@@ -33,20 +34,20 @@ x0 = 0.0
 sigma = 1.0
 phi = 0.0
 
-! 50% perturbation amplitude (inflow only, no IC noise)
-Amplitude = 0.50
+! Amplitude (not used with inflow_flag=1, modes have own amplitude)
+Amplitude = 0.20
 
-! 10 flow-throughs: Lx=5, U=1, dt=2e-5 -> 250k steps/ft
-nsteps   = 2500000
-nsave    = 25000
-nstats   = 25000
-nmonitor = 5000
+! 10 flow-throughs: Lx=2, U=1, dt=4e-5 -> 50k steps/ft
+nsteps   = 500000
+nsave    = 5000
+nstats   = 5000
+nmonitor = 2500
 
-! Blasius IC (init_flow generates Blasius; noise skipped since Amplitude_IC=0 in code)
+! Blasius IC (no volume noise)
 init_rand = 1
 
-! Domain: Lx=5, Ly=0.06, Lz=0.06
-boxsize = 5.0 0.06 0.06 3.0
+! Domain: Lx=2.0, Ly=0.41, Lz=0.1083
+boxsize = 2.0 0.41 0.1083 3.0
 
 init_step = 0
 

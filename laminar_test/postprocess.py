@@ -203,42 +203,44 @@ def main():
 
         fig, axes = plt.subplots(2, 1, figsize=(14, 6))
 
-        # Interpolate onto regular y/delta99 grid for visualization
+        # Interpolate onto regular y/delta99 grid, mask outside domain
         from scipy.interpolate import interp1d
         x_arr = snap['x'][:ix_end]
         delta99_x = 5.0 * np.sqrt(snap['nu'] * np.maximum(x_arr, 0.1))
-        eta_grid = np.linspace(0, 2.5, 100)  # y/delta99
+        eta_grid = np.linspace(0, 2.5, 100)
 
-        # Interpolate U onto (x, y/delta99) grid
-        U_eta = np.zeros((len(x_arr), len(eta_grid)))
+        # U onto (x, y/delta99) — NaN where domain doesn't reach
+        U_eta = np.full((len(x_arr), len(eta_grid)), np.nan)
         for i in range(len(x_arr)):
             eta_local = yg / delta99_x[i]
-            mask = eta_local <= 3.0
-            if np.sum(mask) > 2:
-                f_interp = interp1d(eta_local[mask], U_plane[i, mask],
-                                    bounds_error=False, fill_value=(0, 1.0))
-                U_eta[i, :] = f_interp(eta_grid)
+            eta_max_domain = snap['y'][-1] / delta99_x[i]  # max y/delta99 in domain
+            # Above domain, U = freestream (last grid value)
+            fill_val = U_plane[i, -1]
+            f_interp = interp1d(eta_local, U_plane[i, :],
+                                bounds_error=False, fill_value=(np.nan, fill_val))
+            U_eta[i, :] = f_interp(eta_grid)
 
-        im = axes[0].contourf(x_arr, eta_grid, U_eta.T, levels=20,
-                              cmap='RdBu_r', vmin=0, vmax=1.1)
+        im = axes[0].pcolormesh(x_arr, eta_grid, np.ma.masked_invalid(U_eta.T),
+                               cmap='RdBu_r', shading='nearest', vmin=0, vmax=1.1)
         axes[0].set_ylabel(r'$y / \delta_{99}$')
         axes[0].set_title(f'U velocity (t = {snap["t"]:.4f})')
         plt.colorbar(im, ax=axes[0], label='U')
 
-        # V at mid-z
+        # V onto (x, y/delta99)
         V_plane = snap['V'][:, :, kz_mid]
-        V_eta = np.zeros((len(xg[:ix_end]), len(eta_grid)))
+        V_eta = np.full((len(xg[:ix_end]), len(eta_grid)), np.nan)
         delta99_xg = 5.0 * np.sqrt(snap['nu'] * np.maximum(xg[:ix_end], 0.1))
         for i in range(len(xg[:ix_end])):
             eta_local = snap['y'] / delta99_xg[i]
-            mask = eta_local <= 3.0
-            if np.sum(mask) > 2:
-                f_interp = interp1d(eta_local[mask], V_plane[i, mask],
-                                    bounds_error=False, fill_value=0)
-                V_eta[i, :] = f_interp(eta_grid)
+            eta_max_domain = snap['y'][-1] / delta99_xg[i]
+            # Above domain, V = value at domain edge
+            fill_val = V_plane[i, -1]
+            f_interp = interp1d(eta_local, V_plane[i, :],
+                                bounds_error=False, fill_value=(np.nan, fill_val))
+            V_eta[i, :] = f_interp(eta_grid)
 
-        im = axes[1].contourf(xg[:ix_end], eta_grid, V_eta.T, levels=20,
-                              cmap='RdBu_r')
+        im = axes[1].pcolormesh(xg[:ix_end], eta_grid, np.ma.masked_invalid(V_eta.T),
+                               cmap='RdBu_r', shading='nearest')
         axes[1].set_xlabel('x')
         axes[1].set_ylabel(r'$y / \delta_{99}$')
         axes[1].set_title('V velocity')

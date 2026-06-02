@@ -23,16 +23,37 @@ Contains
   !-----------------------------------------------!
   Subroutine compute_time_step_Euler
 
+    Integer(Int32) :: i, j, k
+
     ! equivalent to last RK step
     step_beginning = 1
     rk_step        = 3
 
     ! save current step
-    !$acc kernels default(present)
-    Uo = U
-    Vo = V
-    Wo = W
-    !$acc end kernels
+    !$acc parallel loop collapse(3) default(present)
+    Do k = 1, nzg
+       Do j = 1, nyg
+          Do i = 1, nx
+             Uo(i,j,k) = U(i,j,k)
+          End Do
+       End Do
+    End Do
+    !$acc parallel loop collapse(3) default(present)
+    Do k = 1, nzg
+       Do j = 1, ny
+          Do i = 1, nxg
+             Vo(i,j,k) = V(i,j,k)
+          End Do
+       End Do
+    End Do
+    !$acc parallel loop collapse(3) default(present)
+    Do k = 1, nz
+       Do j = 1, nyg
+          Do i = 1, nxg
+             Wo(i,j,k) = W(i,j,k)
+          End Do
+       End Do
+    End Do
     ! Compute eddy viscosity (on CPU)
     !$acc update self(Uo,Vo,Wo)
     Call compute_eddy_viscosity(Uo,Vo,Wo,avg_nu_t,nu_t)
@@ -109,16 +130,36 @@ Contains
   Subroutine compute_time_step_RK2
 
     Real(Int64) :: to
+    Integer(Int32) :: i, j, k
 
     step_beginning = 1
 
     ! save previous state
     to = t
-    !$acc kernels default(present)
-    Uo = U
-    Vo = V
-    Wo = W
-    !$acc end kernels
+    !$acc parallel loop collapse(3) default(present)
+    Do k = 1, nzg
+       Do j = 1, nyg
+          Do i = 1, nx
+             Uo(i,j,k) = U(i,j,k)
+          End Do
+       End Do
+    End Do
+    !$acc parallel loop collapse(3) default(present)
+    Do k = 1, nzg
+       Do j = 1, ny
+          Do i = 1, nxg
+             Vo(i,j,k) = V(i,j,k)
+          End Do
+       End Do
+    End Do
+    !$acc parallel loop collapse(3) default(present)
+    Do k = 1, nz
+       Do j = 1, nyg
+          Do i = 1, nxg
+             Wo(i,j,k) = W(i,j,k)
+          End Do
+       End Do
+    End Do
 
     ! step 1 — eddy viscosity on CPU (1 transfer pair)
     rk_step = 1
@@ -129,7 +170,7 @@ Contains
        !$acc update device(U,V,W,nu_t,avg_nu_t,alpha_x,alpha_y,alpha_z,V_bottom)
     End If
 
-    ! RHS, advance, BC, projection — all on GPU (only rhs_p transfers for FFT)
+    ! RHS, advance, BC, projection — all on GPU
     Call compute_rhs_u(U,V,W,Fu1)
     Call compute_rhs_v(U,V,W,Fv1)
     Call compute_rhs_w(U,V,W,Fw1)
@@ -177,16 +218,36 @@ Contains
   Subroutine compute_time_step_RK3
 
     Real(Int64) :: to
+    Integer(Int32) :: i, j, k
 
     step_beginning = 1
 
     ! save previous state
     to = t
-    !$acc kernels default(present)
-    Uo = U
-    Vo = V
-    Wo = W
-    !$acc end kernels
+    !$acc parallel loop collapse(3) default(present)
+    Do k = 1, nzg
+       Do j = 1, nyg
+          Do i = 1, nx
+             Uo(i,j,k) = U(i,j,k)
+          End Do
+       End Do
+    End Do
+    !$acc parallel loop collapse(3) default(present)
+    Do k = 1, nzg
+       Do j = 1, ny
+          Do i = 1, nxg
+             Vo(i,j,k) = V(i,j,k)
+          End Do
+       End Do
+    End Do
+    !$acc parallel loop collapse(3) default(present)
+    Do k = 1, nz
+       Do j = 1, nyg
+          Do i = 1, nxg
+             Wo(i,j,k) = W(i,j,k)
+          End Do
+       End Do
+    End Do
 
     ! step 1
     rk_step = 1
@@ -327,6 +388,13 @@ Contains
     Real   (Int64) :: dt_max, CFLa
 
     CFLa = Abs( CFL )   ! absolute value of CFL ( for when CFL is dt )
+
+    ! Fixed time step: skip CFL computation entirely (avoids GPU->CPU transfer)
+    If ( CFL < 0 ) Then
+       dt = -CFL
+       dt_min_cfl = dt / CFLa
+       Return
+    End If
 
     ! convective time step
     lUmax = 0d0
