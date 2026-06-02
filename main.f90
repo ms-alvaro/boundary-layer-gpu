@@ -73,7 +73,9 @@ Program boundary_layer_FD
   !$acc      copy(V_bottom) &
   !$acc      copyin(bc_1,bc_2) &
   !$acc      copyin(U_top,V_top,W_top,U_inlet,V_inlet,W_inlet) &
-  !$acc      create(plane_gpu,rhs_hat_gpu)
+  !$acc      create(plane_gpu,rhs_hat_gpu) &
+  !$acc      copyin(qu_inlet,qv_inlet,qw_inlet,zmode_inlet,tmode_inlet) &
+  !$acc      create(Ut_inlet,Vt_inlet,Wt_inlet)
 
   ! temporal loop
   Do istep = 1, nsteps
@@ -90,8 +92,12 @@ Program boundary_layer_FD
         Call compute_time_step_RK3
      End If
 
+     ! Transfer GPU -> CPU only when needed (statistics, monitor, or snapshot)
+     If ( istep==1 .Or. Mod(istep,nstats)==0 .Or. Mod(istep,nmonitor)==0 .Or. Mod(istep,nsave)==0 ) Then
+        !$acc update self(U,V,W,P,nu_t)
+     End If
+
      ! compute a few statistics
-     !$acc update self(U,V,W,P,nu_t)
      Call compute_statistics
      !Call compute_statistics_z_modes
 

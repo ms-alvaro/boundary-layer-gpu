@@ -126,22 +126,68 @@ Contains
   !---------------------------------------------------------!
   Subroutine apply_boundary_conditions_gpu
 
-    Integer(Int32) :: i, j, k
+    Integer(Int32) :: i, j, k, n, m
     Real   (Int64) :: Uc, Qx_local, Qy_local, Q_local, Q_total, Delta_U, length_y
     Integer(Int32) :: kk
 
     ! Ghost cell updates: nprocs=1 -> no-op
 
-    ! Inflow BC (temporal modes + Blasius) — CPU side
-    Call compute_temporal_inflow
+    ! Inflow BC (temporal modes + Blasius) — entirely on GPU
+    ! Compute Ut_inlet, Vt_inlet, Wt_inlet on GPU
+    If ( n_modes_inlet > 0 ) Then
+       !$acc parallel loop collapse(2) default(present) &
+       !$acc private(n, m)
+       Do j = 1, nyg
+          Do k = 1, nzg
+             Ut_inlet(j,k) = 0d0
+             Do n = 1, n_modes_inlet
+                Do m = 1, m_modes_inlet
+                   Ut_inlet(j,k) = Ut_inlet(j,k) + &
+                      Real( qu_inlet(j,n,m)*cdexp(dcmplx(0d0,1d0)*zmode_inlet(n)*zg(k) &
+                            - dcmplx(0d0,1d0)*tmode_inlet(m)*t) , 8)
+                End Do
+             End Do
+          End Do
+       End Do
+       !$acc parallel loop collapse(2) default(present) &
+       !$acc private(n, m)
+       Do j = 1, ny
+          Do k = 1, nzg
+             Vt_inlet(j,k) = 0d0
+             Do n = 1, n_modes_inlet
+                Do m = 1, m_modes_inlet
+                   Vt_inlet(j,k) = Vt_inlet(j,k) + &
+                      Real( qv_inlet(j,n,m)*cdexp(dcmplx(0d0,1d0)*zmode_inlet(n)*zg(k) &
+                            - dcmplx(0d0,1d0)*tmode_inlet(m)*t) , 8)
+                End Do
+             End Do
+          End Do
+       End Do
+       !$acc parallel loop collapse(2) default(present) &
+       !$acc private(n, m)
+       Do j = 1, nyg
+          Do k = 1, nz
+             Wt_inlet(j,k) = 0d0
+             Do n = 1, n_modes_inlet
+                Do m = 1, m_modes_inlet
+                   Wt_inlet(j,k) = Wt_inlet(j,k) + &
+                      Real( qw_inlet(j,n,m)*cdexp(dcmplx(0d0,1d0)*zmode_inlet(n)*z(k) &
+                            - dcmplx(0d0,1d0)*tmode_inlet(m)*t) , 8)
+                End Do
+             End Do
+          End Do
+       End Do
+    End If
+    ! Apply inflow: U(1,:,:) = Blasius + perturbation (on GPU)
+    !$acc parallel loop default(present)
     Do j=1,nyg
        U(1,j,:) = U_inlet(j) + Ut_inlet(j,:)
        W(1,j,:) = W_inlet(j) + Wt_inlet(j,:)
     End Do
+    !$acc parallel loop default(present)
     Do j=1,ny
        V(1,j,:) = V_inlet(j) + Vt_inlet(j,:)
     End Do
-    !$acc update device(U(1,:,:), V(1,:,:), W(1,:,:))
 
     ! Outflow BC — on GPU
     Uc = U_top(nx)
