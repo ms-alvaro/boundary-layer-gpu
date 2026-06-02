@@ -131,12 +131,16 @@ Module global
   Complex(C_DOUBLE_COMPLEX), Pointer,     Dimension(:,:) :: plane, plane_hat
   Complex(C_DOUBLE_COMPLEX), Allocatable, Dimension(:,:) :: plane_short
 
-  ! GPU workspace for cuFFT pressure solver
-  Complex(C_DOUBLE_COMPLEX), Allocatable, Dimension(:,:) :: plane_gpu
+  ! GPU workspace for cuFFT pressure solver (batched: all y-planes)
+  Complex(C_DOUBLE_COMPLEX), Allocatable, Dimension(:,:,:) :: plane_gpu
   ! GPU workspace for FFT modes (standard 1-based bounds, avoids nvfortran bug)
   Complex(C_DOUBLE_COMPLEX), Allocatable, Dimension(:,:,:) :: rhs_hat_gpu
 
-  ! Fourier points and wave numbers 
+  ! Precomputed Thomas factorization: DL_fact(nm,mx+1,mz+1), D_pivot(nm,mx+1,mz+1), DU_fact(nm)
+  Complex(C_DOUBLE_COMPLEX), Allocatable, Dimension(:,:,:) :: thomas_dl_fact, thomas_d_pivot
+  Complex(C_DOUBLE_COMPLEX), Allocatable, Dimension(:)     :: thomas_du
+
+  ! Fourier points and wave numbers
   Integer(C_INTPTR_T) :: nxp_global, nxpe_global, nzp_global, local_k_offset
   Integer(C_INTPTR_T) :: nxp, nxpe, nzp
   Integer(C_INTPTR_T) :: mx_global, mz_global

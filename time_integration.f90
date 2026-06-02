@@ -131,8 +131,13 @@ Contains
 
     Real(Int64) :: to
     Integer(Int32) :: i, j, k
+    Integer(Int64) :: c0, c1, c2, c3, c4, c5, crate
+    Real(Int64), Save :: acc_copy=0, acc_rhs=0, acc_adv=0, acc_bc=0, acc_proj=0
+    Integer(Int32), Save :: prof_n = 0
 
     step_beginning = 1
+
+    Call system_clock(c0, crate)
 
     ! save previous state
     to = t
@@ -171,9 +176,13 @@ Contains
     End If
 
     ! RHS, advance, BC, projection — all on GPU
+    !$acc wait
+    Call system_clock(c1)
     Call compute_rhs_u(U,V,W,Fu1)
     Call compute_rhs_v(U,V,W,Fv1)
     Call compute_rhs_w(U,V,W,Fw1)
+    !$acc wait
+    Call system_clock(c2)
 
     !$acc kernels default(present)
     U(2:nx-1,2:nyg-1,2:nzg-1) = Uo(2:nx-1,2:nyg-1,2:nzg-1) + dt*rk2_coef(1,1)*Fu1
@@ -181,9 +190,17 @@ Contains
     W(2:nxg-1,2:nyg-1,2:nz-1) = Wo(2:nxg-1,2:nyg-1,2:nz-1) + dt*rk2_coef(1,1)*Fw1
     !$acc end kernels
     t = to + rk2_t(rk_step)*dt
+    !$acc wait
+    Call system_clock(c3)
 
     Call apply_boundary_conditions_gpu
+    !$acc wait
+    Call system_clock(c4)
+
     Call compute_projection_step
+    !$acc wait
+    Call system_clock(c5)
+
     Call apply_boundary_conditions_gpu
 
     ! step 2 — eddy viscosity on CPU (1 transfer pair)
@@ -209,6 +226,23 @@ Contains
     Call apply_boundary_conditions_gpu
     Call compute_projection_step
     Call apply_boundary_conditions_gpu
+
+    ! Accumulate profiling (step 1 only — step 2 is symmetric)
+    acc_copy = acc_copy + Real(c1-c0)/Real(crate)
+    acc_rhs  = acc_rhs  + Real(c2-c1)/Real(crate)
+    acc_adv  = acc_adv  + Real(c3-c2)/Real(crate)
+    acc_bc   = acc_bc   + Real(c4-c3)/Real(crate)
+    acc_proj = acc_proj + Real(c5-c4)/Real(crate)
+    prof_n = prof_n + 1
+    If ( Mod(prof_n, 100) == 0 .And. myid==0 ) Then
+       Write(*,'(A,I6,A,5(A,F9.4))') ' PROFILE n=', prof_n, ' (substep1 avg ms):', &
+            ' copy=', acc_copy/prof_n*1e3, &
+            ' RHS=',  acc_rhs/prof_n*1e3, &
+            ' adv=',  acc_adv/prof_n*1e3, &
+            ' BC=',   acc_bc/prof_n*1e3, &
+            ' proj=', acc_proj/prof_n*1e3
+       Call flush(6)
+    End If
 
   End Subroutine compute_time_step_RK2
 
