@@ -52,10 +52,12 @@ Contains
     Allocate (  k1_global(0:nprocs-1),  k2_global(0:nprocs-1) )
     Allocate ( kg1_global(0:nprocs-1), kg2_global(0:nprocs-1) )
 
-    ! restrictions for FFTW mapping
-    If ( Mod( nx_global   , 2     )/=0 ) Stop 'Error: nx must be even'
-    If ( Mod( nz_global   , 2     )/=0 ) Stop 'Error: nz must be even'
-    If ( Mod( nz_global-2 , nprocs)/=0 ) Stop 'nz-2 should be divisible by number of processors'
+    ! restrictions for FFTW-MPI mapping (only enforced for multi-rank)
+    If ( nprocs > 1 ) Then
+       If ( Mod( nx_global, 2 )/=0 )      Stop 'Error: nx must be even for MPI'
+       If ( Mod( nz_global, 2 )/=0 )      Stop 'Error: nz must be even for MPI'
+       If ( Mod( nz_global-2, nprocs)/=0 ) Stop 'nz-2 should be divisible by nprocs'
+    End If
 
     ! number of interior z-planes per processor based on fftw decomposition
     nslices_z = Nint( Real((nz_global-2))/Real(nprocs) ) 
@@ -701,7 +703,8 @@ Contains
     nzu_reduced     = (nzg_global-2) - 2 + 1
     nzu_modes       = nzu_reduced/2+1
     nzu_first_modes = Min(6,nzg_global-4)
-    If ( Mod(nzu_reduced,2)/=0 ) Stop 'Error! nzu_reduced must be even'
+    If ( Mod(nzu_reduced,2)/=0 .And. nprocs > 1 ) Stop 'Error! nzu_reduced must be even'
+    If ( Mod(nzu_reduced,2)/=0 ) nzu_reduced = nzu_reduced - 1  ! trim for odd case
     Call initialize_fftz(nzu_reduced)
 
     Allocate( xu_reduced(nxu_reduced) )
