@@ -95,7 +95,7 @@ Contains
     Integer(Int32) :: ii, i, j, k, b, i_global, k_global, jj, nm
     Integer(Int32) :: nxp_i, nxpe_i, nzp_i, mx_i, mz_i
     Integer :: istat
-    Complex(Int64) :: rhs_loc(128)
+    ! (no private arrays needed — Thomas operates directly on rhs_hat_gpu)
     Real(Int64) :: fft_norm
     Integer(Int64) :: p0, p1, p2, p3, p4, p5, p6, prate
     Real(Int64), Save :: a_fpack=0, a_fft_f=0, a_fext=0, a_thomas=0, a_ipack=0, a_fft_i=0, a_iext=0
@@ -156,26 +156,19 @@ Contains
     Call system_clock(p3)
 
     ! ---- Thomas solve using precomputed LU (1 kernel, batched over i,k) ----
-    !$acc parallel loop collapse(2) default(present) &
-    !$acc private(jj, rhs_loc)
+    !$acc parallel loop collapse(2) default(present)
     Do k = 1, mz_i
        Do i = 1, mx_i
-          ! Load RHS
-          Do jj = 1, nm
-             rhs_loc(jj) = rhs_hat_gpu(i, jj, k)
-          End Do
           ! Forward substitution (L solve)
           Do jj = 2, nm
-             rhs_loc(jj) = rhs_loc(jj) - thomas_dl_fact(jj-1, i, k) * rhs_loc(jj-1)
+             rhs_hat_gpu(i, jj, k) = rhs_hat_gpu(i, jj, k) &
+                - thomas_dl_fact(i, k, jj-1) * rhs_hat_gpu(i, jj-1, k)
           End Do
-          ! Back substitution (U solve) — multiply by 1/D_pivot instead of divide
-          rhs_loc(nm) = rhs_loc(nm) * thomas_d_pivot(nm, i, k)
+          ! Back substitution (U solve)
+          rhs_hat_gpu(i, nm, k) = rhs_hat_gpu(i, nm, k) * thomas_d_pivot(i, k, nm)
           Do jj = nm-1, 1, -1
-             rhs_loc(jj) = (rhs_loc(jj) - thomas_du(jj) * rhs_loc(jj+1)) * thomas_d_pivot(jj, i, k)
-          End Do
-          ! Store result
-          Do jj = 1, nm
-             rhs_hat_gpu(i, jj, k) = rhs_loc(jj)
+             rhs_hat_gpu(i, jj, k) = (rhs_hat_gpu(i, jj, k) &
+                - thomas_du(jj) * rhs_hat_gpu(i, jj+1, k)) * thomas_d_pivot(i, k, jj)
           End Do
        End Do
     End Do
@@ -428,22 +421,31 @@ Contains
 
     Integer(Int32) :: i, j, k
 
-    !$acc parallel loop default(present)
-    Do i = 2, nx-1
-       U(i,2:nyg-1,2:nzg-1) = U(i,2:nyg-1,2:nzg-1) - &
-            ( rhs_p(i+1,2:nyg-1,2:nzg-1) - rhs_p(i,2:nyg-1,2:nzg-1) )/( xg(i+1) - xg(i) )
+    !$acc parallel loop collapse(3) default(present)
+    Do k = 2, nzg-1
+       Do j = 2, nyg-1
+          Do i = 2, nx-1
+             U(i,j,k) = U(i,j,k) - (rhs_p(i+1,j,k) - rhs_p(i,j,k))/(xg(i+1) - xg(i))
+          End Do
+       End Do
     End Do
 
-    !$acc parallel loop default(present)
-    Do j = 2, ny-1
-       V(2:nxg-1,j,2:nzg-1) = V(2:nxg-1,j,2:nzg-1) - &
-            ( rhs_p(2:nxg-1,j+1,2:nzg-1) - rhs_p(2:nxg-1,j,2:nzg-1) )/( yg(j+1) - yg(j) )
+    !$acc parallel loop collapse(3) default(present)
+    Do k = 2, nzg-1
+       Do j = 2, ny-1
+          Do i = 2, nxg-1
+             V(i,j,k) = V(i,j,k) - (rhs_p(i,j+1,k) - rhs_p(i,j,k))/(yg(j+1) - yg(j))
+          End Do
+       End Do
     End Do
 
-    !$acc parallel loop default(present)
+    !$acc parallel loop collapse(3) default(present)
     Do k = 2, nz-1
-       W(2:nxg-1,2:nyg-1,k) = W(2:nxg-1,2:nyg-1,k) - &
-            ( rhs_p(2:nxg-1,2:nyg-1,k+1) - rhs_p(2:nxg-1,2:nyg-1,k) )/( zg(k+1) - zg(k) )
+       Do j = 2, nyg-1
+          Do i = 2, nxg-1
+             W(i,j,k) = W(i,j,k) - (rhs_p(i,j,k+1) - rhs_p(i,j,k))/(zg(k+1) - zg(k))
+          End Do
+       End Do
     End Do
 
   End Subroutine project_velocity

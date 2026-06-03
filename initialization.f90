@@ -422,37 +422,37 @@ Contains
           Integer(Int32) :: ii, kk, jj, nm_loc, ig, kg
           Complex(Int64) :: dd
           nm_loc = Int(nyg) - 2
-          Allocate( thomas_dl_fact(nm_loc, mx+1, mz+1) )
-          Allocate( thomas_d_pivot(nm_loc, mx+1, mz+1) )
+          ! Transposed layout: (mx+1, mz+1, nm) for coalesced GPU access
+          Allocate( thomas_dl_fact(mx+1, mz+1, nm_loc) )
+          Allocate( thomas_d_pivot(mx+1, mz+1, nm_loc) )
           Allocate( thomas_du(nm_loc) )
           ! DU is the same for all modes
           Do jj = 1, nm_loc-1
              thomas_du(jj) = dcmplx(Dyy(jj+1, jj+2))
           End Do
           thomas_du(nm_loc) = (0d0, 0d0)
-          ! Factorize each (i,k) mode
+          ! Factorize each (i,k) mode (stored transposed)
           Do kk = 1, Int(mz)+1
              Do ii = 1, Int(mx)+1
                 ig = imode_map(ii-1)
                 kg = kmode_map(kk-1)
-                ! Build D and DL for this mode
                 Do jj = 1, nm_loc
-                   thomas_d_pivot(jj, ii, kk) = dcmplx(Dyy(jj+1, jj+1) + kxx(ig) + kzz(kg))
+                   thomas_d_pivot(ii, kk, jj) = dcmplx(Dyy(jj+1, jj+1) + kxx(ig) + kzz(kg))
                 End Do
                 Do jj = 1, nm_loc-1
-                   thomas_dl_fact(jj, ii, kk) = dcmplx(Dyy(jj+2, jj+1))
+                   thomas_dl_fact(ii, kk, jj) = dcmplx(Dyy(jj+2, jj+1))
                 End Do
-                thomas_dl_fact(nm_loc, ii, kk) = (0d0, 0d0)
-                If ( ig==0 .And. kg==0 ) thomas_d_pivot(1, ii, kk) = 3d0/2d0 * thomas_d_pivot(1, ii, kk)
+                thomas_dl_fact(ii, kk, nm_loc) = (0d0, 0d0)
+                If ( ig==0 .And. kg==0 ) thomas_d_pivot(ii, kk, 1) = 3d0/2d0 * thomas_d_pivot(ii, kk, 1)
                 ! Forward elimination (factorize)
                 Do jj = 2, nm_loc
-                   dd = thomas_dl_fact(jj-1, ii, kk) / thomas_d_pivot(jj-1, ii, kk)
-                   thomas_dl_fact(jj-1, ii, kk) = dd
-                   thomas_d_pivot(jj, ii, kk) = thomas_d_pivot(jj, ii, kk) - dd * thomas_du(jj-1)
+                   dd = thomas_dl_fact(ii, kk, jj-1) / thomas_d_pivot(ii, kk, jj-1)
+                   thomas_dl_fact(ii, kk, jj-1) = dd
+                   thomas_d_pivot(ii, kk, jj) = thomas_d_pivot(ii, kk, jj) - dd * thomas_du(jj-1)
                 End Do
                 ! Invert D_pivot for multiply instead of divide at runtime
                 Do jj = 1, nm_loc
-                   thomas_d_pivot(jj, ii, kk) = (1d0, 0d0) / thomas_d_pivot(jj, ii, kk)
+                   thomas_d_pivot(ii, kk, jj) = (1d0, 0d0) / thomas_d_pivot(ii, kk, jj)
                 End Do
              End Do
           End Do
