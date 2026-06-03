@@ -64,25 +64,40 @@ Contains
     Call compute_rhs_u(Uo,Vo,Wo,rhs_uo)
 
     ! Advance U interior points
-    !$acc kernels default(present)
-    U(2:nx-1,2:nyg-1,2:nzg-1) = Uo(2:nx-1,2:nyg-1,2:nzg-1) + dt*rhs_uo
-    !$acc end kernels
+    !$acc parallel loop collapse(3) default(present)
+    Do k=2,nzg-1
+       Do j=2,nyg-1
+          Do i=2,nx-1
+       U(i,j,k) = Uo(i,j,k) + dt*rhs_uo(i,j,k)
+              End Do
+       End Do
+    End Do
 
     ! compute rhs for V
     Call compute_rhs_v(Uo,Vo,Wo,rhs_vo)
 
     ! Advance V interior points
-    !$acc kernels default(present)
-    V(2:nxg-1,2:ny-1,2:nzg-1) = Vo(2:nxg-1,2:ny-1,2:nzg-1) + dt*rhs_vo
-    !$acc end kernels
+    !$acc parallel loop collapse(3) default(present)
+    Do k=2,nzg-1
+       Do j=2,ny-1
+          Do i=2,nxg-1
+       V(i,j,k) = Vo(i,j,k) + dt*rhs_vo(i,j,k)
+              End Do
+       End Do
+    End Do
 
     ! compute rhs for W
     Call compute_rhs_w(Uo,Vo,Wo,rhs_wo)
 
     ! Advance W interior points
-    !$acc kernels default(present)
-    W(2:nxg-1,2:nyg-1,2:nz-1) = Wo(2:nxg-1,2:nyg-1,2:nz-1) + dt*rhs_wo
-    !$acc end kernels
+    !$acc parallel loop collapse(3) default(present)
+    Do k=2,nz-1
+       Do j=2,nyg-1
+          Do i=2,nxg-1
+       W(i,j,k) = Wo(i,j,k) + dt*rhs_wo(i,j,k)
+              End Do
+       End Do
+    End Do
 
     ! Advance time
     t = t + dt
@@ -184,11 +199,30 @@ Contains
     !$acc wait
     Call system_clock(c2)
 
-    !$acc kernels default(present)
-    U(2:nx-1,2:nyg-1,2:nzg-1) = Uo(2:nx-1,2:nyg-1,2:nzg-1) + dt*rk2_coef(1,1)*Fu1
-    V(2:nxg-1,2:ny-1,2:nzg-1) = Vo(2:nxg-1,2:ny-1,2:nzg-1) + dt*rk2_coef(1,1)*Fv1
-    W(2:nxg-1,2:nyg-1,2:nz-1) = Wo(2:nxg-1,2:nyg-1,2:nz-1) + dt*rk2_coef(1,1)*Fw1
-    !$acc end kernels
+    !$acc parallel loop collapse(3) default(present)
+    Do k=2,nzg-1
+       Do j=2,nyg-1
+          Do i=2,nx-1
+       U(i,j,k) = Uo(i,j,k) + dt*rk2_coef(1,1)*Fu1(i,j,k)
+              End Do
+       End Do
+    End Do
+    !$acc parallel loop collapse(3) default(present)
+    Do k=2,nzg-1
+       Do j=2,ny-1
+          Do i=2,nxg-1
+       V(i,j,k) = Vo(i,j,k) + dt*rk2_coef(1,1)*Fv1(i,j,k)
+              End Do
+       End Do
+    End Do
+    !$acc parallel loop collapse(3) default(present)
+    Do k=2,nz-1
+       Do j=2,nyg-1
+          Do i=2,nxg-1
+       W(i,j,k) = Wo(i,j,k) + dt*rk2_coef(1,1)*Fw1(i,j,k)
+              End Do
+       End Do
+    End Do
     t = to + rk2_t(rk_step)*dt
     !$acc wait
     Call system_clock(c3)
@@ -216,11 +250,30 @@ Contains
     Call compute_rhs_v(U,V,W,Fv2)
     Call compute_rhs_w(U,V,W,Fw2)
 
-    !$acc kernels default(present)
-    U(2:nx-1,2:nyg-1,2:nzg-1) = Uo(2:nx-1,2:nyg-1,2:nzg-1) + dt*( rk2_coef(2,1)*Fu1 + rk2_coef(2,2)*Fu2 )
-    V(2:nxg-1,2:ny-1,2:nzg-1) = Vo(2:nxg-1,2:ny-1,2:nzg-1) + dt*( rk2_coef(2,1)*Fv1 + rk2_coef(2,2)*Fv2 )
-    W(2:nxg-1,2:nyg-1,2:nz-1) = Wo(2:nxg-1,2:nyg-1,2:nz-1) + dt*( rk2_coef(2,1)*Fw1 + rk2_coef(2,2)*Fw2 )
-    !$acc end kernels
+    !$acc parallel loop collapse(3) default(present)
+    Do k=2,nzg-1
+       Do j=2,nyg-1
+          Do i=2,nx-1
+       U(i,j,k) = Uo(i,j,k) + dt*( rk2_coef(2,1)*Fu1(i,j,k) + rk2_coef(2,2)*Fu2(i,j,k) )
+              End Do
+       End Do
+    End Do
+    !$acc parallel loop collapse(3) default(present)
+    Do k=2,nzg-1
+       Do j=2,ny-1
+          Do i=2,nxg-1
+       V(i,j,k) = Vo(i,j,k) + dt*( rk2_coef(2,1)*Fv1(i,j,k) + rk2_coef(2,2)*Fv2(i,j,k) )
+              End Do
+       End Do
+    End Do
+    !$acc parallel loop collapse(3) default(present)
+    Do k=2,nz-1
+       Do j=2,nyg-1
+          Do i=2,nxg-1
+       W(i,j,k) = Wo(i,j,k) + dt*( rk2_coef(2,1)*Fw1(i,j,k) + rk2_coef(2,2)*Fw2(i,j,k) )
+              End Do
+       End Do
+    End Do
     t = to + rk2_t(rk_step)*dt
 
     Call apply_boundary_conditions_gpu
@@ -295,11 +348,30 @@ Contains
     Call compute_rhs_v(U,V,W,Fv1)
     Call compute_rhs_w(U,V,W,Fw1)
 
-    !$acc kernels default(present)
-    U(2:nx-1,2:nyg-1,2:nzg-1) = Uo(2:nx-1,2:nyg-1,2:nzg-1) + dt*rk_coef(1,1)*Fu1
-    V(2:nxg-1,2:ny-1,2:nzg-1) = Vo(2:nxg-1,2:ny-1,2:nzg-1) + dt*rk_coef(1,1)*Fv1
-    W(2:nxg-1,2:nyg-1,2:nz-1) = Wo(2:nxg-1,2:nyg-1,2:nz-1) + dt*rk_coef(1,1)*Fw1
-    !$acc end kernels
+    !$acc parallel loop collapse(3) default(present)
+    Do k=2,nzg-1
+       Do j=2,nyg-1
+          Do i=2,nx-1
+       U(i,j,k) = Uo(i,j,k) + dt*rk_coef(1,1)*Fu1(i,j,k)
+              End Do
+       End Do
+    End Do
+    !$acc parallel loop collapse(3) default(present)
+    Do k=2,nzg-1
+       Do j=2,ny-1
+          Do i=2,nxg-1
+       V(i,j,k) = Vo(i,j,k) + dt*rk_coef(1,1)*Fv1(i,j,k)
+              End Do
+       End Do
+    End Do
+    !$acc parallel loop collapse(3) default(present)
+    Do k=2,nz-1
+       Do j=2,nyg-1
+          Do i=2,nxg-1
+       W(i,j,k) = Wo(i,j,k) + dt*rk_coef(1,1)*Fw1(i,j,k)
+              End Do
+       End Do
+    End Do
     t = to + rk_t(rk_step)*dt
 
     Call apply_boundary_conditions_gpu
@@ -318,11 +390,30 @@ Contains
     Call compute_rhs_v(U,V,W,Fv2)
     Call compute_rhs_w(U,V,W,Fw2)
 
-    !$acc kernels default(present)
-    U(2:nx-1,2:nyg-1,2:nzg-1) = Uo(2:nx-1,2:nyg-1,2:nzg-1) + dt*( rk_coef(2,1)*Fu1 + rk_coef(2,2)*Fu2 )
-    V(2:nxg-1,2:ny-1,2:nzg-1) = Vo(2:nxg-1,2:ny-1,2:nzg-1) + dt*( rk_coef(2,1)*Fv1 + rk_coef(2,2)*Fv2 )
-    W(2:nxg-1,2:nyg-1,2:nz-1) = Wo(2:nxg-1,2:nyg-1,2:nz-1) + dt*( rk_coef(2,1)*Fw1 + rk_coef(2,2)*Fw2 )
-    !$acc end kernels
+    !$acc parallel loop collapse(3) default(present)
+    Do k=2,nzg-1
+       Do j=2,nyg-1
+          Do i=2,nx-1
+       U(i,j,k) = Uo(i,j,k) + dt*( rk_coef(2,1)*Fu1(i,j,k) + rk_coef(2,2)*Fu2(i,j,k) )
+              End Do
+       End Do
+    End Do
+    !$acc parallel loop collapse(3) default(present)
+    Do k=2,nzg-1
+       Do j=2,ny-1
+          Do i=2,nxg-1
+       V(i,j,k) = Vo(i,j,k) + dt*( rk_coef(2,1)*Fv1(i,j,k) + rk_coef(2,2)*Fv2(i,j,k) )
+              End Do
+       End Do
+    End Do
+    !$acc parallel loop collapse(3) default(present)
+    Do k=2,nz-1
+       Do j=2,nyg-1
+          Do i=2,nxg-1
+       W(i,j,k) = Wo(i,j,k) + dt*( rk_coef(2,1)*Fw1(i,j,k) + rk_coef(2,2)*Fw2(i,j,k) )
+              End Do
+       End Do
+    End Do
     t = to + rk_t(rk_step)*dt
 
     Call apply_boundary_conditions_gpu
@@ -341,14 +432,30 @@ Contains
     Call compute_rhs_v(U,V,W,Fv3)
     Call compute_rhs_w(U,V,W,Fw3)
 
-    !$acc kernels default(present)
-    U(2:nx-1,2:nyg-1,2:nzg-1) = Uo(2:nx-1,2:nyg-1,2:nzg-1) + &
-         dt*( rk_coef(3,1)*Fu1 + rk_coef(3,2)*Fu2 + rk_coef(3,3)*Fu3 )
-    V(2:nxg-1,2:ny-1,2:nzg-1) = Vo(2:nxg-1,2:ny-1,2:nzg-1) + &
-         dt*( rk_coef(3,1)*Fv1 + rk_coef(3,2)*Fv2 + rk_coef(3,3)*Fv3 )
-    W(2:nxg-1,2:nyg-1,2:nz-1) = Wo(2:nxg-1,2:nyg-1,2:nz-1) + &
-         dt*( rk_coef(3,1)*Fw1 + rk_coef(3,2)*Fw2 + rk_coef(3,3)*Fw3 )
-    !$acc end kernels
+    !$acc parallel loop collapse(3) default(present)
+    Do k=2,nzg-1
+       Do j=2,nyg-1
+          Do i=2,nx-1
+       U(i,j,k) = Uo(i,j,k) + dt*( rk_coef(3,1)*Fu1(i,j,k) + rk_coef(3,2)*Fu2(i,j,k) + rk_coef(3,3)*Fu3(i,j,k) )
+              End Do
+       End Do
+    End Do
+    !$acc parallel loop collapse(3) default(present)
+    Do k=2,nzg-1
+       Do j=2,ny-1
+          Do i=2,nxg-1
+       V(i,j,k) = Vo(i,j,k) + dt*( rk_coef(3,1)*Fv1(i,j,k) + rk_coef(3,2)*Fv2(i,j,k) + rk_coef(3,3)*Fv3(i,j,k) )
+              End Do
+       End Do
+    End Do
+    !$acc parallel loop collapse(3) default(present)
+    Do k=2,nz-1
+       Do j=2,nyg-1
+          Do i=2,nxg-1
+       W(i,j,k) = Wo(i,j,k) + dt*( rk_coef(3,1)*Fw1(i,j,k) + rk_coef(3,2)*Fw2(i,j,k) + rk_coef(3,3)*Fw3(i,j,k) )
+              End Do
+       End Do
+    End Do
     t = to + rk_t(rk_step)*dt
 
     Call apply_boundary_conditions_gpu
@@ -363,7 +470,7 @@ Contains
   Subroutine test_projection
 
     Real   (Int64) :: max_divergence
-    Integer(Int32) :: i,j
+    Integer(Int32) :: i,j,k
 
     If (myid==0) Write(*,*) '----------------projection test-----------------'
 
@@ -380,9 +487,14 @@ Contains
           V(i,j,:) = i*j+j+i
        end Do
     end Do
-    !$acc kernels default(present)
-    W = 0d0
-    !$acc end kernels
+    !$acc parallel loop collapse(3) default(present)
+    Do k=1,nz
+       Do j=1,nyg
+          Do i=1,nxg
+       W(i,j,k) = 0d0
+              End Do
+       End Do
+    End Do
 
     ! mass correction
     !$acc update self(U,V,W)
