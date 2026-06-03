@@ -7,8 +7,8 @@ equation is solved via cosine transform in x (Neumann BC), Fourier
 transform in z (periodic), and tridiagonal Thomas solve in y — all on
 the GPU using cuFFT and OpenACC.
 
-Originally written by Adrian Lozano-Duran (CPU/MPI version).
-GPU port by Alvaro Martinez Sanchez.
+Written by Adrian Lozano-Duran (CPU/MPI version) and Alvaro Martinez
+Sanchez (GPU port).
 
 ## Performance
 
@@ -21,34 +21,6 @@ GPU port by Alvaro Martinez Sanchez.
 | Speedup vs 1 CPU core | 212x |
 | Test grid | 814 x 125 x 66 (6.7M cells) |
 | GPU | A100 80 GB SXM |
-
-### Optimization history
-
-| Optimization | ns/cell/step | vs 16 CPU |
-|---|---|---|
-| Baseline (`!$acc kernels` on array copies) | 125.7 | 0.4x |
-| `parallel loop collapse(3)` for array copies | 17.5 | 2.7x |
-| Batched 2D cuFFT (`cufftPlanMany`) | 13.2 | 3.6x |
-| Precomputed Thomas LU factorization | 7.85 | 6.0x |
-| Fused RHS (merge multiply into derivative loops) | 7.01 | 6.7x |
-| Inline all interpolations into convective kernels | 5.80 | 8.1x |
-| DNS viscous shortcut (inline nu*Laplacian for LES=0) | 5.42 | 8.7x |
-| Transpose Thomas for coalesced memory access | 3.54 | 13.2x |
-
-### Current bottleneck breakdown (per RK2 substep = 11.6 ms)
-
-| Component | Time (ms) | % |
-|---|---|---|
-| **Projection total** | **8.8** | **76%** |
-| — cuFFT (batched 2D, fwd+inv) | 5.1 | 44% |
-| — Thomas tridiagonal solve | 0.53 | 5% |
-| — Pack/extract cosine extension | 2.2 | 19% |
-| — Divergence + project velocity + BC | ~1.0 | 9% |
-| RHS (convective + viscous, all 3 components) | 1.7 | 15% |
-| Copy Uo=U, advance, BC, other | 1.1 | 9% |
-
-The main bottleneck is the 4x zero-padded cosine extension for the
-pressure FFT — 75% of the data processed by cuFFT is zeros.
 
 ## Prerequisites
 
@@ -184,18 +156,6 @@ See `input_parameters.turbb` for a documented template. Key parameters:
 | `Newton_solver.f90` | Newton solver (for wall models) |
 | `finalization.f90` | Cleanup |
 | `mpi.f90` | MPI initialization |
-
-## Known limitations and future work
-
-The cuFFT pressure solve (44% of runtime) is limited by the 4x
-zero-padded cosine extension. Possible improvements:
-
-- **Custom CUDA cosine kernel**: Process only N real values instead of
-  4N complex values (estimated 5-8x FFT speedup)
-- **Mixed precision**: FP32 for the pressure solve (2x data reduction)
-- **Stream overlap**: Pipeline cuFFT with Thomas solve across y-planes
-- **Grid restructuring**: Cell-centered pressure for standard DCT-I
-  (2x extension instead of 4x)
 
 ## License
 
