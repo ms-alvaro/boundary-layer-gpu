@@ -68,6 +68,7 @@ Program boundary_layer_FD
   !$acc      create(rhs_uo,rhs_vo,rhs_wo,rhs_p) &
   !$acc      copy(nu_t,avg_nu_t) &
   !$acc      create(Fu1,Fu2,Fv1,Fv2,Fw1,Fw2) &
+  !$acc      create(Fu3,Fv3,Fw3) &
   !$acc      copy(alpha_x,alpha_y,alpha_z) &
   !$acc      copy(alpha_xo,alpha_yo,alpha_zo) &
   !$acc      copy(V_bottom) &

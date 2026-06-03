@@ -1,2 +1,33 @@
+# Build artifacts
 build/
 prebuild/
+*.o
+*.mod
+
+# Binaries
+boundary_layer_*
+debug
+
+# Simulation output (large binary files)
+*/data/
+*.restart
+
+# Logs
+*.log
+nohup.out
+
+# Profiling
+*.nsys-rep
+*.sqlite
+*.qdrep
+*.ncu-rep
+
+# Editor/OS temporaries
+*~
+*.swp
+*.swo
+.DS_Store
+
+# Python
+__pycache__/
+*.pyc
