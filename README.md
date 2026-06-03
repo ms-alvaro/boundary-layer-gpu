@@ -1,4 +1,4 @@
-# Boundary Layer DNS — GPU (OpenACC + cuFFT)
+# Boundary layer GPU solver
 
 Incompressible boundary layer DNS solver accelerated with NVIDIA GPUs.
 2nd-order finite differences on a staggered mesh, explicit RK2/RK3 time
@@ -12,14 +12,14 @@ Sanchez (GPU port).
 
 ## Performance
 
-**13.2x faster than 16 CPU cores** on a single NVIDIA A100.
+**22x faster than 16 CPU cores** on a single NVIDIA A100.
 
 | Metric | Value |
 |---|---|
-| Time per cell per step | 3.54 ns |
-| Speedup vs 16 CPU cores | 13.2x |
-| Speedup vs 1 CPU core | 212x |
-| Test grid | 814 x 125 x 66 (6.7M cells) |
+| Time per cell per step | 2.09 ns |
+| Speedup vs 16 CPU cores | 22x |
+| Speedup vs 1 CPU core | 359x |
+| Test grid | 814 x 257 x 193 (40.4M cells) |
 | GPU | A100 80 GB SXM |
 
 ## Prerequisites
