@@ -136,7 +136,9 @@ Module global
   ! GPU workspace for FFT modes (standard 1-based bounds, avoids nvfortran bug)
   Complex(C_DOUBLE_COMPLEX), Allocatable, Dimension(:,:,:) :: rhs_hat_gpu
 
-  ! Precomputed Thomas factorization: DL_fact(nm,mx+1,mz+1), D_pivot(nm,mx+1,mz+1), DU_fact(nm)
+  ! Precomputed Thomas factorization — transposed for coalesced GPU access
+  ! thomas_dl_fact(mx+1, mz+1, nm), thomas_d_pivot(mx+1, mz+1, nm)
+  ! Threads at (i,k) read thomas_*_fact(i,k,jj) — contiguous in i
   Complex(C_DOUBLE_COMPLEX), Allocatable, Dimension(:,:,:) :: thomas_dl_fact, thomas_d_pivot
   Complex(C_DOUBLE_COMPLEX), Allocatable, Dimension(:)     :: thomas_du
 
