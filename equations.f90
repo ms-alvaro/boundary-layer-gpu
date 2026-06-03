@@ -37,55 +37,31 @@ Contains
 
     !-------------compute convective terms----------------!
 
-    ! 1)---------compute -du^2/dx--------------
-
-    ! interpolate u in x (faces to centers)
-    Call interpolate_x(U_,term_1,in1)
-
-    ! -du^2/dx (squaring fused into derivative)
-    !$acc parallel loop collapse(3) default(present)
+    ! All convective terms for u, fully inlined (no intermediate arrays)
+    ! 1) -du^2/dx: interp_x(U,centers) then d/dx
+    !    u_c(i) = 0.5*(U(i)+U(i+1)), du^2/dx = (u_c(i)^2 - u_c(i-1)^2)/dx
+    ! 2) -duv/dy: interp_y(U,faces)*interp_x(V,faces) then d/dy
+    !    u_f(j) = w0*U(j)+w1*U(j+1), v_f(i) = 0.5*(V(i)+V(i+1))
+    ! 3) -duw/dz: interp_z(U,faces)*interp_x(W,faces) then d/dz
+    !    u_f(k) = 0.5*(U(k)+U(k+1)), w_f(i) = 0.5*(W(i)+W(i+1))
+    !$acc parallel loop collapse(3) default(present) &
+    !$acc private(dx_1)
     Do k=2,nzg-1
        Do j=2,nyg-1
           Do i=2,nx-1
-             rhs_u(i,j,k) = -(term_1(i,j,k)**2-term_1(i-1,j,k)**2)/( xg(i+1) - xg(i) )
-          End Do
-       End Do
-    End Do
-
-    ! 2)-----------compute -duv/dy--------------
-
-    ! interpolate u in y (centers to faces)
-    Call interpolate_y(U_,term_1,in2)
-
-    ! interpolate v in x (centers to faces)
-    Call interpolate_x(V_,term_2,in2)
-
-    ! -duv/dy (multiply fused into derivative, accumulate into rhs_u)
-    !$acc parallel loop collapse(3) default(present)
-    Do k=2,nzg-1
-       Do j=2,nyg-1
-          Do i=2,nx-1
+             ! 1) -du^2/dx (interp_x faces->centers = simple average)
+             rhs_u(i,j,k) = -( (0.5d0*(U_(i,j,k)+U_(i+1,j,k)))**2 &
+                              - (0.5d0*(U_(i-1,j,k)+U_(i,j,k)))**2 ) / (xg(i+1)-xg(i))
+             ! 2) -duv/dy (interp_y centers->faces = weighted, interp_x centers->faces)
              rhs_u(i,j,k) = rhs_u(i,j,k) &
-                - ( term_1(i,j,k)*term_2(i,j,k) - term_1(i,j-1,k)*term_2(i,j-1,k) )/( y(j) - y(j-1) )
-          End Do
-       End Do
-    End Do
-
-    ! 3)--------------compute -duw/dz--------------
-
-    ! interpolate u in z (centers to faces)
-    Call interpolate_z(U_,term_1,in2)
-
-    ! interpolate w in x (centers to faces)
-    Call interpolate_x(W_,term_2,in2)
-
-    ! -duw/dz (multiply fused, accumulate into rhs_u)
-    !$acc parallel loop collapse(3) default(present)
-    Do k=2,nzg-1
-       Do j=2,nyg-1
-          Do i=2,nx-1
+                - ( (weight_y_0(j)*U_(i,j,k)+weight_y_1(j)*U_(i,j+1,k)) &
+                    * 0.5d0*(V_(i,j,k)+V_(i+1,j,k)) &
+                  - (weight_y_0(j-1)*U_(i,j-1,k)+weight_y_1(j-1)*U_(i,j,k)) &
+                    * 0.5d0*(V_(i,j-1,k)+V_(i+1,j-1,k)) ) / (y(j)-y(j-1))
+             ! 3) -duw/dz (interp_z centers->faces = simple avg, interp_x centers->faces)
              rhs_u(i,j,k) = rhs_u(i,j,k) &
-                - ( term_1(i,j,k)*term_2(i,j,k) - term_1(i,j,k-1)*term_2(i,j,k-1) )/( z(k) - z(k-1) )
+                - ( 0.5d0*(U_(i,j,k)+U_(i,j,k+1)) * 0.5d0*(W_(i,j,k)+W_(i+1,j,k)) &
+                  - 0.5d0*(U_(i,j,k-1)+U_(i,j,k)) * 0.5d0*(W_(i,j,k-1)+W_(i+1,j,k-1)) ) / (z(k)-z(k-1))
           End Do
        End Do
     End Do
@@ -190,55 +166,29 @@ Contains
 
     !-------------compute convective terms----------------!
 
-    ! 1)---------compute -dv^2/dy--------------
-
-    ! interpolate v in y (faces to centers)
-    Call interpolate_y(V_,term_1,in1)
-
-    ! -dv^2/dy (squaring fused into derivative)
+    ! All convective terms for v, fully inlined
+    ! 1) -dv^2/dy: interp_y(V,centers=0.5avg) then d/dy
+    ! 2) -duv/dx: interp_y(U,faces=weighted)*interp_x(V,faces=0.5avg) then d/dx
+    ! 3) -dvw/dz: interp_z(V,faces=0.5avg)*interp_y(W,faces=weighted) then d/dz
     !$acc parallel loop collapse(3) default(present)
     Do k=2,nzg-1
        Do j=2,ny-1
           Do i=2,nxg-1
-             rhs_v(i,j,k) = -(term_1(i,j,k)**2-term_1(i,j-1,k)**2)/( yg(j+1) - yg(j) )
-          End Do
-       End Do
-    End Do
-
-    ! 2)-----------compute -duv/dx--------------
-
-    ! interpolate u in y (centers to faces)
-    Call interpolate_y(U_,term_1,in2)
-
-    ! interpolate v in x (centers to faces)
-    Call interpolate_x(V_,term_2,in2)
-
-    ! -duv/dx (multiply fused, accumulate into rhs_v)
-    !$acc parallel loop collapse(3) default(present)
-    Do k=2,nzg-1
-       Do j=2,ny-1
-          Do i=2,nxg-1
+             ! 1) -dv^2/dy (interp_y faces->centers = 0.5 average)
+             rhs_v(i,j,k) = -( (0.5d0*(V_(i,j,k)+V_(i,j+1,k)))**2 &
+                              - (0.5d0*(V_(i,j-1,k)+V_(i,j,k)))**2 ) / (yg(j+1)-yg(j))
+             ! 2) -duv/dx (interp_y centers->faces=weighted, interp_x centers->faces=0.5avg)
              rhs_v(i,j,k) = rhs_v(i,j,k) &
-                - ( term_1(i,j,k)*term_2(i,j,k) - term_1(i-1,j,k)*term_2(i-1,j,k) )/( x(i) - x(i-1) )
-          End Do
-       End Do
-    End Do
-
-    ! 3)--------------compute -dvw/dz--------------
-
-    ! interpolate v in z (centers to faces)
-    Call interpolate_z(V_,term_1,in2)
-
-    ! interpolate w in y (centers to faces)
-    Call interpolate_y(W_,term_2,in2)
-
-    ! -dvw/dz (multiply fused, accumulate into rhs_v)
-    !$acc parallel loop collapse(3) default(present)
-    Do k=2,nzg-1
-       Do j=2,ny-1
-          Do i=2,nxg-1
+                - ( (weight_y_0(j)*U_(i,j,k)+weight_y_1(j)*U_(i,j+1,k)) &
+                    * 0.5d0*(V_(i,j,k)+V_(i+1,j,k)) &
+                  - (weight_y_0(j)*U_(i-1,j,k)+weight_y_1(j)*U_(i-1,j+1,k)) &
+                    * 0.5d0*(V_(i-1,j,k)+V_(i,j,k)) ) / (x(i)-x(i-1))
+             ! 3) -dvw/dz (interp_z centers->faces=0.5avg, interp_y centers->faces=weighted)
              rhs_v(i,j,k) = rhs_v(i,j,k) &
-                - ( term_1(i,j,k)*term_2(i,j,k) - term_1(i,j,k-1)*term_2(i,j,k-1) )/( z(k) - z(k-1) )
+                - ( 0.5d0*(V_(i,j,k)+V_(i,j,k+1)) &
+                    * (weight_y_0(j)*W_(i,j,k)+weight_y_1(j)*W_(i,j+1,k)) &
+                  - 0.5d0*(V_(i,j,k-1)+V_(i,j,k)) &
+                    * (weight_y_0(j)*W_(i,j,k-1)+weight_y_1(j)*W_(i,j+1,k-1)) ) / (z(k)-z(k-1))
           End Do
        End Do
     End Do
@@ -339,53 +289,27 @@ Contains
 
     ! 1)---------compute -dw^2/dz--------------
 
-    ! interpolate w in z (faces to centers)
-    Call interpolate_z(W_,term_1,in1)
-
-    ! -dw^2/dz (squaring fused into derivative)
+    ! All convective terms for w, fully inlined
+    ! 1) -dw^2/dz: interp_z(W,centers=0.5avg) then d/dz
+    ! 2) -duw/dx: interp_z(U,faces=0.5avg)*interp_x(W,faces=0.5avg) then d/dx
+    ! 3) -dvw/dy: interp_z(V,faces=0.5avg)*interp_y(W,faces=weighted) then d/dy
     !$acc parallel loop collapse(3) default(present)
     Do k=2,nz-1
        Do j=2,nyg-1
           Do i=2,nxg-1
-             rhs_w(i,j,k) = -(term_1(i,j,k)**2-term_1(i,j,k-1)**2)/( zg(k+1) - zg(k) )
-          End Do
-       End Do
-    End Do
-
-    ! 2)-----------compute -duw/dx--------------
-
-    ! interpolate u in z (centers to faces)
-    Call interpolate_z(U_,term_1,in2)
-
-    ! interpolate w in x (centers to faces)
-    Call interpolate_x(W_,term_2,in2)
-
-    ! -duw/dx (multiply fused, accumulate into rhs_w)
-    !$acc parallel loop collapse(3) default(present)
-    Do k=2,nz-1
-       Do j=2,nyg-1
-          Do i=2,nxg-1
+             ! 1) -dw^2/dz (interp_z faces->centers = 0.5 average)
+             rhs_w(i,j,k) = -( (0.5d0*(W_(i,j,k)+W_(i,j,k+1)))**2 &
+                              - (0.5d0*(W_(i,j,k-1)+W_(i,j,k)))**2 ) / (zg(k+1)-zg(k))
+             ! 2) -duw/dx (interp_z centers->faces=0.5avg, interp_x centers->faces=0.5avg)
              rhs_w(i,j,k) = rhs_w(i,j,k) &
-                - ( term_1(i,j,k)*term_2(i,j,k) - term_1(i-1,j,k)*term_2(i-1,j,k) )/( x(i) - x(i-1) )
-          End Do
-       End Do
-    End Do
-
-    ! 3)--------------compute -dvw/dy--------------
-
-    ! interpolate v in z (centers to faces)
-    Call interpolate_z(V_,term_1,in2)
-
-    ! interpolate w in y (centers to faces)
-    Call interpolate_y(W_,term_2,in2)
-
-    ! -dvw/dy (multiply fused, accumulate into rhs_w)
-    !$acc parallel loop collapse(3) default(present)
-    Do k=2,nz-1
-       Do j=2,nyg-1
-          Do i=2,nxg-1
+                - ( 0.5d0*(U_(i,j,k)+U_(i,j,k+1)) * 0.5d0*(W_(i,j,k)+W_(i+1,j,k)) &
+                  - 0.5d0*(U_(i-1,j,k)+U_(i-1,j,k+1)) * 0.5d0*(W_(i-1,j,k)+W_(i,j,k)) ) / (x(i)-x(i-1))
+             ! 3) -dvw/dy (interp_z centers->faces=0.5avg, interp_y centers->faces=weighted)
              rhs_w(i,j,k) = rhs_w(i,j,k) &
-                - ( term_1(i,j,k)*term_2(i,j,k) - term_1(i,j-1,k)*term_2(i,j-1,k) )/( y(j) - y(j-1) )
+                - ( 0.5d0*(V_(i,j,k)+V_(i,j,k+1)) &
+                    * (weight_y_0(j)*W_(i,j,k)+weight_y_1(j)*W_(i,j+1,k)) &
+                  - 0.5d0*(V_(i,j-1,k)+V_(i,j-1,k+1)) &
+                    * (weight_y_0(j-1)*W_(i,j-1,k)+weight_y_1(j-1)*W_(i,j,k)) ) / (y(j)-y(j-1))
           End Do
        End Do
     End Do
