@@ -309,14 +309,20 @@ Contains
 
     ! Initialize cuFFT plans for single-rank GPU solver
     If ( nprocs == 1 ) Then
-       ! Batched cuFFT: all nyg-2 interior y-planes at once
-       Call cufft_init_plans(Int(nzp_global), Int(nxpe_global), Int(nyg-2))
-       Allocate( plane_gpu(nxpe, nzp, nyg-2) )
+       ! Half-size DCT: forward 2D(2*nxp×nzp), inverse split z+x
+       Call cufft_init_plans(Int(nxp), Int(nzp_global), Int(nyg-2))
+       Allocate( plane_gpu(2*nxp, nzp, nyg-2) )
        Allocate( rhs_hat_gpu(mx+1, nyg-2, mz+1) )
-       If (myid==0) Write(*,*) 'cuFFT batched plans created:', nyg-2, 'y-planes'
+       ! DCT-II twiddle factors
+       Allocate( dct_twiddle(0:mx) )
+       Do i = 0, Int(mx)
+          dct_twiddle(i) = cdexp(dcmplx(0d0, -pi*Real(i,8)/(2d0*Real(nxp,8))))
+       End Do
+       If (myid==0) Write(*,*) 'cuFFT half-size DCT:', 2*Int(nxp), 'x', Int(nzp), ',', Int(nyg-2), 'batches'
     Else
-       Allocate( plane_gpu(1, 1, 1) )  ! dummy
-       Allocate( rhs_hat_gpu(1, 1, 1) )  ! dummy
+       Allocate( plane_gpu(1, 1, 1) )
+       Allocate( rhs_hat_gpu(1, 1, 1) )
+       Allocate( dct_twiddle(0:0) )
     End If
 
     ! global Fourier coeficients with modified wave-number for the second derivative

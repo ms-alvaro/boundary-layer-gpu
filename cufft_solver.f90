@@ -1,7 +1,7 @@
 !------------------------------------------------!
-!  Module for cuFFT-based 2D transforms          !
-!  Replaces FFTW-MPI for single-rank runs        !
-!  Batched: all y-planes in one call             !
+!  Module for cuFFT-based transforms              !
+!  Forward: 2D batched (2*nxp × nzp)             !
+!  Inverse: split z-IFFT + x-IFFT                !
 !------------------------------------------------!
 Module cufft_solver
 
@@ -11,68 +11,62 @@ Module cufft_solver
 
   Implicit None
 
-  ! Single cuFFT plan (used for both forward and inverse)
-  Integer :: cufft_plan = 0
-
-  ! Number of batches (= nyg-2 interior y-planes)
-  Integer :: cufft_nbatch = 0
-
-  ! Flag: use cuFFT (true when nprocs==1)
+  Integer :: cufft_plan_2d = 0   ! 2D C2C for forward (2*nxp × nzp × nm batches)
+  Integer :: cufft_plan_zi = 0   ! 1D C2C for inverse z (on rhs_hat_gpu)
+  Integer :: cufft_plan_xi = 0   ! 1D C2C for inverse x (on plane_gpu)
   Logical :: use_cufft = .False.
 
   Private
-  Public :: use_cufft, cufft_plan, cufft_nbatch
+  Public :: use_cufft, cufft_plan_2d, cufft_plan_zi, cufft_plan_xi
   Public :: cufft_init_plans, cufft_destroy_plans
   Public :: cufftExecZ2Z, CUFFT_FORWARD, CUFFT_INVERSE, CUFFT_SUCCESS
 
 Contains
 
-  !--------------------------------------------!
-  !  Initialize cuFFT batched Z2Z plan         !
-  !  plane_gpu(nx_dim, nz_dim, nbatch)         !
-  !--------------------------------------------!
-  Subroutine cufft_init_plans(nz_dim, nx_dim, nbatch)
+  Subroutine cufft_init_plans(nxp_in, nzp_in, nm_in)
+    Integer, Intent(In) :: nxp_in, nzp_in, nm_in
+    Integer :: istat, n2(2), ne(2), n1(1), ne1(1)
+    Integer :: nx2
 
-    Integer, Intent(In) :: nz_dim, nx_dim, nbatch
-    Integer :: istat
-    Integer :: rank_fft, n_arr(2), inembed(2), onembed(2)
-    Integer :: istride, idist, ostride, odist
+    nx2 = 2 * nxp_in
 
-    cufft_nbatch = nbatch
-    rank_fft = 2
-
-    ! cuFFT uses C-order: n_arr(1)=slow dim, n_arr(2)=fast dim
-    ! Fortran column-major plane_gpu(nx_dim, nz_dim, nbatch):
-    !   element (i,k,b) at offset (i-1) + (k-1)*nx_dim + (b-1)*nx_dim*nz_dim
-    n_arr(1) = nz_dim
-    n_arr(2) = nx_dim
-
-    istride = 1
-    idist   = nx_dim * nz_dim
-    inembed(1) = nz_dim
-    inembed(2) = nx_dim
-
-    ostride = istride
-    odist   = idist
-    onembed = inembed
-
-    istat = cufftPlanMany(cufft_plan, rank_fft, n_arr, &
-         inembed, istride, idist, onembed, ostride, odist, &
-         CUFFT_Z2Z, nbatch)
+    ! Plan 1: 2D C2C forward — plane_gpu(2*nxp, nzp, nm)
+    n2(1) = nzp_in;  n2(2) = nx2
+    ne(1) = nzp_in;  ne(2) = nx2
+    istat = cufftPlanMany(cufft_plan_2d, 2, n2, &
+         ne, 1, nx2*nzp_in, ne, 1, nx2*nzp_in, CUFFT_Z2Z, nm_in)
     If (istat /= CUFFT_SUCCESS) Then
-       Write(*,*) 'Error: cufftPlanMany failed, status=', istat
-       Write(*,*) '  nz=', nz_dim, ' nx=', nx_dim, ' batch=', nbatch
-       Stop
+       Write(*,*) 'cufftPlanMany 2D failed:', istat; Stop
+    End If
+
+    ! Plan 2: 1D C2C inverse z — rhs_hat_gpu(nxp, nm, nzp)
+    ! stride = nxp*nm (between consecutive z-values)
+    ! dist = 1, batch = nxp*nm
+    n1(1) = nzp_in; ne1(1) = nzp_in
+    istat = cufftPlanMany(cufft_plan_zi, 1, n1, &
+         ne1, nxp_in*nm_in, 1, ne1, nxp_in*nm_in, 1, CUFFT_Z2Z, nxp_in*nm_in)
+    If (istat /= CUFFT_SUCCESS) Then
+       Write(*,*) 'cufftPlanMany zi failed:', istat; Stop
+    End If
+
+    ! Plan 3: 1D C2C inverse x — plane_gpu(2*nxp, nzp, nm)
+    ! stride = 1, dist = 2*nxp, batch = nzp*nm
+    n1(1) = nx2; ne1(1) = nx2
+    istat = cufftPlanMany(cufft_plan_xi, 1, n1, &
+         ne1, 1, nx2, ne1, 1, nx2, CUFFT_Z2Z, nzp_in*nm_in)
+    If (istat /= CUFFT_SUCCESS) Then
+       Write(*,*) 'cufftPlanMany xi failed:', istat; Stop
     End If
 
     use_cufft = .True.
-
   End Subroutine cufft_init_plans
 
   Subroutine cufft_destroy_plans
     Integer :: istat
     If (use_cufft) Then
-       istat = cufftDestroy(cufft_plan)
+       istat = cufftDestroy(cufft_plan_2d)
+       istat = cufftDestroy(cufft_plan_zi)
+       istat = cufftDestroy(cufft_plan_xi)
        use_cufft = .False.
     End If
   End Subroutine cufft_destroy_plans
