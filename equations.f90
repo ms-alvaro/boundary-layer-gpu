@@ -8,7 +8,7 @@ Module equations
   Use global,          Only : x, xm, xg, y, ym, yg, z, zm, zg, term_1, &
                               term_2, term, nx, nxg, ny, nyg, nz, nzg, &
                               nu, dPdx, dPdz, yg_m, nu_t, in1, in2,    &
-                              weight_y_0, weight_y_1, Omega_z
+                              weight_y_0, weight_y_1, Omega_z, LES_model
   Use interpolation
 
   ! prevent implicit typing
@@ -66,61 +66,71 @@ Contains
        End Do
     End Do
 
-    !--------------compute viscous terms------------!
+    !--------------compute viscous terms (fused into convective kernel for DNS)-----!
 
-    ! 4)--------compute div( nu grad(u) )------------
-
-    ! first derivation in y: du/dy goes to yg_m(1:ny)
-    !$acc parallel loop collapse(2) default(present)
-    Do i = 1, nx
+    If ( LES_model == 0 ) Then
+       ! DNS: nu_t = 0, viscous = nu * Laplacian(U) — inline into single kernel
+       ! Rewrite the convective kernel to include viscous + pressure gradient
+       ! Note: we OVERWRITE rhs_u here (convective already computed above)
+       ! Actually we need to ADD viscous to the existing rhs_u from convective
+       !$acc parallel loop collapse(3) default(present) &
+       !$acc private(dx_1,dx_2,dx_3,dy_3,dz_1,dz_2,dz_3)
+       Do k=2,nzg-1
+          Do j=2,nyg-1
+             Do i=2,nx-1
+                dx_1 = x(i) - x(i-1)
+                dx_2 = x(i+1) - x(i)
+                dx_3 = xg(i+1) - xg(i)
+                dy_3 = y(j) - y(j-1)
+                dz_1 = zg(k) - zg(k-1)
+                dz_2 = zg(k+1) - zg(k)
+                dz_3 = z(k) - z(k-1)
+                rhs_u(i,j,k) = rhs_u(i,j,k) + dPdx + nu * ( &
+                   (1d0/dx_2*(U_(i+1,j,k)-U_(i,j,k)) - 1d0/dx_1*(U_(i,j,k)-U_(i-1,j,k)))/dx_3 + &
+                   ((U_(i,j+1,k)-U_(i,j,k))/(yg(j+1)-yg(j)) - (U_(i,j,k)-U_(i,j-1,k))/(yg(j)-yg(j-1)))/dy_3 + &
+                   (1d0/dz_2*(U_(i,j,k+1)-U_(i,j,k)) - 1d0/dz_1*(U_(i,j,k)-U_(i,j,k-1)))/dz_3 )
+             End Do
+          End Do
+       End Do
+    Else
+       ! LES: variable nu_t, need interpolated du/dy
+       !$acc parallel loop collapse(3) default(present)
        Do k = 1, nzg
-          term_1(i,1:nyg-1,k) = ( U_(i,2:nyg,k) - U_(i,1:nyg-1,k) )/( yg(2:nyg) - yg(1:nyg-1) )
+          Do j = 1, nyg-1
+             Do i = 1, nx
+                term_2(i,j,k) = ( U_(i,j+1,k) - U_(i,j,k) )/( yg(j+1) - yg(j) )
+             End Do
+          End Do
        End Do
-    End Do
-    ! interpolate du/dy from yg_m(1:ny) to faces y(1:ny)
-    !Call interpolate_y_2nd( yg_m, term_1, y, term_2 )
-    !$acc kernels default(present)
-    term_2 = term_1 ! -> uncomment for no interpolation
-    !$acc end kernels
 
-    !$acc parallel loop collapse(3) default(present) &
-    !$acc private(dx_1,dx_2,dx_3,dy_3,dz_1,dz_2,dz_3,nu_x1,nu_x2,nu_y1,nu_y2,nu_z1,nu_z2)
-    Do k=2,nzg-1
-       Do j=2,nyg-1
-          Do i=2,nx-1
-
-             ! grid spacings
-             dz_1 = zg(  k) - zg(k-1)
-             dz_2 = zg(k+1) - zg(k  )
-             dz_3 = z(k) - z(k-1)
-             dy_3 = y(j) - y(j-1)
-             dx_1 = x(  i) - x(i-1)
-             dx_2 = x(i+1) - x(i  )
-             dx_3 = xg(i+1) - xg(i)
-
-             ! total viscosity at x locations
-             nu_x1  = nu + nu_t(i  ,j,k)
-             nu_x2  = nu + nu_t(i+1,j,k)
-
-             ! total viscosity at y locations
-             nu_y1 = nu + 0.5d0*( weight_y_0(j-1)*nu_t(i,  j-1,k) + weight_y_1(j-1)*nu_t(i,  j  ,k) + &
-                                  weight_y_0(j-1)*nu_t(i+1,j-1,k) + weight_y_1(j-1)*nu_t(i+1,j  ,k) )
-             nu_y2 = nu + 0.5d0*( weight_y_0(j  )*nu_t(i,  j,  k) + weight_y_1(j  )*nu_t(i,  j+1,k) + &
-                                  weight_y_0(j  )*nu_t(i+1,j,  k) + weight_y_1(j  )*nu_t(i+1,j+1,k) )
-
-             ! total viscosity at z locations
-             nu_z1 = nu + 0.25d0*(nu_t(i,j,k)+nu_t(i,j,k-1)+nu_t(i+1,j,k)+nu_t(i+1,j,k-1))
-             nu_z2 = nu + 0.25d0*(nu_t(i,j,k)+nu_t(i,j,k+1)+nu_t(i+1,j,k)+nu_t(i+1,j,k+1))
-
-             ! viscous term (accumulated directly into rhs_u with pressure gradient)
-             rhs_u(i,j,k) = rhs_u(i,j,k) + dPdx + &
-                           1d0/dx_3*(nu_x2*1d0/dx_2*(U_(i+1,j,k)-U_(i,j,k)) - nu_x1*1d0/dx_1*(U_(i,j,k)-U_(i-1,j,k)) ) + &
-                           1d0/dy_3*(nu_y2*term_2(i,j,k)                    - nu_y1*term_2(i,j-1,k) )                  + &
-                           1d0/dz_3*(nu_z2*1d0/dz_2*(U_(i,j,k+1)-U_(i,j,k)) - nu_z1*1d0/dz_1*(U_(i,j,k)-U_(i,j,k-1)) )
-
+       !$acc parallel loop collapse(3) default(present) &
+       !$acc private(dx_1,dx_2,dx_3,dy_3,dz_1,dz_2,dz_3,nu_x1,nu_x2,nu_y1,nu_y2,nu_z1,nu_z2)
+       Do k=2,nzg-1
+          Do j=2,nyg-1
+             Do i=2,nx-1
+                dz_1 = zg(k) - zg(k-1)
+                dz_2 = zg(k+1) - zg(k)
+                dz_3 = z(k) - z(k-1)
+                dy_3 = y(j) - y(j-1)
+                dx_1 = x(i) - x(i-1)
+                dx_2 = x(i+1) - x(i)
+                dx_3 = xg(i+1) - xg(i)
+                nu_x1 = nu + nu_t(i,j,k)
+                nu_x2 = nu + nu_t(i+1,j,k)
+                nu_y1 = nu + 0.5d0*(weight_y_0(j-1)*nu_t(i,j-1,k) + weight_y_1(j-1)*nu_t(i,j,k) + &
+                                     weight_y_0(j-1)*nu_t(i+1,j-1,k) + weight_y_1(j-1)*nu_t(i+1,j,k))
+                nu_y2 = nu + 0.5d0*(weight_y_0(j)*nu_t(i,j,k) + weight_y_1(j)*nu_t(i,j+1,k) + &
+                                     weight_y_0(j)*nu_t(i+1,j,k) + weight_y_1(j)*nu_t(i+1,j+1,k))
+                nu_z1 = nu + 0.25d0*(nu_t(i,j,k)+nu_t(i,j,k-1)+nu_t(i+1,j,k)+nu_t(i+1,j,k-1))
+                nu_z2 = nu + 0.25d0*(nu_t(i,j,k)+nu_t(i,j,k+1)+nu_t(i+1,j,k)+nu_t(i+1,j,k+1))
+                rhs_u(i,j,k) = rhs_u(i,j,k) + dPdx + &
+                   (nu_x2/dx_2*(U_(i+1,j,k)-U_(i,j,k)) - nu_x1/dx_1*(U_(i,j,k)-U_(i-1,j,k)))/dx_3 + &
+                   (nu_y2*term_2(i,j,k) - nu_y1*term_2(i,j-1,k))/dy_3 + &
+                   (nu_z2/dz_2*(U_(i,j,k+1)-U_(i,j,k)) - nu_z1/dz_1*(U_(i,j,k)-U_(i,j,k-1)))/dz_3
+             End Do
+          End Do
        End Do
-    End Do
-    End Do
+    End If
 
     !-------------------Rotating force--------------------!
     If ( Abs(Omega_z)>1d-6 ) Then
@@ -195,32 +205,48 @@ Contains
 
     !--------------compute viscous terms------------!
 
-    ! 4)-----------compute div( nu grad(v) )----------
-
-    ! interpolate eddy viscosity to faces
-
-    ! second order remain, no need to interpolate
-    !$acc parallel loop collapse(3) default(present) &
-    !$acc private(dx_1,dx_2,dx_3,dy_1,dy_2,dy_3,dz_1,dz_2,dz_3,nu_x1,nu_x2,nu_y1,nu_y2,nu_z1,nu_z2)
-    Do k=2,nzg-1
-       Do j=2,ny-1
-          Do i=2,nxg-1
-
-             ! grid spacings
-             dz_1 = zg(  k) - zg(k-1)
-             dz_2 = zg(k+1) - zg(k  )
-             dz_3 = z(k) - z(k-1)
-             dy_1 = y(  j) - y(j-1)
-             dy_2 = y(j+1) - y(j  )
-             dy_3 = yg(j+1) - yg(j)
-             dx_1 = xg(  i) - xg(i-1)
-             dx_2 = xg(i+1) - xg(i  )
-             dx_3 = x(i) - x(i-1)
-
-             ! eddy viscosity at x locations
-             nu_x1 = nu + 0.5d0*( weight_y_0(j)*nu_t(i-1,j,k) + weight_y_1(j)*nu_t(i-1,j+1,k) + &
-                                  weight_y_0(j)*nu_t(i  ,j,k) + weight_y_1(j)*nu_t(i  ,j+1,k) )
-             nu_x2 = nu + 0.5d0*( weight_y_0(j)*nu_t(i,  j,k) + weight_y_1(j)*nu_t(i,  j+1,k) + &
+    If ( LES_model == 0 ) Then
+       ! DNS: nu * Laplacian(V) inlined
+       !$acc parallel loop collapse(3) default(present) &
+       !$acc private(dx_1,dx_2,dx_3,dy_1,dy_2,dy_3,dz_1,dz_2,dz_3)
+       Do k=2,nzg-1
+          Do j=2,ny-1
+             Do i=2,nxg-1
+                dx_1 = xg(i) - xg(i-1)
+                dx_2 = xg(i+1) - xg(i)
+                dx_3 = x(i) - x(i-1)
+                dy_1 = y(j) - y(j-1)
+                dy_2 = y(j+1) - y(j)
+                dy_3 = yg(j+1) - yg(j)
+                dz_1 = zg(k) - zg(k-1)
+                dz_2 = zg(k+1) - zg(k)
+                dz_3 = z(k) - z(k-1)
+                rhs_v(i,j,k) = rhs_v(i,j,k) + nu * ( &
+                   (1d0/dx_2*(V_(i+1,j,k)-V_(i,j,k)) - 1d0/dx_1*(V_(i,j,k)-V_(i-1,j,k)))/dx_3 + &
+                   (1d0/dy_2*(V_(i,j+1,k)-V_(i,j,k)) - 1d0/dy_1*(V_(i,j,k)-V_(i,j-1,k)))/dy_3 + &
+                   (1d0/dz_2*(V_(i,j,k+1)-V_(i,j,k)) - 1d0/dz_1*(V_(i,j,k)-V_(i,j,k-1)))/dz_3 )
+             End Do
+          End Do
+       End Do
+    Else
+       ! LES: variable nu_t
+       !$acc parallel loop collapse(3) default(present) &
+       !$acc private(dx_1,dx_2,dx_3,dy_1,dy_2,dy_3,dz_1,dz_2,dz_3,nu_x1,nu_x2,nu_y1,nu_y2,nu_z1,nu_z2)
+       Do k=2,nzg-1
+          Do j=2,ny-1
+             Do i=2,nxg-1
+                dz_1 = zg(k) - zg(k-1)
+                dz_2 = zg(k+1) - zg(k)
+                dz_3 = z(k) - z(k-1)
+                dy_1 = y(j) - y(j-1)
+                dy_2 = y(j+1) - y(j)
+                dy_3 = yg(j+1) - yg(j)
+                dx_1 = xg(i) - xg(i-1)
+                dx_2 = xg(i+1) - xg(i)
+                dx_3 = x(i) - x(i-1)
+                nu_x1 = nu + 0.5d0*( weight_y_0(j)*nu_t(i-1,j,k) + weight_y_1(j)*nu_t(i-1,j+1,k) + &
+                                     weight_y_0(j)*nu_t(i  ,j,k) + weight_y_1(j)*nu_t(i  ,j+1,k) )
+                nu_x2 = nu + 0.5d0*( weight_y_0(j)*nu_t(i,  j,k) + weight_y_1(j)*nu_t(i,  j+1,k) + &
                                   weight_y_0(j)*nu_t(i+1,j,k) + weight_y_1(j)*nu_t(i+1,j+1,k) )
 
              ! eddy viscosity at the centers
@@ -239,9 +265,10 @@ Contains
                            1d0/dy_3*(nu_y2*1d0/dy_2*(V_(i,j+1,k) - V_(i,j,k)) - nu_y1*1d0/dy_1*(V_(i,j,k)-V_(i,j-1,k)) ) + &
                            1d0/dz_3*(nu_z2*1d0/dz_2*(V_(i,j,k+1) - V_(i,j,k)) - nu_z1*1d0/dz_1*(V_(i,j,k)-V_(i,j,k-1)) )
 
+             End Do
+          End Do
        End Do
-    End Do
-    End Do
+    End If
 
     !-------------------Rotating force--------------------!
     If ( Abs(Omega_z)>1d-6 ) Then
@@ -316,58 +343,66 @@ Contains
 
     !--------------compute viscous terms------------!
 
-    ! 4)----------compute div( nu grad(w) )-----------
-    ! first derivation in y: dw/dy -> term_2 (need to preserve before term_1 is reused)
-    !$acc parallel loop collapse(3) default(present)
-    Do k = 1, nz
-       Do j = 1, nyg-1
-          Do i = 1, nxg
-             term_2(i,j,k) = ( W_(i,j+1,k) - W_(i,j,k) )/( yg(j+1) - yg(j) )
+    If ( LES_model == 0 ) Then
+       ! DNS: nu * Laplacian(W) + dPdz inlined
+       !$acc parallel loop collapse(3) default(present) &
+       !$acc private(dx_1,dx_2,dx_3,dy_3,dz_1,dz_2,dz_3)
+       Do k=2,nz-1
+          Do j=2,nyg-1
+             Do i=2,nxg-1
+                dx_1 = xg(i) - xg(i-1)
+                dx_2 = xg(i+1) - xg(i)
+                dx_3 = x(i) - x(i-1)
+                dy_3 = y(j) - y(j-1)
+                dz_1 = z(k) - z(k-1)
+                dz_2 = z(k+1) - z(k)
+                dz_3 = zg(k+1) - zg(k)
+                rhs_w(i,j,k) = rhs_w(i,j,k) + dPdz + nu * ( &
+                   (1d0/dx_2*(W_(i+1,j,k)-W_(i,j,k)) - 1d0/dx_1*(W_(i,j,k)-W_(i-1,j,k)))/dx_3 + &
+                   ((W_(i,j+1,k)-W_(i,j,k))/(yg(j+1)-yg(j)) - (W_(i,j,k)-W_(i,j-1,k))/(yg(j)-yg(j-1)))/dy_3 + &
+                   (1d0/dz_2*(W_(i,j,k+1)-W_(i,j,k)) - 1d0/dz_1*(W_(i,j,k)-W_(i,j,k-1)))/dz_3 )
+             End Do
           End Do
        End Do
-    End Do
-
-    ! interpolate eddy viscosity to faces
-    Call interpolate_y(nu_t(2:nxg-1,1:nyg,2:nzg-1),term_1(2:nxg-1,1:ny,2:nzg-1),in2)
-
-    !$acc parallel loop collapse(3) default(present) &
-    !$acc private(dx_1,dx_2,dx_3,dy_3,dz_1,dz_2,dz_3,nu_x1,nu_x2,nu_y1,nu_y2,nu_z1,nu_z2)
-    Do k=2,nz-1
-       Do j=2,nyg-1
-          Do i=2,nxg-1
-
-             ! grid spacings
-             dz_1 = z(  k) - z(k-1)
-             dz_2 = z(k+1) - z(k  )
-             dz_3 = zg(k+1) - zg(k)
-             dy_3 = y(j) - y(j-1)
-             dx_1 = xg(  i) - xg(i-1)
-             dx_2 = xg(i+1) - xg(i  )
-             dx_3 = x(i) - x(i-1)
-
-             ! eddy viscosity at x locations
-             nu_x1 = nu + 0.25d0*(nu_t(i,j,k)+nu_t(i,j,k+1)+nu_t(i-1,j,k)+nu_t(i-1,j,k+1))
-             nu_x2 = nu + 0.25d0*(nu_t(i,j,k)+nu_t(i,j,k+1)+nu_t(i+1,j,k)+nu_t(i+1,j,k+1))
-
-             ! eddy viscosity at y locations
-             nu_y1 = nu + 0.5d0*( weight_y_0(j-1)*nu_t(i,j-1,  k) + weight_y_1(j-1)*nu_t(i,j  ,  k) + &
-                                  weight_y_0(j-1)*nu_t(i,j-1,k+1) + weight_y_1(j-1)*nu_t(i,j  ,k+1) )
-             nu_y2 = nu + 0.5d0*( weight_y_0(j  )*nu_t(i,j  ,  k) + weight_y_1(j  )*nu_t(i,j+1,  k) + &
-                                  weight_y_0(j  )*nu_t(i,j  ,k+1) + weight_y_1(j  )*nu_t(i,j+1,k+1) )
-
-             ! eddy viscosity at z locations
-             nu_z1 = nu + nu_t(i,j,k)
-             nu_z2 = nu + nu_t(i,j,k+1)
-
-             ! viscous term (accumulated directly into rhs_w with pressure gradient)
-             rhs_w(i,j,k) = rhs_w(i,j,k) + dPdz + &
-                           1d0/dx_3*(nu_x2*1d0/dx_2*(W_(i+1,j,k) - W_(i,j,k)) - nu_x1*1d0/dx_1*(W_(i,j,k) - W_(i-1,j,k)) ) + &
-                           1d0/dy_3*(nu_y2*term_2(i,j,k)                      - nu_y1*term_2(i,j-1,k) )                    + &
-                           1d0/dz_3*(nu_z2*1d0/dz_2*(W_(i,j,k+1) - W_(i,j,k)) - nu_z1*1d0/dz_1*(W_(i,j,k) - W_(i,j,k-1)) )
-
+    Else
+       ! LES: variable nu_t
+       !$acc parallel loop collapse(3) default(present)
+       Do k = 1, nz
+          Do j = 1, nyg-1
+             Do i = 1, nxg
+                term_2(i,j,k) = ( W_(i,j+1,k) - W_(i,j,k) )/( yg(j+1) - yg(j) )
+             End Do
+          End Do
        End Do
-    End Do
-    End Do
+       Call interpolate_y(nu_t(2:nxg-1,1:nyg,2:nzg-1),term_1(2:nxg-1,1:ny,2:nzg-1),in2)
+       !$acc parallel loop collapse(3) default(present) &
+       !$acc private(dx_1,dx_2,dx_3,dy_3,dz_1,dz_2,dz_3,nu_x1,nu_x2,nu_y1,nu_y2,nu_z1,nu_z2)
+       Do k=2,nz-1
+          Do j=2,nyg-1
+             Do i=2,nxg-1
+                dz_1 = z(k) - z(k-1)
+                dz_2 = z(k+1) - z(k)
+                dz_3 = zg(k+1) - zg(k)
+                dy_3 = y(j) - y(j-1)
+                dx_1 = xg(i) - xg(i-1)
+                dx_2 = xg(i+1) - xg(i)
+                dx_3 = x(i) - x(i-1)
+                nu_x1 = nu + 0.25d0*(nu_t(i,j,k)+nu_t(i,j,k+1)+nu_t(i-1,j,k)+nu_t(i-1,j,k+1))
+                nu_x2 = nu + 0.25d0*(nu_t(i,j,k)+nu_t(i,j,k+1)+nu_t(i+1,j,k)+nu_t(i+1,j,k+1))
+                nu_y1 = nu + 0.5d0*(weight_y_0(j-1)*nu_t(i,j-1,k)+weight_y_1(j-1)*nu_t(i,j,k) + &
+                                     weight_y_0(j-1)*nu_t(i,j-1,k+1)+weight_y_1(j-1)*nu_t(i,j,k+1))
+                nu_y2 = nu + 0.5d0*(weight_y_0(j)*nu_t(i,j,k)+weight_y_1(j)*nu_t(i,j+1,k) + &
+                                     weight_y_0(j)*nu_t(i,j,k+1)+weight_y_1(j)*nu_t(i,j+1,k+1))
+                nu_z1 = nu + nu_t(i,j,k)
+                nu_z2 = nu + nu_t(i,j,k+1)
+                rhs_w(i,j,k) = rhs_w(i,j,k) + dPdz + &
+                   (nu_x2/dx_2*(W_(i+1,j,k)-W_(i,j,k)) - nu_x1/dx_1*(W_(i,j,k)-W_(i-1,j,k)))/dx_3 + &
+                   (nu_y2*term_2(i,j,k) - nu_y1*term_2(i,j-1,k))/dy_3 + &
+                   (nu_z2/dz_2*(W_(i,j,k+1)-W_(i,j,k)) - nu_z1/dz_1*(W_(i,j,k)-W_(i,j,k-1)))/dz_3
+             End Do
+          End Do
+       End Do
+    End If
 
     !-----------------last plane is dummy----------------!
     !$acc parallel loop collapse(2) default(present)
