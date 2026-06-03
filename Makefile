@@ -1,5 +1,5 @@
 ####################################################################
-### INPUT ##########################################################
+### GPU Build with NVIDIA HPC SDK + OpenACC                      ###
 ####################################################################
 
 SHELL:=/bin/bash
@@ -7,11 +7,13 @@ SHELL:=/bin/bash
 export F_UFMTENDIAN=big
 
 ## name of the executable file
-EXE = boundary_layer_1.1
+EXE = boundary_layer_gpu
 ## source code path
 SRC = pwd
 
-F90=mpifort -ffree-line-length-none
+## NVIDIA HPC SDK paths (set NVHPC_ROOT or use default)
+NVHPC_ROOT ?= /opt/nvidia/hpc_sdk/Linux_x86_64/24.3
+F90 = $(NVHPC_ROOT)/comm_libs/mpi/bin/mpifort
 
 ####################################################################
 # END INPUT ########################################################
@@ -21,60 +23,68 @@ WORK = $(PWD)
 PREBUILD = $(WORK)/prebuild
 OBJ = $(WORK)/build
 
-FFTWDIR=$(FFTW_DIR)
-LAPACKDIR=$(LAPACK_DIR)
+FFTWDIR ?= $(FFTW_DIR)
 
 #################################################### compiler flags
 
-## general
+## OpenACC + GPU flags
+ACCFLAGS = -acc -gpu=cc80 -Minfo=accel
+
+## FFTW (still needed for CPU fallback of FFTW-MPI pressure solver)
 FFTFLAGS = -I$(FFTWDIR)/include/
 
 #################################################### linker flags
 
-## general 
+## FFTW (CPU, for pressure solver until cuFFT replacement is complete)
 FFT_LFLAGS = -L$(FFTWDIR)/lib/ -lfftw3_mpi -lfftw3 -lm
-LAPACK_LFLAGS = -L$(LAPACKDIR) -llapack
 
-LFLAGS += $(FFT_LFLAGS) 
+## cuFFT
+CUDA_LFLAGS = -cudalib=cufft
+
+## LAPACK (from NVHPC)
+LAPACK_LFLAGS = -llapack
+
+LFLAGS += $(FFT_LFLAGS)
 LFLAGS += $(LAPACK_LFLAGS)
+LFLAGS += $(CUDA_LFLAGS)
 
 #################################################### extra flags
 
-## !!! if_set beg !!!
-## INTEL FLAGS
-## test    -> -O0 -g -traceback -check all -check bounds
-## profile -> -pg -O0 -fno-inline-functions
-## run     -> -O3 -ipo
-## GFORTRAN FLAGS
-FEXDEB = -O0 -g -fbacktrace -fcheck=all -fbounds-check -Wall
-FEXOPT = -O2
+FEXDEB = -O0 -g -Mbounds $(ACCFLAGS)
+FEXOPT = -O2 $(ACCFLAGS)
 
 debug:  FEX = $(FEXDEB)
 $(EXE): FEX = $(FEXOPT)
 
 #################################################### objects alpha
-OBJECTS = $(OBJ)/mpi.o $(OBJ)/global.o $(OBJ)/Newton_solver.o $(OBJ)/interpolation.o \
+OBJECTS = $(OBJ)/mpi.o $(OBJ)/global.o $(OBJ)/cufft_solver.o $(OBJ)/Newton_solver.o $(OBJ)/interpolation.o \
 	$(OBJ)/equations.o $(OBJ)/rescaled_inlet_bc.o $(OBJ)/boundary_conditions.o \
 	$(OBJ)/pressure.o $(OBJ)/input_output.o $(OBJ)/fftz.o $(OBJ)/statistics.o \
 	$(OBJ)/initialization.o $(OBJ)/subgrid.o $(OBJ)/wallmodel.o $(OBJ)/finalization.o \
 	$(OBJ)/projection.o $(OBJ)/time_integration.o \
 	$(OBJ)/params.o $(OBJ)/miscel.o $(OBJ)/monitor.o $(OBJ)/main.o
 
-#################################################### compile 
+#################################################### compile
 $(OBJ)/%.o: $(PREBUILD)/%.f90
 	@echo compiling $<
 	cd $(OBJ);\
-		$(F90) -c $(FFTFLAGS)  $(FEX) $< -o $@
+		$(F90) -c $(FFTFLAGS) $(FEX) $< -o $@
+
+# Files that trigger nvfortran 24.3 ICE at -O2: compile at -O0
+$(OBJ)/statistics.o: $(PREBUILD)/statistics.f90
+	@echo "compiling $< (O0 workaround for nvfortran ICE)"
+	cd $(OBJ);\
+		$(F90) -c $(FFTFLAGS) -O0 -acc -gpu=cc80 $< -o $@
 
 .SECONDARY:
 $(PREBUILD)/%.f90: $(WORK)/%.f90 $(WORK)/Makefile
-	@echo 
+	@echo
 	@echo -e "\033[7;35m WORK \033[0m  copying $<"
 	@echo to $@
 	@cp $< $@
 .SECONDARY:
-$(PREBUILD)/%.f90: $(SRC)/%.f90 $(WORK)/Makefile 
-	@echo 
+$(PREBUILD)/%.f90: $(SRC)/%.f90 $(WORK)/Makefile
+	@echo
 	@echo -e "\033[7;36m SRC \033[0m copying  $<"
 	@echo to $@
 	@cp $< $@
@@ -86,26 +96,26 @@ DIRSETUP:
 	@if ! [ -d $(PREBUILD) ]; then mkdir -p $(PREBUILD);echo PRECOMP directory created; fi
 
 ############################################################ build
-debug: DIRSETUP $(OBJECTS) 
+debug: DIRSETUP $(OBJECTS)
 	@echo " "
 	@echo "LINKING... "
 	@echo " "
 	cd $(OBJ);\
 	$(F90) -o $(WORK)/$@ $(OBJECTS) $(LFLAGS) $(FEXDEB)
 	@echo " "
-	@echo " "	
+	@echo " "
 	echo $@ built, congratulations.
 
 
 ############################################################ build
-$(EXE): DIRSETUP $(OBJECTS) 
+$(EXE): DIRSETUP $(OBJECTS)
 	@echo " "
 	@echo "LINKING... "
 	@echo " "
 	cd $(OBJ);\
 	$(F90) -o $(WORK)/$@ $(OBJECTS) $(LFLAGS) $(FEX)
 	@echo " "
-	@echo " "	
+	@echo " "
 	echo $@ built, congratulations.
 
 ########################################################## message

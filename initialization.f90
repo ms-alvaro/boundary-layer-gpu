@@ -533,18 +533,24 @@ Contains
     Allocate ( Fu2 ( 2:nx-1,  2:nyg-1, 2:nzg-1 ) )
     If (itime_step==3) Then
        Allocate ( Fu3 ( 2:nx-1,  2:nyg-1, 2:nzg-1 ) )
+    Else
+       Allocate ( Fu3 ( 1:1, 1:1, 1:1 ) )
     End If
 
     Allocate ( Fv1 ( 2:nxg-1,  2:ny-1, 2:nzg-1 ) )
     Allocate ( Fv2 ( 2:nxg-1,  2:ny-1, 2:nzg-1 ) )
     If (itime_step==3) Then
        Allocate ( Fv3 ( 2:nxg-1,  2:ny-1, 2:nzg-1 ) )
+    Else
+       Allocate ( Fv3 ( 1:1, 1:1, 1:1 ) )
     End If
 
     Allocate ( Fw1 ( 2:nxg-1,  2:nyg-1, 2:nz-1 ) )
     Allocate ( Fw2 ( 2:nxg-1,  2:nyg-1, 2:nz-1 ) )
     If (itime_step==3) Then
        Allocate ( Fw3 ( 2:nxg-1,  2:nyg-1, 2:nz-1 ) )
+    Else
+       Allocate ( Fw3 ( 1:1, 1:1, 1:1 ) )
     End If
 
     !----------------------sgs model------------------------------!

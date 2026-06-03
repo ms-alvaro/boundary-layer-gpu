@@ -1,131 +1,203 @@
-# BLseparation
+# Boundary Layer DNS — GPU (OpenACC + cuFFT)
 
-This repo contains the fortran code to solve an incompressible boundary layer 
-with a suction/blowing boundary condition at the top wall.
+Incompressible boundary layer DNS solver accelerated with NVIDIA GPUs.
+2nd-order finite differences on a staggered mesh, explicit RK2/RK3 time
+integration, fractional-step pressure projection. The pressure Poisson
+equation is solved via cosine transform in x (Neumann BC), Fourier
+transform in z (periodic), and tridiagonal Thomas solve in y — all on
+the GPU using cuFFT and OpenACC.
 
-The code solves the Navier-Stokes equations of an incompressible flow
-using finite differences in a staggered grid with a RK3 temporal scheme.
+Originally written by Adrian Lozano-Duran (CPU/MPI version).
+GPU port by Alvaro Martinez Sanchez.
 
-The code has been written by Adrian Lozano-Duran.
+## Performance
 
+**13.2x faster than 16 CPU cores** on a single NVIDIA A100.
 
-## Download
+| Metric | Value |
+|---|---|
+| Time per cell per step | 3.54 ns |
+| Speedup vs 16 CPU cores | 13.2x |
+| Speedup vs 1 CPU core | 212x |
+| Test grid | 814 x 125 x 66 (6.7M cells) |
+| GPU | A100 80 GB SXM |
 
-To download this repo, type: 
+### Optimization history
 
-```bash  
-git clone git@github.mit.edu:Computational-Turbulence-Group/BLseparation.git <path>/<name>
-```
-where `<path>` is the path where you want to install the code, and `<name>` is the name of the repo. If `<name>` is not given, the default *BLseparation* is used.
+| Optimization | ns/cell/step | vs 16 CPU |
+|---|---|---|
+| Baseline (`!$acc kernels` on array copies) | 125.7 | 0.4x |
+| `parallel loop collapse(3)` for array copies | 17.5 | 2.7x |
+| Batched 2D cuFFT (`cufftPlanMany`) | 13.2 | 3.6x |
+| Precomputed Thomas LU factorization | 7.85 | 6.0x |
+| Fused RHS (merge multiply into derivative loops) | 7.01 | 6.7x |
+| Inline all interpolations into convective kernels | 5.80 | 8.1x |
+| DNS viscous shortcut (inline nu*Laplacian for LES=0) | 5.42 | 8.7x |
+| Transpose Thomas for coalesced memory access | 3.54 | 13.2x |
 
+### Current bottleneck breakdown (per RK2 substep = 11.6 ms)
 
-## Pre-requisites
+| Component | Time (ms) | % |
+|---|---|---|
+| **Projection total** | **8.8** | **76%** |
+| — cuFFT (batched 2D, fwd+inv) | 5.1 | 44% |
+| — Thomas tridiagonal solve | 0.53 | 5% |
+| — Pack/extract cosine extension | 2.2 | 19% |
+| — Divergence + project velocity + BC | ~1.0 | 9% |
+| RHS (convective + viscous, all 3 components) | 1.7 | 15% |
+| Copy Uo=U, advance, BC, other | 1.1 | 9% |
 
-`BLseparation` requires the [FFTW library](https://www.fftw.org) and the intel
-compilers `ifort` and `mpiifort` [intel oneAPI](https://www.intel.com/content/www/us/en/developer/tools/oneapi/hpc-toolkit.html#gs.6296q9).
+The main bottleneck is the 4x zero-padded cosine extension for the
+pressure FFT — 75% of the data processed by cuFFT is zeros.
 
+## Prerequisites
+
+- **NVIDIA HPC SDK** 24.3+ (`nvfortran`, `mpifort`)
+- **NVIDIA GPU** with compute capability 8.0+ (A100, H100, etc.)
+- **FFTW 3.3+** compiled with the NVHPC Fortran compiler (for the
+  MPI-parallel FFTW fallback in the pressure solver)
+- **CUDA toolkit** (included with HPC SDK)
+- **LAPACK** (included with HPC SDK)
 
 ## Compilation
 
-Provided that FFTW is installed under `<path-to_fftw>` and that `ifort`
-and `mpiifort` are available commands, follow these steps:
+1. Set environment variables:
 
-1. Add the include and lib paths of your local installation of FFTW to your `~/.bashrc`:
-    ```bash
-    export FFTW_DIR=<path-to-fftw>
-    export LAPACK_DIR=<path-to-lapack>
-    ```
-2. Load the new variables:
-    ```bash
-    source ~/.bashrc
-    ```
-3. Go to `<path>/<name>` and type:
-    ```bash
-    make
-    ```
-4. (optional) For debugging purposes, you can also compile the code using
-    ```bash
-    make clean
-    make debug
-    ```
-
-These steps will generate an executable file `boundary_layer_<version>`
-in `<path>/<name>` directory.
-
-> NOTE: If you are in supercloud.mit.edu, intel compilers can be loaded as:
-> ```bash
-> module load intel-oneapi/2023.1
-> ```
-
-### Compile in Resnick HPC (Caltech)
-
-To make the intel compilers available, you have to load the modules:
 ```bash
-module load intel-oneapi-compilers/2023.2.1-gcc-11.3.1-3knpjdr   
-module load openmpi/5.0.1-oneapi-2023.2.1-aef2p6e  
+export NVHPC_ROOT=/opt/nvidia/hpc_sdk/Linux_x86_64/24.3  # adjust to your installation
+export FFTW_DIR=/path/to/fftw-3.3.10-nvhpc                # FFTW built with nvfortran
 ```
 
-The paths to be added to `.bashrc` are
+2. Compile:
+
 ```bash
-export FFTW_DIR=/central/software9/spack/opt/spack/linux-rhel9-x86_64/oneapi-2023.2.1/fftw-3.3.10-dxwsxf6a4v6xxyp4wxmnixbuvayokeso/
-export LAPACK_DIR=/home/garranz/opt/lapack-3.12.0/
+make clean && make
 ```
 
-### Advanced compilation
+This produces the `boundary_layer_gpu` executable.
 
-In case you want to make some modification to the source code, a clean way to 
-do it is:
+For debugging:
 
-1. Create an empty directory (`my_modifications` in this example)
-elsewhere.
-Then, copy [Makefile](Makefile) into `my_modifications` and edit the line
-```Makefile
-SRC = pwd
-```
-replacing `pwd` by `<path>/<name>`
-
-2. Copy *only* file that you want to modify into `my_modifications` and 
-edit it as desired.
-
-3. Compile the code as usual inside `my_modifications` by running
-    ```bash
-    make
-    ```
-    or
-    ```bash
-    make debug
-    ```
-
-In this way, you do not modify the original files, and it is easy to
-keep track of the files that you have modified with respect to the
-original version.
-
-
-## Setting-up a simulation
-
-To set up a simulation, `BLseparation` needs and input file. A template of the
-input file can be found in [input_parameters.turbb](input_parameters.turbb). 
-You should copy this file and edit the local copy.
-
-> NOTE: If `inflow_flag` > 1, a binary input file has to be specified 
-> as `inflow_file`. For that, you can use [generate_inflow_file.py](pyfiles/generate_inflow_file.py).
-
-
-## Run a simulation
-
-Once you have defined your input file, `<myinput_file>.turbb`, 
-the simulation is launched as
 ```bash
-mpirun -np <np> ./boundary_layer_<version> -i <myinput_file>.turbb > output
+make clean && make debug
 ```
-where `<np>` is the number of processors.
 
+> **Note:** `statistics.f90` is compiled at `-O0` due to an internal
+> compiler error in nvfortran 24.3. This has no measurable performance
+> impact since statistics are computed infrequently.
 
-## Post-processing
+### Building FFTW with NVHPC
 
-After executing the code, `BLseparation` generates two different output files: the instantaneous
-flow field, and a `txt` file with statistics of the flow.
+If your system does not have FFTW compiled with nvfortran:
 
-Python scripts to post-process these files can be found in [tests/pyfiles](tests/pyfiles).
+```bash
+export FC=$NVHPC_ROOT/compilers/bin/nvfortran
+export CC=$NVHPC_ROOT/compilers/bin/nvc
+./configure --prefix=$HOME/opt/fftw-3.3.10-nvhpc --enable-mpi FC=$FC CC=$CC
+make -j && make install
+```
 
+### CPU-only build
 
+A CPU Makefile (`Makefile.cpu`) is included for reference. It uses
+`mpifort` (gfortran) with FFTW and LAPACK:
+
+```bash
+make -f Makefile.cpu FFTW_DIR=/path/to/fftw LAPACK_DIR=/path/to/lapack
+```
+
+## Running
+
+```bash
+mpirun -np 1 ./boundary_layer_gpu -i <input_file>.turbb
+```
+
+Currently single-GPU only (MPI decomposition is in z, but the GPU solver
+runs on rank 0).
+
+## Test cases
+
+### Laminar Blasius (`laminar_test/`)
+
+Laminar flat-plate boundary layer validation. Compares skin friction and
+velocity profiles against the Blasius similarity solution.
+
+```bash
+cd laminar_test
+python3 generate_blasius.py    # generate blasius_solution.dat
+mpirun -np 1 ../boundary_layer_gpu -i laminar.turbb
+python3 postprocess.py         # validation plots
+```
+
+### TS-mode transition (`transition_test/`)
+
+Boundary layer transition triggered by Tollmien-Schlichting modes at the
+inflow (inflow_flag=1).
+
+```bash
+cd transition_test
+python3 generate_temporal_modes_local.py  # generate TS mode file
+mpirun -np 1 ../boundary_layer_gpu -i transition.turbb
+python3 plot_snapshot.py data/BL_transition.NNNNN
+```
+
+## Input parameters
+
+See `input_parameters.turbb` for a documented template. Key parameters:
+
+| Parameter | Description |
+|---|---|
+| `nxyz` | Grid points (nx, ny, nz) |
+| `boxsize` | Domain size (Lx, Ly, Lz, alpha_stretch) |
+| `CFL` | CFL number (positive) or fixed dt (negative) |
+| `nu` | Kinematic viscosity |
+| `RKscheme` | Time integration: 1=Euler, 2=RK2, 3=RK3 |
+| `LES` | SGS model: 0=DNS, 1=Smagorinsky, 2=DSM |
+| `WM` | Wall model: 0=none, 1-9=various |
+| `inflow_flag` | Inflow BC: 1=Blasius, 3=Lund, 4=Blasius+noise, 6=Blasius+HIT |
+| `nsteps` | Total time steps |
+| `nsave` | Save snapshot every N steps |
+
+## Code structure
+
+| File | Description |
+|---|---|
+| `main.f90` | Main program, OpenACC data region |
+| `global.f90` | Global variable declarations |
+| `initialization.f90` | Grid setup, Thomas LU precomputation, cuFFT plans |
+| `equations.f90` | RHS computation (inlined convective + viscous terms) |
+| `time_integration.f90` | RK2/RK3 stepping with OpenACC loops |
+| `projection.f90` | GPU pressure solver (cuFFT + Thomas) |
+| `cufft_solver.f90` | cuFFT plan creation (`cufftPlanMany`) |
+| `pressure.f90` | Pressure Poisson equation setup |
+| `boundary_conditions.f90` | Inflow/outflow/wall BCs (GPU-resident) |
+| `rescaled_inlet_bc.f90` | Lund's rescaling for turbulent inflow |
+| `statistics.f90` | Time-averaged flow statistics |
+| `monitor.f90` | Runtime diagnostics (Cf, max U, divergence) |
+| `input_output.f90` | Snapshot read/write |
+| `params.f90` | Input parameter parsing |
+| `fftz.f90` | FFT wrappers |
+| `interpolation.f90` | Grid interpolation utilities |
+| `subgrid.f90` | LES subgrid-scale models |
+| `wallmodel.f90` | Wall stress models |
+| `miscel.f90` | Miscellaneous utilities |
+| `Newton_solver.f90` | Newton solver (for wall models) |
+| `finalization.f90` | Cleanup |
+| `mpi.f90` | MPI initialization |
+
+## Known limitations and future work
+
+The cuFFT pressure solve (44% of runtime) is limited by the 4x
+zero-padded cosine extension. Possible improvements:
+
+- **Custom CUDA cosine kernel**: Process only N real values instead of
+  4N complex values (estimated 5-8x FFT speedup)
+- **Mixed precision**: FP32 for the pressure solve (2x data reduction)
+- **Stream overlap**: Pipeline cuFFT with Thomas solve across y-planes
+- **Grid restructuring**: Cell-centered pressure for standard DCT-I
+  (2x extension instead of 4x)
+
+## License
+
+Original code by Adrian Lozano-Duran and the Computational Turbulence
+Group at MIT.
