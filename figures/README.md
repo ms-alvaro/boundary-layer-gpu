@@ -11,7 +11,10 @@ inflow + bypass-transition DNS (`transition_hit_v2` workflow).
   periodic forever, so the swept inflow echoes at the 18.5 δ99 tile sub-period.
 - `echo_isotropy_3case.png` — genuine LONGX=8 echo + isotropy overview.
 - `eddy_isotropy_sweep0.80.png` — eddy isotropy at y=2 δ99 (R_x solid vs R_z dashed) at
-  the tuned sweep_period=0.80: L_x/L_z(u') ≈ 2.1 (canonical isotropic ~2).
+  the tuned sweep_period=0.80 (well-averaged t=12 run): **L_x/L_z(u') ≈ 1.9** (canonical
+  isotropic ~2). NOTE the box-period echo at this sweep_period is ~0.09 @112 δ99 (above the
+  0.05 wish) — isotropy (~2.0, needs faster sweep) and low echo (needs slower sweep) trade
+  off on this LONGX=8 box; still 3× lower echo than the current Marlowe inflow (0.28 @74 δ99).
 - `streamwise_view_sweep0.80.png` — u'(x,z) top + u'(x,y) side view, true aspect.
 - `inflow_spectra_vs_v2.png` — inflow 1D energy spectra E(k_x), E(k_z) at y=2 δ99 vs the
   deployed v2 inflow: k^-5/3 inertial range, matching energy levels, no echo spike.
