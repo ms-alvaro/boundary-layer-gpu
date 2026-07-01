@@ -8,10 +8,10 @@ inflow + bypass-transition DNS (`transition_hit_v2` workflow).
 (`tbl_mz_sw080`, sweep_period=0.80 inflow, top_flag=4 zero-shear top): the FST enters from the
 inlet into a **clean Blasius/laminar** start. Top: u'(x,z) at y=2δ99; bottom: u'(x,y) mid-span
 side view. **Colorbar fixed at ±0.20** — pinned to the *developed-turbulent* u' range (99th pct of the
-completed prior run at T=50), NOT the weak FST, so the FST reads faint now and the turbulence won't clip
-once transition sets in downstream. The **x-window is auto-zoomed** to the max streamwise extent the FST
-has reached (front advances at ~U∞·t). Currently t=0.5→7.5, x ≤ ~322 δ99; will be re-rendered (longer +
-wider) as the run advances toward step 420000.
+completed prior run at T=50), NOT the weak FST, so the FST reads faint and the turbulence fills the range.
+Now covers **t=0.5→37.5 over the full 900-δ99 plate**: FST enters → Klebanoff streaks (x≲150 δ99) →
+breakdown (150–400) → **turbulent BL downstream** (400–935) filling the colorbar. 38 frames (rendered on a
+Marlowe compute node; login-node Lustre was too slow). Will extend further as the run finishes at 420000.
 
 ![FST entering the boundary layer (preliminary)](movies/fst_entering_bl_prelim.gif)
 
