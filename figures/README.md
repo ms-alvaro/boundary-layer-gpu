@@ -7,8 +7,9 @@ inflow + bypass-transition DNS (`transition_hit_v2` workflow).
 `fst_entering_bl_prelim.gif` / `.mp4` — **preliminary** movie from the Marlowe production run
 (`tbl_mz_sw080`, sweep_period=0.80 inflow, top_flag=4 zero-shear top): the FST enters from the
 inlet into a **clean Blasius/laminar** start. Top: u'(x,z) at y=2δ99; bottom: u'(x,y) mid-span
-side view. **Colorbar fixed** (±0.06) across every frame. Currently t=0.5→5.5 — the FST front has
-reached the front ~25% of the 900-δ99 plate; will be extended as the run advances toward step 420000.
+side view. **Colorbar fixed** (±0.067) across every frame, and the **x-window is auto-zoomed** to the
+max streamwise extent the FST has reached (front advances at ~U∞·t). Currently t=0.5→6.0, x ≤ ~266 δ99;
+will be re-rendered (longer + wider) as the run advances toward step 420000.
 
 ![FST entering the boundary layer (preliminary)](movies/fst_entering_bl_prelim.gif)
 
