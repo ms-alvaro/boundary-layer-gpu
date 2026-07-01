@@ -3,6 +3,15 @@
 Diagnostic and validation figures from the swept-HIT-box freestream-turbulence
 inflow + bypass-transition DNS (`transition_hit_v2` workflow).
 
+## `movies/` — freestream turbulence entering the boundary layer
+`fst_entering_bl_prelim.gif` / `.mp4` — **preliminary** movie from the Marlowe production run
+(`tbl_mz_sw080`, sweep_period=0.80 inflow, top_flag=4 zero-shear top): the FST enters from the
+inlet into a **clean Blasius/laminar** start. Top: u'(x,z) at y=2δ99; bottom: u'(x,y) mid-span
+side view. **Colorbar fixed** (±0.06) across every frame. Currently t=0.5→5.5 — the FST front has
+reached the front ~25% of the 900-δ99 plate; will be extended as the run advances toward step 420000.
+
+![FST entering the boundary layer (preliminary)](movies/fst_entering_bl_prelim.gif)
+
 ## `longx8_inflow/` — swept-HIT inflow isotropy, echo, and spectra (LONGX=8)
 - `streamwise_echo_3case.png` — streamwise autocorrelation R_uu(Δx): current Marlowe
   (LONGX=4, echo +0.283 @74 δ99) vs the failed 8×-tiled box (+0.754 @18.5 δ99) vs the
