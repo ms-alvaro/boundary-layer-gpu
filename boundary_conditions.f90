@@ -62,7 +62,10 @@ Contains
        ! Impose zero vorticity and dw/dy = 0
        Call zero_wz_top(U,V,W)
     Elseif (top_boundary_flag==3) Then
-       Call apply_top_bc_y_Falkner_Skan(U,V,W) 
+       Call apply_top_bc_y_Falkner_Skan(U,V,W)
+    Elseif (top_boundary_flag==4) Then
+       ! zero-shear tangential (du/dy=dw/dy=0) + displacement V at the lid
+       Call apply_top_bc_y_zeroshear(U,V,W)
     Else
        ! U, V and W boundary condition at the top           
        Call apply_top_bc_y(U,V,W) 
@@ -132,8 +135,12 @@ Contains
 
     ! Ghost cell updates: nprocs=1 -> no-op
 
-    ! Inflow BC (temporal modes + Blasius) — entirely on GPU
-    ! Compute Ut_inlet, Vt_inlet, Wt_inlet on GPU
+    ! Inflow BC — entirely on GPU
+    ! inflow_flag=6: HIT planes -> Ut/Vt/Wt_inlet (temporal interpolation)
+    If ( inflow_boundary_flag == 6 ) Then
+       Call update_hit_inlet_gpu
+    End If
+    ! inflow_flag=1: temporal modes -> Ut/Vt/Wt_inlet (mode synthesis)
     If ( n_modes_inlet > 0 ) Then
        !$acc parallel loop collapse(2) default(present) &
        !$acc private(n, m)
@@ -215,16 +222,31 @@ Contains
     W(:,:,nz) = W(:,:,2)
     !$acc end kernels
 
-    ! Top BC (top_flag=0) — on GPU
-    !$acc parallel loop default(present)
-    Do i=1,nx
-       U(i,nyg,:) = U_top(i)
-    End Do
-    !$acc parallel loop default(present)
-    Do i=1,nxg
-       V(i, ny,:) = V_top(i)
-       W(i,nyg,:) = W_top(i)
-    End Do
+    ! Top BC — on GPU.  top_flag=4: zero-shear tangential (du/dy=dw/dy=0) +
+    ! displacement V_top (lets freestream turbulence pass the lid).
+    ! Else (top_flag=0): Dirichlet tangential (U=U_inf, W=0) + displacement V_top
+    ! (clamps FST u'/w' to ~0 at the lid).  V_top is identical -> top pressure BC unchanged.
+    If ( top_boundary_flag == 4 ) Then
+       !$acc parallel loop default(present)
+       Do i=1,nx
+          U(i,nyg,:) = U(i,nyg-1,:)
+       End Do
+       !$acc parallel loop default(present)
+       Do i=1,nxg
+          V(i, ny,:) = V_top(i)
+          W(i,nyg,:) = W(i,nyg-1,:)
+       End Do
+    Else
+       !$acc parallel loop default(present)
+       Do i=1,nx
+          U(i,nyg,:) = U_top(i)
+       End Do
+       !$acc parallel loop default(present)
+       Do i=1,nxg
+          V(i, ny,:) = V_top(i)
+          W(i,nyg,:) = W_top(i)
+       End Do
+    End If
 
     ! Wall BC (iwall_model=0): Dirichlet — on GPU
     !$acc kernels default(present)
@@ -1007,6 +1029,35 @@ Contains
   End Subroutine apply_top_bc_y_Falkner_Skan
 
   !-------------------------------------------------!
+  !  Zero-shear (Neumann) tangential + displacement !
+  !  wall-normal velocity at the top  (top_flag=4)  !
+  !                                                 !
+  !  du/dy = dw/dy = 0  (zero shear stress; lets    !
+  !  freestream-turbulence u'/w' pass at the lid),  !
+  !  V kept = V_top = U_inf*0.0160*Re_x^(-1/7)       !
+  !  (same displacement/entrainment V as top_flag=0,!
+  !  so the top pressure BC is unchanged).          !
+  !-------------------------------------------------!
+  Subroutine apply_top_bc_y_zeroshear(U_,V_,W_)
+
+    Real(Int64), Dimension(:,:,:), Intent(InOut) :: U_, V_, W_
+
+    ! local variables
+    Integer(Int32) :: i
+
+    ! tangential at centers: zero shear stress (Neumann), du/dy = 0
+    Do i=1,nx
+       U_(i,nyg,:) = U_(i,nyg-1,:)
+    End Do
+    ! faces: keep displacement entrainment V; zero shear stress in W (dw/dy=0)
+    Do i=1,nxg
+       V_(i, ny,:) = V_top(i)
+       W_(i,nyg,:) = W_(i,nyg-1,:)
+    End Do
+
+  End Subroutine apply_top_bc_y_zeroshear
+
+  !-------------------------------------------------!
   !        Dirichlet boundary condition in y        !
   !          No MPI communication required          !
   !                                                 !
@@ -1485,7 +1536,8 @@ Contains
        ! inflow Rex
        Rex0 = 1d0*x(1)/nu
           
-       If ( inflow_boundary_flag==1 .or. inflow_boundary_flag==3 .or. inflow_boundary_flag==4 ) Then
+       If ( inflow_boundary_flag==1 .or. inflow_boundary_flag==3 .or. &
+            inflow_boundary_flag==4 .or. inflow_boundary_flag==6 ) Then
 
           ! Generate own Blasius
           Write(*,*) 'Generating own Blasius for inlet'
@@ -1795,6 +1847,265 @@ Contains
     Call Mpi_bcast ( qv_inlet,ntotal,MPI_real8,0,MPI_COMM_WORLD,ierr )
     
   End Subroutine compute_blasius_solution_for_bc
+
+  !-------------------------------------------------------------------!
+  !  HIT plane inflow (inflow_flag=6)                                 !
+  !                                                                   !
+  !  Time-resolved y-z planes from a precursor HIT simulation,        !
+  !  preprocessed (rescaled+blended) by preprocess_planes.py (v2).    !
+  !  Planes are z-PERIODIC with period Lz_box_hit (must equal Lz).    !
+  !                                                                   !
+  !  - init_hit_inflow:      read header, allocate, load 1st buffer   !
+  !  - load_hit_buffer:      read N_buffer planes, interp to          !
+  !                          staggered grids (CPU)                    !
+  !  - update_hit_inlet_gpu: temporal interpolation -> Ut/Vt/Wt_inlet !
+  !                          (GPU kernel), reload buffer if exhausted !
+  !-------------------------------------------------------------------!
+  Subroutine init_hit_inflow
+
+    Integer(Int32) :: magic
+    Real   (Int64) :: L11r_f, alphaL_f, alphat_f, Uinf_f
+
+    If ( nprocs > 1 ) Stop 'inflow_flag=6 GPU: only nprocs=1 supported'
+
+    If ( Len_Trim(file_hit_planes)==0 ) &
+         Stop 'inflow_flag=6 requires hit_file in input'
+
+    If (myid==0) Write(*,*) 'Initializing HIT plane inflow from: ', &
+                            Trim(file_hit_planes)
+
+    Open(47, file=Trim(file_hit_planes), form='unformatted', &
+         action='read', access='stream', status='old')
+    Read(47) magic
+    If ( magic /= 20260612 ) Then
+       Write(*,*) 'ERROR: bad magic in hit_file: ', magic
+       Stop 'hit_file format mismatch (need v2, magic 20260612)'
+    End If
+    Read(47) n_planes_hit
+    Read(47) ny_hit_f
+    Read(47) nz_hit_f
+    Read(47) dt_plane_hit
+    Read(47) Lz_box_hit
+    Read(47) Tu_hit, L11r_f, alphaL_f, A_vel_hit, alphat_f, &
+             y_blend_hit, Uinf_f
+    Allocate( y_hit_f(ny_hit_f) )
+    Read(47) y_hit_f
+    Close(47)
+
+    ! data start offset (bytes, 1-based POS for stream access)
+    hit_data_offset = 4_8*4_8 + 8_8*2_8 + 8_8*7_8 + 8_8*Int(ny_hit_f,8) + 1_8
+
+    ! consistency checks
+    ! true spanwise period of the code: dz*(nz_global-2)
+    ! (z(1) and z(nz-1) are periodic images; z(nz) is a ghost)
+    If ( Abs( Lz_box_hit - (z(2)-z(1))*Real(nz_global-2,8) ) > 1d-6*Lz_box_hit ) Then
+       Write(*,*) 'ERROR: domain z-period=', (z(2)-z(1))*Real(nz_global-2,8), &
+                  ' /= plane z-period=', Lz_box_hit
+       Write(*,*) 'Planes are z-periodic over Lz_box: set boxsize Lz accordingly'
+       Stop 'hit_file z-period mismatch'
+    End If
+    If ( y_hit_f(ny_hit_f) < yg_global(nyg_global-1) ) Then
+       Write(*,*) 'WARNING: plane y range ', y_hit_f(ny_hit_f), &
+                  ' < domain top ', yg_global(nyg_global-1), ' (will clamp)'
+    End If
+
+    If ( N_buffer_hit > n_planes_hit ) N_buffer_hit = n_planes_hit
+
+    ! GPU-resident buffers on the staggered inlet grids
+    Allocate( hit_buf_u(nyg, nzg, N_buffer_hit) )
+    Allocate( hit_buf_v(ny , nzg, N_buffer_hit) )
+    Allocate( hit_buf_w(nyg, nz , N_buffer_hit) )
+
+    ! load first buffer (before the OpenACC data region: copied in by copyin)
+    Call load_hit_buffer(1)
+
+    If (myid==0) Then
+       Write(*,*) '   planes: ', n_planes_hit, '  grid: ', ny_hit_f, 'x', nz_hit_f
+       Write(*,*) '   dt_plane = ', dt_plane_hit, ' (', dt_plane_hit/Abs(CFL), ' steps)'
+       Write(*,*) '   time covered = ', Real(n_planes_hit-1,8)*dt_plane_hit
+       Write(*,*) '   buffer = ', N_buffer_hit, ' planes (', &
+                  Real(N_buffer_hit,8)*Real(nyg*nzg+ny*nzg+nyg*nz,8)*8d0/1d9, ' GB)'
+       Write(*,*) '   Tu = ', Tu_hit, '  y_blend = ', y_blend_hit
+    End If
+
+  End Subroutine init_hit_inflow
+
+  !-------------------------------------------------------------------!
+  ! Load planes [istart, istart+N_buffer-1] (1-based, clamped to end) !
+  ! from disk and interpolate to the staggered inlet grids (CPU).     !
+  !-------------------------------------------------------------------!
+  Subroutine load_hit_buffer(istart)
+
+    Integer(Int32), Intent(In) :: istart
+
+    Integer(Int32) :: n_load, p, ip, j, k, j0, j1, k0, k1
+    Integer(Int64) :: pos, rec_bytes
+    Real   (Int64) :: yy, zz, fy, fz, wyj, wzk, dzf
+    Real   (4), Allocatable, Dimension(:,:) :: raw_u, raw_v, raw_w
+    ! precomputed y-weights for centers (yg) and faces (y)
+    Integer(Int32), Allocatable, Dimension(:) :: jg0, jf0
+    Real   (Int64), Allocatable, Dimension(:) :: wg, wf
+    ! precomputed z-weights for centers (zg) and faces (z)
+    Integer(Int32), Allocatable, Dimension(:) :: kc0, kc1, kf0v, kf1v
+    Real   (Int64), Allocatable, Dimension(:) :: wc, wfz
+
+    n_load = Min( N_buffer_hit, n_planes_hit - istart + 1 )
+    ibuf_start_hit = istart
+    rec_bytes = 3_8 * Int(ny_hit_f,8) * Int(nz_hit_f,8) * 4_8
+
+    Allocate( raw_u(nz_hit_f, ny_hit_f) )   ! file order: iy slow, iz fast
+    Allocate( raw_v(nz_hit_f, ny_hit_f) )
+    Allocate( raw_w(nz_hit_f, ny_hit_f) )
+
+    ! ---- y interpolation weights (clamped linear on y_hit_f) ----
+    Allocate( jg0(nyg), wg(nyg), jf0(ny), wf(ny) )
+    Do j = 1, nyg
+       yy = Min( Max( yg(j), y_hit_f(1) ), y_hit_f(ny_hit_f) )
+       j0 = 1
+       Do j1 = 2, ny_hit_f
+          If ( y_hit_f(j1) >= yy ) Then
+             j0 = j1 - 1
+             Exit
+          End If
+          If ( j1 == ny_hit_f ) j0 = ny_hit_f - 1
+       End Do
+       jg0(j) = j0
+       wg (j) = ( yy - y_hit_f(j0) ) / ( y_hit_f(j0+1) - y_hit_f(j0) )
+    End Do
+    Do j = 1, ny
+       yy = Min( Max( y(j), y_hit_f(1) ), y_hit_f(ny_hit_f) )
+       j0 = 1
+       Do j1 = 2, ny_hit_f
+          If ( y_hit_f(j1) >= yy ) Then
+             j0 = j1 - 1
+             Exit
+          End If
+          If ( j1 == ny_hit_f ) j0 = ny_hit_f - 1
+       End Do
+       jf0(j) = j0
+       wf (j) = ( yy - y_hit_f(j0) ) / ( y_hit_f(j0+1) - y_hit_f(j0) )
+    End Do
+
+    ! ---- z interpolation weights (periodic over Lz_box_hit) ----
+    dzf = Lz_box_hit / Real(nz_hit_f,8)
+    Allocate( kc0(nzg), kc1(nzg), wc(nzg), kf0v(nz), kf1v(nz), wfz(nz) )
+    Do k = 1, nzg
+       zz = Modulo( zg(k), Lz_box_hit )
+       fz = zz / dzf
+       k0 = Int(fz)
+       wc(k)  = fz - Real(k0,8)
+       kc0(k) = Mod(k0  , nz_hit_f) + 1
+       kc1(k) = Mod(k0+1, nz_hit_f) + 1
+    End Do
+    Do k = 1, nz
+       zz = Modulo( z(k), Lz_box_hit )
+       fz = zz / dzf
+       k0 = Int(fz)
+       wfz(k)  = fz - Real(k0,8)
+       kf0v(k) = Mod(k0  , nz_hit_f) + 1
+       kf1v(k) = Mod(k0+1, nz_hit_f) + 1
+    End Do
+
+    ! ---- read + interpolate each plane ----
+    Open(47, file=Trim(file_hit_planes), form='unformatted', &
+         action='read', access='stream', status='old')
+    Do p = 1, n_load
+       ip  = istart + p - 1
+       pos = hit_data_offset + Int(ip-1,8)*rec_bytes
+       Read(47, POS=pos) raw_u, raw_v, raw_w
+
+       ! u at (yg, zg)
+       Do k = 1, nzg
+          k0 = kc0(k); k1 = kc1(k); wzk = wc(k)
+          Do j = 1, nyg
+             j0 = jg0(j); wyj = wg(j)
+             hit_buf_u(j,k,p) = &
+               (1d0-wyj)*( (1d0-wzk)*Real(raw_u(k0,j0  ),8) + wzk*Real(raw_u(k1,j0  ),8) ) + &
+                    wyj *( (1d0-wzk)*Real(raw_u(k0,j0+1),8) + wzk*Real(raw_u(k1,j0+1),8) )
+          End Do
+       End Do
+       ! v at (y, zg)
+       Do k = 1, nzg
+          k0 = kc0(k); k1 = kc1(k); wzk = wc(k)
+          Do j = 1, ny
+             j0 = jf0(j); wyj = wf(j)
+             hit_buf_v(j,k,p) = &
+               (1d0-wyj)*( (1d0-wzk)*Real(raw_v(k0,j0  ),8) + wzk*Real(raw_v(k1,j0  ),8) ) + &
+                    wyj *( (1d0-wzk)*Real(raw_v(k0,j0+1),8) + wzk*Real(raw_v(k1,j0+1),8) )
+          End Do
+       End Do
+       ! w at (yg, z)
+       Do k = 1, nz
+          k0 = kf0v(k); k1 = kf1v(k); wzk = wfz(k)
+          Do j = 1, nyg
+             j0 = jg0(j); wyj = wg(j)
+             hit_buf_w(j,k,p) = &
+               (1d0-wyj)*( (1d0-wzk)*Real(raw_w(k0,j0  ),8) + wzk*Real(raw_w(k1,j0  ),8) ) + &
+                    wyj *( (1d0-wzk)*Real(raw_w(k0,j0+1),8) + wzk*Real(raw_w(k1,j0+1),8) )
+          End Do
+       End Do
+    End Do
+    Close(47)
+
+    If (myid==0) Write(*,'(a,i8,a,i8,a)') '   HIT buffer loaded: planes ', &
+         istart, ' to ', istart+n_load-1, ' (interpolated to inlet grids)'
+
+    Deallocate( raw_u, raw_v, raw_w, jg0, wg, jf0, wf )
+    Deallocate( kc0, kc1, wc, kf0v, kf1v, wfz )
+
+  End Subroutine load_hit_buffer
+
+  !-------------------------------------------------------------------!
+  ! Fill Ut/Vt/Wt_inlet from the HIT buffer at the current time t     !
+  ! (linear interpolation between bracketing planes, GPU kernel).     !
+  ! Reloads the buffer from disk when exhausted.                      !
+  !-------------------------------------------------------------------!
+  Subroutine update_hit_inlet_gpu
+
+    Integer(Int32) :: ip0, ipw, p0, il0, j, k, n_loaded
+    Real   (Int64) :: theta
+
+    ! global plane interval (0-based). NO-WRAP CAMPAIGN (audit blueprint):
+    ! the library must NEVER be recycled — running past its end is a fatal
+    ! configuration error, not something to paper over with Mod().
+    ip0   = Int( t / dt_plane_hit )
+    theta = t/dt_plane_hit - Real(ip0,8)
+    If ( ip0 >= n_planes_hit-1 ) Then
+       Write(*,*) 'FATAL: HIT inflow library exhausted: t=', t, &
+            ' ip0=', ip0, ' n_planes=', n_planes_hit
+       Stop 'HIT library exhausted — no wrap allowed (extend library first)'
+    End If
+    ipw   = ip0
+    p0    = ipw + 1                     ! 1-based file index of left plane
+
+    ! reload if [p0, p0+1] not inside the buffer
+    n_loaded = Min( N_buffer_hit, n_planes_hit - ibuf_start_hit + 1 )
+    If ( p0 < ibuf_start_hit .or. p0+1 > ibuf_start_hit+n_loaded-1 ) Then
+       Call load_hit_buffer(p0)
+       !$acc update device(hit_buf_u, hit_buf_v, hit_buf_w)
+    End If
+    il0 = p0 - ibuf_start_hit + 1       ! local buffer index
+
+    !$acc parallel loop collapse(2) default(present)
+    Do k = 1, nzg
+       Do j = 1, nyg
+          Ut_inlet(j,k) = (1d0-theta)*hit_buf_u(j,k,il0) + theta*hit_buf_u(j,k,il0+1)
+       End Do
+    End Do
+    !$acc parallel loop collapse(2) default(present)
+    Do k = 1, nzg
+       Do j = 1, ny
+          Vt_inlet(j,k) = (1d0-theta)*hit_buf_v(j,k,il0) + theta*hit_buf_v(j,k,il0+1)
+       End Do
+    End Do
+    !$acc parallel loop collapse(2) default(present)
+    Do k = 1, nz
+       Do j = 1, nyg
+          Wt_inlet(j,k) = (1d0-theta)*hit_buf_w(j,k,il0) + theta*hit_buf_w(j,k,il0+1)
+       End Do
+    End Do
+
+  End Subroutine update_hit_inlet_gpu
 
   !-------------------------------------------------------!
   !                                                       !
