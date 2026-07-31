@@ -232,13 +232,26 @@ contains
     if ( nxp < 1 .or. nzp < 1 .or. nm < 1 ) &
        stop ' ERROR: poisson_init called with invalid grid sizes'
 
+    ! The gather-fallback selection must be known before allocating: the
+    ! full-size root work arrays + plans are needed ONLY by the single-rank
+    ! solve and the P5.1 gather fallback; the distributed P5.2 solve uses
+    ! the per-rank local arrays exclusively. Skipping them on rank 0 frees
+    ! ~2x nxp*nzp*nm complex16 — decisive for >40GB capacity runs.
+    block
+      character(8) :: envval
+      integer :: envlen, envstat
+      call get_environment_variable('BL_POISSON_GATHER', envval, envlen, envstat)
+      use_gather_fallback = (envstat == 0 .and. envlen >= 1 .and. envval(1:1) == '1')
+    end block
+
     if (is_root()) write(*,*) 'initializing FFT...'
 
-    !------------- cuFFT plans (root only: the gathered P5.1 solve runs on
-    ! rank 0 at global size; nprocs = 1 is its own root) ----------------------
-    if (is_root()) call cufft_init_plans(nxp, nzp, nm)
+    !------------- cuFFT plans (full-size: only the single-rank solve and
+    ! the gather fallback need them) ------------------------------------------
+    if (is_root() .and. (nprocs == 1 .or. use_gather_fallback)) &
+       call cufft_init_plans(nxp, nzp, nm)
 
-    root_setup: if (is_root()) then
+    root_setup: if (is_root() .and. (nprocs == 1 .or. use_gather_fallback)) then
     ! Root only (or the single rank): full-size FFT work arrays + plans —
     ! used by the single-rank solve and the P5.1 gather fallback.
 
@@ -378,7 +391,7 @@ contains
     allocate ( thomas_du_d(nm) )
     dct_twiddle_d = dct_twiddle
     thomas_du_d   = thomas_du
-    if (is_root()) then
+    if (is_root() .and. (nprocs == 1 .or. use_gather_fallback)) then
        allocate ( thomas_dl_fact_d(mx+1, mz+1, nm) )
        allocate ( thomas_d_pivot_d(mx+1, mz+1, nm) )
        thomas_dl_fact_d = thomas_dl_fact
@@ -395,22 +408,20 @@ contains
     ! (local planes 2..ns+1 <-> global pack indices myid*ns+1 .. (myid+1)*ns);
     ! rank 0 additionally holds the gathered (nxp, ns, nm, nprocs) buffer.
     if (nprocs > 1) then
-       allocate ( divc_d(nxp, nslices_z, nm) )
-       divc_d = 0.0_dp
-       if (is_root()) then
-          allocate ( gath_d(nxp, nslices_z, nm, nprocs) )
-       else
-          allocate ( gath_d(1, 1, 1, 1) )   ! dummy (root-significant arg)
+       if (use_gather_fallback) then
+          allocate ( divc_d(nxp, nslices_z, nm) )
+          divc_d = 0.0_dp
+          if (is_root()) then
+             allocate ( gath_d(nxp, nslices_z, nm, nprocs) )
+          else
+             allocate ( gath_d(1, 1, 1, 1) )   ! dummy (root-significant arg)
+          end if
+          gath_d = 0.0_dp
        end if
-       gath_d = 0.0_dp
 
        !------------------ P5.2 distributed-solve state ----------------------
        block
-         character(8) :: envval
-         integer :: envlen, envstat
          integer(c_int) :: istat_p, n1p(1), ne1p(1)
-         call get_environment_variable('BL_POISSON_GATHER', envval, envlen, envstat)
-         use_gather_fallback = (envstat == 0 .and. envlen >= 1 .and. envval(1:1) == '1')
        if (.not. use_gather_fallback) then
          if (mod(nxp, nprocs) /= 0) then
             if (is_root()) write(*,*) 'ERROR: nxp =', nxp, &
