@@ -52,6 +52,11 @@ validation/
 |---|---|---|---|
 | openacc-ref (commit 0537a6c) | laminar 302x64x8 | 2.35 | 15.2 |
 | openacc-ref (commit 0537a6c) | bench 814x125x66 | 15.53 | 2.31 |
+| cuda-v1 (Phase 2 port) | laminar 302x64x8 | 1.13 | 7.3 |
+| cuda-v1 (Phase 2 port) | bench 814x125x66 | 15.55 | 2.32 |
+
+cuda-v1 vs openacc-ref: max relative field diff 4.5e-12 after 2000
+laminar steps; both builds bitwise run-to-run deterministic.
 
 (Laminar-grid timing is kernel-launch-latency dominated; the bench number is
 the one that predicts production performance.)
