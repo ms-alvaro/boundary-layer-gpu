@@ -63,7 +63,18 @@ optimizations so far (RHS fusion, Poisson pack fusions, save+advance
 fusion, device-resident mass-flux reduction) are bitwise-identical to
 cuda-v1 by construction and verified so by `compare --tol 1e-15`.
 Bench numbers vary +-0.3 ms run-to-run (GPU clocks); quote medians of
-several runs when comparing.
+several runs when comparing. NOTE: the bench case monitors every 50
+steps, which folds monitor/stats overhead into the interval clock; at
+production cadence (transition case, nmonitor=1000, same 814x125x66
+grid) cuda-v4 runs 10.0 ms/step vs 13.2 for the OpenACC reference
+(1.32x).
+
+## Transition-path validation (2026-07-30)
+
+The TS-mode temporal inflow path (unused by the laminar case) was
+validated head-to-head on transition_test (5000 steps, active
+temporal modes): max relative field diff 1.8e-14 (U), 2.4e-14 (V/W),
+identical Cf to all printed digits, max divergence ~1.4e-12 in both.
 
 (Laminar-grid timing is kernel-launch-latency dominated; the bench number is
 the one that predicts production performance.)
