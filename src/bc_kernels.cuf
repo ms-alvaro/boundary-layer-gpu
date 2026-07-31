@@ -103,6 +103,7 @@ module bc_kernels
   private
 
   public :: apply_bc
+  public :: sync_z_ghosts   ! z-ghost/periodic sync alone (post-restart fixup)
   public :: bc_finalize
 
   ! Thread-block shape for all 2-D plane kernels (design-doc convention).
@@ -623,32 +624,11 @@ contains
     call debug_check('bc_outflow_kernel(W)')
 
     !------------------------------------------------------------------
-    ! 4. Periodicity in z. nprocs = 1: local copies (reference lines
-    !    203-216; U, V z-centered = three ghost/image planes, W z-faced
-    !    = two). nprocs > 1 (P5.1): device-direct MPI — interior-neighbor
-    !    ghost update (legacy update_ghost_interior_planes) + periodic
-    !    wrap between rank 0 and the last rank (legacy apply_periodic_bc_z).
+    ! 4. Periodicity in z (sync_z_ghosts: local copies at nprocs = 1,
+    !    device-direct exchanges otherwise; also called by main after a
+    !    restart load, mirroring the legacy post-read fixup).
     !------------------------------------------------------------------
-    if (nprocs == 1) then
-       gridS = dim3(ceil_div(nx, BX), ceil_div(nyg, BY), 1)
-       call bc_periodic_z_centers_kernel<<<gridS, tBlock>>>(U_d, nx, nyg, nzg)
-       call debug_check('bc_periodic_z_centers_kernel(U)')
-
-       gridS = dim3(ceil_div(nxg, BX), ceil_div(ny, BY), 1)
-       call bc_periodic_z_centers_kernel<<<gridS, tBlock>>>(V_d, nxg, ny, nzg)
-       call debug_check('bc_periodic_z_centers_kernel(V)')
-
-       gridS = dim3(ceil_div(nxg, BX), ceil_div(nyg, BY), 1)
-       call bc_periodic_z_faces_kernel<<<gridS, tBlock>>>(W_d, nxg, nyg, nz)
-       call debug_check('bc_periodic_z_faces_kernel(W)')
-    else
-       call halo_exchange_z    (U_d, nx , nyg, nzg, 11)
-       call halo_exchange_z    (V_d, nxg, ny , nzg, 12)
-       call halo_exchange_z    (W_d, nxg, nyg, nz , 13)
-       call periodic_exchange_z(U_d, nx , nyg, nzg, STAG_CENTER, 21)
-       call periodic_exchange_z(V_d, nxg, ny , nzg, STAG_CENTER, 23)
-       call periodic_exchange_z(W_d, nxg, nyg, nz , STAG_FACE,   25)
-    end if
+    call sync_z_ghosts()
 
     !------------------------------------------------------------------
     ! 5. Top BC. top_flag = 4: zero-shear tangential (du/dy = dw/dy = 0,
@@ -767,5 +747,46 @@ contains
     call debug_check('bc_massflux_correct_kernel(U)')
 
   end subroutine apply_bc
+
+  !--------------------------------------------------------------------
+  ! sync_z_ghosts — z-ghost/periodic synchronization of U, V, W.
+  ! nprocs = 1: the reference's local periodic copies (lines 203-216;
+  ! U, V z-centered = three ghost/image planes, W z-faced = two).
+  ! nprocs > 1: interior-neighbor ghost update (legacy
+  ! update_ghost_interior_planes) + periodic wrap rank0 <-> last
+  ! (legacy apply_periodic_bc_z), device-direct.
+  ! Called from apply_bc every substep AND from the driver after a
+  ! restart load (legacy initialization.f90:244-246 'force periodicity
+  ! in z' — the snapshot format does not store the top ghost plane).
+  !--------------------------------------------------------------------
+  subroutine sync_z_ghosts()
+
+    type(dim3) :: tBlock, gridS
+    integer, parameter :: BX = 64, BY = 4
+
+    tBlock = dim3(BX, BY, 1)
+
+    if (nprocs == 1) then
+       gridS = dim3(ceil_div(nx, BX), ceil_div(nyg, BY), 1)
+       call bc_periodic_z_centers_kernel<<<gridS, tBlock>>>(U_d, nx, nyg, nzg)
+       call debug_check('bc_periodic_z_centers_kernel(U)')
+
+       gridS = dim3(ceil_div(nxg, BX), ceil_div(ny, BY), 1)
+       call bc_periodic_z_centers_kernel<<<gridS, tBlock>>>(V_d, nxg, ny, nzg)
+       call debug_check('bc_periodic_z_centers_kernel(V)')
+
+       gridS = dim3(ceil_div(nxg, BX), ceil_div(nyg, BY), 1)
+       call bc_periodic_z_faces_kernel<<<gridS, tBlock>>>(W_d, nxg, nyg, nz)
+       call debug_check('bc_periodic_z_faces_kernel(W)')
+    else
+       call halo_exchange_z    (U_d, nx , nyg, nzg, 11)
+       call halo_exchange_z    (V_d, nxg, ny , nzg, 12)
+       call halo_exchange_z    (W_d, nxg, nyg, nz , 13)
+       call periodic_exchange_z(U_d, nx , nyg, nzg, STAG_CENTER, 21)
+       call periodic_exchange_z(V_d, nxg, ny , nzg, STAG_CENTER, 23)
+       call periodic_exchange_z(W_d, nxg, nyg, nz , STAG_FACE,   25)
+    end if
+
+  end subroutine sync_z_ghosts
 
 end module bc_kernels

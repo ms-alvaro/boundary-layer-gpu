@@ -27,7 +27,7 @@ module hit_inflow_mod
 
   use iso_fortran_env, only: int64
   use precision_mod,   only: dp, ceil_div
-  use param_mod,       only: CFL, file_hit_planes, N_buffer_hit
+  use param_mod,       only: CFL, file_hit_planes, N_buffer_hit, nz_global
   use grid_mod,        only: ny, nz, nyg, nzg, y, yg, z, zg
   use ic_inflow_mod,   only: Ut_inlet_d, Vt_inlet_d, Wt_inlet_d
   use cudafor
@@ -98,10 +98,11 @@ contains
                     + 8_int64*int(ny_hit_f, int64) + 1_int64
 
     ! consistency checks
-    ! true spanwise period of the code: dz*(nz-2)
-    ! (z(1) and z(nz-1) are periodic images; z(nz) is a ghost)
-    if ( abs( Lz_box_hit - (z(2)-z(1))*real(nz-2, dp) ) > 1.0e-6_dp*Lz_box_hit ) then
-       write(*,*) 'ERROR: domain z-period=', (z(2)-z(1))*real(nz-2, dp), &
+    ! true spanwise period of the code: dz*(nz_global-2) — GLOBAL count
+    ! (z(1) and z(nz-1) are periodic images; z(nz) is a ghost; at nprocs > 1
+    ! the local nz is only this rank's slab)
+    if ( abs( Lz_box_hit - (z(2)-z(1))*real(nz_global-2, dp) ) > 1.0e-6_dp*Lz_box_hit ) then
+       write(*,*) 'ERROR: domain z-period=', (z(2)-z(1))*real(nz_global-2, dp), &
                   ' /= plane z-period=', Lz_box_hit
        write(*,*) 'Planes are z-periodic over Lz_box: set boxsize Lz accordingly'
        stop 'hit_file z-period mismatch'
