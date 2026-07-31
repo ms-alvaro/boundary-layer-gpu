@@ -442,9 +442,14 @@ contains
   !     integer,  intent(in) :: rk_step   ! RK substep index (1-based)
   !     real(dp), intent(in) :: dt        ! full-step time increment
   !
-  ! Sequence (order exactly as the reference):
-  !   1. rhs_p = div(u*) on centers            [compute_pseudo_pressure_rhs]
-  !      (NOT divided by dt: the dt is folded into the eigenvalue scaling)
+  ! Sequence (results exactly as the reference; Phase 3 fusion note below):
+  !   1. div(u*) at centers is computed IN-REGISTER inside the DCT pack
+  !      kernel of solve_poisson_gpu (k_div_pack) — the reference's separate
+  !      rhs_p = div(u*) sweep is fused away. rhs_p never holds the
+  !      divergence: no other kernel ever read it (all post-solve consumers
+  !      read only post-solve-written points), so results are bitwise
+  !      unchanged. (div NOT divided by dt: dt is folded into the
+  !      eigenvalue scaling.)
   !   2. spectral Poisson solve on the GPU     [solve_poisson_gpu]
   !   3. periodic-z fix-up of rhs_p            [apply_periodic_z_pressure]
   !      (update_ghost_interior_planes_pressure is a no-op at nprocs = 1)
@@ -456,8 +461,6 @@ contains
 
     integer,  intent(in) :: rk_step
     real(dp), intent(in) :: dt
-
-    call compute_pseudo_pressure_rhs()
 
     call solve_poisson_gpu()
 
@@ -472,29 +475,14 @@ contains
   end subroutine projection_step
 
   !----------------------------------------------------------------------------
-  ! compute_pseudo_pressure_rhs — rhs_p(i,j,k) = div(u*) at cell centers
-  ! (projection.f90:34-49), over i = 2..nxg-1, j = 2..nyg-1, k = 2..nzg-1.
-  !----------------------------------------------------------------------------
-  subroutine compute_pseudo_pressure_rhs()
-
-    type(dim3) :: tb, gr
-
-    tb = dim3(64, 4, 1)
-    gr = dim3( ceil_div(nxg-2, 64), ceil_div(nyg-2, 4), nzg-2 )
-    call k_pseudo_rhs<<<gr, tb>>>(rhs_p_d, U_d, V_d, W_d, x_d, y_d, z_d, &
-                                  nx, ny, nz, nxg, nyg, nzg)
-    call debug_check('k_pseudo_rhs')
-
-  end subroutine compute_pseudo_pressure_rhs
-
-  !----------------------------------------------------------------------------
   ! solve_poisson_gpu — spectral Poisson solve, all on the GPU
   ! (projection.f90:93-204). Sequence:
-  !   forward:  DCT-II symmetric pack -> 2D batched FFT -> twiddle extract
+  !   forward:  div(u*) + DCT-II symmetric pack (fused, k_div_pack)
+  !             -> 2D batched FFT -> twiddle extract
   !   solve:    batched Thomas solve in y (pre-factorized LU per (i,k) mode)
   !   inverse:  z-IFFT (makes data real in z-physical space) ->
-  !             zero/untwiddle/Hermitian-extension pack -> x-IFFT ->
-  !             extract with 1/(2*nxp*nzp) normalization
+  !             fused untwiddle/Hermitian/Nyquist-zero pack (k_untwiddle_herm)
+  !             -> x-IFFT -> extract with 1/(2*nxp*nzp) normalization
   !----------------------------------------------------------------------------
   subroutine solve_poisson_gpu()
 
@@ -505,13 +493,14 @@ contains
     fft_norm = 1.0_dp / real(2*nxp*nzp, dp)
     tb = dim3(64, 4, 1)
 
-    ! ======== FORWARD: symmetric pack -> 2D FFT -> twiddle extract ========
+    ! ======== FORWARD: div + symmetric pack -> 2D FFT -> twiddle extract ====
 
-    ! Pack DCT-II symmetric extension: g[0..N-1]=f, g[2N-1..N]=f[0..N-1]
+    ! div(u*) at the cell center (projection.f90:34-49, in-register) packed
+    ! directly as the DCT-II even extension: g[0..N-1]=f, g[2N-1..N]=f
     gr = dim3( ceil_div(nxp, 64), ceil_div(nzp, 4), nm )
-    call k_pack_dct<<<gr, tb>>>(plane_d, rhs_p_d, nx2, nxp, nzp, nm, &
-                                nxg, nyg, nzg)
-    call debug_check('k_pack_dct')
+    call k_div_pack<<<gr, tb>>>(plane_d, U_d, V_d, W_d, x_d, y_d, z_d, &
+                                nx2, nxp, nzp, nm, nx, ny, nz, nxg, nyg, nzg)
+    call debug_check('k_div_pack')
 
     ! 2D batched forward FFT (2*nxp x nzp, nm batches)
     istat = cufftExecZ2Z(cufft_plan_2d, plane_d, plane_d, CUFFT_FORWARD)
@@ -537,21 +526,15 @@ contains
     call debug_check_cufft('cufftExecZ2Z(plan_zi inv)', istat)
 
     ! Step 2: un-twiddle + Hermitian extend into plane_d for x-IFFT
-    ! Data is now real in z-physical, so Hermitian in x is valid
+    ! (data is now real in z-physical, so the x-spectrum is Hermitian).
+    ! Fused single pass over the full plane: each element written exactly
+    ! once (mode, conjugate mirror, or the zero Nyquist column nxp+1) —
+    ! replaces the reference's zero-fill + two overwrite sweeps bitwise-
+    ! identically while removing ~2 full passes over the work array.
     gr = dim3( ceil_div(nx2, 64), ceil_div(nzp, 4), nm )
-    call k_zero_plane<<<gr, tb>>>(plane_d, nx2, nzp, nm)
-    call debug_check('k_zero_plane')
-
-    ! First nxp modes with inverse twiddle
-    gr = dim3( ceil_div(nxp, 64), ceil_div(nzp, 4), nm )
-    call k_untwiddle<<<gr, tb>>>(plane_d, rhs_hat_d, dct_twiddle_d, &
-                                 nxp, nx2, nzp, nm, mx+1, mz+1)
-    call debug_check('k_untwiddle')
-
-    ! Hermitian extension: plane(2N+2-ii) = conj(plane(ii)) for ii=2..nxp
-    gr = dim3( ceil_div(nxp-1, 64), ceil_div(nzp, 4), nm )
-    call k_hermitian_ext<<<gr, tb>>>(plane_d, nxp, nx2, nzp, nm)
-    call debug_check('k_hermitian_ext')
+    call k_untwiddle_herm<<<gr, tb>>>(plane_d, rhs_hat_d, dct_twiddle_d, &
+                                      nxp, nx2, nzp, nm, mx+1, mz+1)
+    call debug_check('k_untwiddle_herm')
 
     ! Step 3: x-IFFT (1D, batched over nzp*nm)
     istat = cufftExecZ2Z(cufft_plan_xi, plane_d, plane_d, CUFFT_INVERSE)
@@ -737,49 +720,48 @@ contains
   !   rhs_p(i,j,k) = du/dx + dv/dy + dw/dz
   ! over i = 2..nxg-1, j = 2..nyg-1, k = 2..nzg-1 (NOT divided by dt).
   !----------------------------------------------------------------------------
-  attributes(global) subroutine k_pseudo_rhs(rhs_p, U, V, W, x, y, z, &
-                                             nx, ny, nz, nxg, nyg, nzg)
-    integer, value :: nx, ny, nz, nxg, nyg, nzg
-    real(dp), intent(inout) :: rhs_p(2:nxg-1, 2:nyg-1, 2:nzg)
-    real(dp), intent(in)  :: U(nx, nyg, nzg), V(nxg, ny, nzg), W(nxg, nyg, nz)
-    real(dp), intent(in)  :: x(nx), y(ny), z(nz)
-    integer :: i, j, k
-
-    i = 2 + (blockIdx%x-1)*blockDim%x + threadIdx%x - 1
-    j = 2 + (blockIdx%y-1)*blockDim%y + threadIdx%y - 1
-    k = 2 + blockIdx%z - 1
-    if (i > nxg-1 .or. j > nyg-1 .or. k > nzg-1) return
-
-    rhs_p(i,j,k)  = ( U(i,j,k) - U(i-1,j,k) )/( x(i)-x(i-1) ) + &
-                    ( V(i,j,k) - V(i,j-1,k) )/( y(j)-y(j-1) ) + &
-                    ( W(i,j,k) - W(i,j,k-1) )/( z(k)-z(k-1) )
-
-  end subroutine k_pseudo_rhs
-
-  !----------------------------------------------------------------------------
-  ! k_pack_dct — DCT-II symmetric-extension pack (projection.f90:111-119):
-  ! for each y-plane batch b, the real RHS row f[0..N-1] (N = nxp) is placed
-  ! as a complex even extension g[0..N-1] = f, g[2N-1..N] = f[0..N-1], so a
+  ! k_div_pack — FUSED divergence + DCT-II symmetric-extension pack
+  ! (projection.f90:34-49 and 111-119). For pack thread (ii, k, b) the
+  ! divergence of u* at cell center (i, j, kk) = (ii+1, b+1, k+1) is computed
+  ! in-register with the reference expression and placed directly as the
+  ! complex even extension g[0..N-1] = f, g[2N-1..N] = f (N = nxp), so a
   ! single complex FFT of length 2N yields the DCT-II after twiddling.
-  ! Note the (j <-> k) transposition: batch b is the y-plane, rhs_p is
-  ! indexed (ii+1, b+1, k+1).
+  ! Note the (j <-> k) transposition: batch b is the y-plane.
+  !
+  ! Exactness: identical expression, identical operands — the reference
+  ! merely stored the same double in rhs_p and re-loaded it here. rhs_p is
+  ! NOT written (nothing ever read the divergence from it: the solve
+  ! overwrites it and all later consumers read post-solve values only).
+  ! The divergence values the reference computed at i = nxg-1 or k = nzg-1
+  ! were never read by any kernel and are simply not computed.
   !----------------------------------------------------------------------------
-  attributes(global) subroutine k_pack_dct(plane, rhs_p, nx2, nxp, nzp, nm, &
+  attributes(global) subroutine k_div_pack(plane, U, V, W, x, y, z, &
+                                           nx2, nxp, nzp, nm, nx, ny, nz, &
                                            nxg, nyg, nzg)
-    integer, value :: nx2, nxp, nzp, nm, nxg, nyg, nzg
+    integer, value :: nx2, nxp, nzp, nm, nx, ny, nz, nxg, nyg, nzg
     complex(dp), intent(inout) :: plane(nx2, nzp, nm)
-    real(dp),    intent(in)    :: rhs_p(2:nxg-1, 2:nyg-1, 2:nzg)
-    integer :: ii, k, b
+    real(dp), intent(in) :: U(nx, nyg, nzg), V(nxg, ny, nzg), W(nxg, nyg, nz)
+    real(dp), intent(in) :: x(nx), y(ny), z(nz)
+    integer  :: ii, k, b, i, j, kk
+    real(dp) :: div
 
     ii = 1 + (blockIdx%x-1)*blockDim%x + threadIdx%x - 1
     k  = 1 + (blockIdx%y-1)*blockDim%y + threadIdx%y - 1
     b  = 1 + blockIdx%z - 1
     if (ii > nxp .or. k > nzp .or. b > nm) return
 
-    plane(ii,         k, b) = cmplx( rhs_p(ii+1, b+1, k+1), 0.0_dp, dp )
-    plane(nx2+1-ii,   k, b) = cmplx( rhs_p(ii+1, b+1, k+1), 0.0_dp, dp )
+    i  = ii + 1
+    j  = b  + 1
+    kk = k  + 1
 
-  end subroutine k_pack_dct
+    div = ( U(i,j,kk) - U(i-1,j,kk) )/( x(i)-x(i-1) ) + &
+          ( V(i,j,kk) - V(i,j-1,kk) )/( y(j)-y(j-1) ) + &
+          ( W(i,j,kk) - W(i,j,kk-1) )/( z(kk)-z(kk-1) )
+
+    plane(ii,       k, b) = cmplx( div, 0.0_dp, dp )
+    plane(nx2+1-ii, k, b) = cmplx( div, 0.0_dp, dp )
+
+  end subroutine k_div_pack
 
   !----------------------------------------------------------------------------
   ! k_twiddle_extract — extract DCT-II modes from the 2D FFT result
@@ -839,68 +821,43 @@ contains
   end subroutine k_thomas
 
   !----------------------------------------------------------------------------
-  ! k_zero_plane — zero the full complex plane before the inverse-x pack
-  ! (projection.f90:162-169); modes not written by the untwiddle/Hermitian
-  ! kernels (column nxp+1) must be zero.
+  ! k_untwiddle_herm — FUSED inverse-x pack (projection.f90:162-187: the
+  ! zero-fill, the un-twiddle of the first nxp modes, and the Hermitian
+  ! extension) in a single pass writing every element of the plane exactly
+  ! once:
+  !   ii <= nxp   : plane(ii) = rhs_hat(ii, b, k) * conjg(tw(ii-1))
+  !   ii == nxp+1 : plane(ii) = 0                  (Nyquist column — the only
+  !                                                 slot the reference's
+  !                                                 zero-fill left standing)
+  !   ii >= nxp+2 : plane(ii) = conjg( rhs_hat(jj) * conjg(tw(jj-1)) ),
+  !                 jj = nx2+2-ii in 2..nxp        (Hermitian mirror)
+  ! Exactness: the mirror conjugates the identically-computed product —
+  ! the same value the reference conjugated from memory. Data is real in
+  ! z-physical space after the z-IFFT, so the x-spectrum is Hermitian.
   !----------------------------------------------------------------------------
-  attributes(global) subroutine k_zero_plane(plane, nx2, nzp, nm)
-    integer, value :: nx2, nzp, nm
-    complex(dp), intent(out) :: plane(nx2, nzp, nm)
-    integer :: ii, k, b
+  attributes(global) subroutine k_untwiddle_herm(plane, rhs_hat, tw, &
+                                                 nxp, nx2, nzp, nm, mxp1, mzp1)
+    integer, value :: nxp, nx2, nzp, nm, mxp1, mzp1
+    complex(dp), intent(inout) :: plane(nx2, nzp, nm)
+    complex(dp), intent(in)    :: rhs_hat(mxp1, nm, mzp1)
+    complex(dp), intent(in)    :: tw(0:mxp1-1)
+    integer :: ii, k, b, jj
 
     ii = 1 + (blockIdx%x-1)*blockDim%x + threadIdx%x - 1
     k  = 1 + (blockIdx%y-1)*blockDim%y + threadIdx%y - 1
     b  = 1 + blockIdx%z - 1
     if (ii > nx2 .or. k > nzp .or. b > nm) return
 
-    plane(ii, k, b) = (0.0_dp, 0.0_dp)
+    if (ii <= nxp) then
+       plane(ii, k, b) = rhs_hat(ii, b, k) * conjg(tw(ii-1))
+    else if (ii == nxp+1) then
+       plane(ii, k, b) = (0.0_dp, 0.0_dp)
+    else
+       jj = nx2 + 2 - ii
+       plane(ii, k, b) = conjg( rhs_hat(jj, b, k) * conjg(tw(jj-1)) )
+    end if
 
-  end subroutine k_zero_plane
-
-  !----------------------------------------------------------------------------
-  ! k_untwiddle — place the first nxp solved modes with the inverse (conjugate)
-  ! DCT-II twiddle (projection.f90:171-178):
-  !   plane(ii, k, b) = rhs_hat(ii, b, k) * conjg(dct_twiddle(ii-1))
-  ! (the data is real in z-physical space after the z-IFFT, so the x-spectrum
-  ! is Hermitian and the extension in k_hermitian_ext is valid).
-  !----------------------------------------------------------------------------
-  attributes(global) subroutine k_untwiddle(plane, rhs_hat, tw, &
-                                            nxp, nx2, nzp, nm, mxp1, mzp1)
-    integer, value :: nxp, nx2, nzp, nm, mxp1, mzp1
-    complex(dp), intent(inout) :: plane(nx2, nzp, nm)
-    complex(dp), intent(in)    :: rhs_hat(mxp1, nm, mzp1)
-    complex(dp), intent(in)    :: tw(0:mxp1-1)
-    integer :: ii, k, b
-
-    ii = 1 + (blockIdx%x-1)*blockDim%x + threadIdx%x - 1
-    k  = 1 + (blockIdx%y-1)*blockDim%y + threadIdx%y - 1
-    b  = 1 + blockIdx%z - 1
-    if (ii > nxp .or. k > nzp .or. b > nm) return
-
-    plane(ii, k, b) = rhs_hat(ii, b, k) * conjg(tw(ii-1))
-
-  end subroutine k_untwiddle
-
-  !----------------------------------------------------------------------------
-  ! k_hermitian_ext — Hermitian extension of the x-spectrum
-  ! (projection.f90:180-187):
-  !   plane(2N+2-ii, k, b) = conjg(plane(ii, k, b))  for ii = 2..nxp
-  ! Separate launch after k_untwiddle (read-after-write across kernels, no
-  ! intra-kernel hazard), exactly as the reference's separate acc loops.
-  !----------------------------------------------------------------------------
-  attributes(global) subroutine k_hermitian_ext(plane, nxp, nx2, nzp, nm)
-    integer, value :: nxp, nx2, nzp, nm
-    complex(dp), intent(inout) :: plane(nx2, nzp, nm)
-    integer :: ii, k, b
-
-    ii = 2 + (blockIdx%x-1)*blockDim%x + threadIdx%x - 1
-    k  = 1 + (blockIdx%y-1)*blockDim%y + threadIdx%y - 1
-    b  = 1 + blockIdx%z - 1
-    if (ii > nxp .or. k > nzp .or. b > nm) return
-
-    plane(nx2+2-ii, k, b) = conjg(plane(ii, k, b))
-
-  end subroutine k_hermitian_ext
+  end subroutine k_untwiddle_herm
 
   !----------------------------------------------------------------------------
   ! k_extract_out — extract the physical-space solution with the FFT
