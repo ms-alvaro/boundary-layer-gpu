@@ -38,7 +38,7 @@ REPO = os.path.dirname(HERE)
 RUNS = os.path.join(HERE, 'runs')
 
 # Golden values from the validated OpenACC baseline (A100, nvhpc 24.3,
-# laminar_test/laminar.turbb, 2000 steps). Physics tolerances are loose enough
+# cases/laminar/laminar.turbb, 2000 steps). Physics tolerances are loose enough
 # to accept floating-point reordering from kernel rewrites, tight enough to
 # catch real bugs.
 GOLDEN = {
@@ -269,7 +269,7 @@ def timing_summary(mon, ncells, steps_per_interval):
 # Subcommands
 # ----------------------------------------------------------------------------
 def cmd_laminar(args):
-    case = os.path.join(REPO, 'laminar_test')
+    case = os.path.join(REPO, 'cases', 'laminar')
     rundir = os.path.join(RUNS, args.label, 'laminar')
     files = [os.path.join(case, f)
              for f in ('laminar.turbb', 'blasius_solution.dat')]
@@ -297,7 +297,7 @@ def cmd_bench(args):
     case = os.path.join(HERE, 'cases')
     rundir = os.path.join(RUNS, args.label, 'bench')
     files = [os.path.join(case, 'bench_dns.turbb'),
-             os.path.join(REPO, 'laminar_test', 'blasius_solution.dat')]
+             os.path.join(REPO, 'cases', 'laminar', 'blasius_solution.dat')]
     run_case(args.exe, files, 'bench_dns.turbb', rundir,
              nsteps=args.nsteps, gpu=args.gpu)
     mon = parse_monitor_log(os.path.join(rundir, 'run.log'))
