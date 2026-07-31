@@ -80,6 +80,17 @@ production cadence (transition case, nmonitor=1000, same 814x125x66
 grid) cuda-v4 runs 10.0 ms/step vs 13.2 for the OpenACC reference
 (1.32x).
 
+## Full transition physics validation (2026-07-31)
+
+Complete 500k-step transition runs (transition_test, 10 flow-throughs)
+on both builds: transition-onset location (x where Cf > 1.5 Cf_lam)
+IDENTICAL to 4 decimals at every 5000-step checkpoint over 20 time
+units, including every phase oscillation of the TS-driven onset;
+Cf(x) curves overlay through transition and turbulence. Instantaneous
+turbulent Cf decorrelates progressively (5.6e-6 at t=3.4 to ~5% RMS at
+t=19.4) exactly as chaotic dynamics requires. Timing over the full run:
+CUDA 10.3 ms/step vs legacy 13.7 (1.33x).
+
 ## Transition-path validation (2026-07-30)
 
 The TS-mode temporal inflow path (unused by the laminar case) was
