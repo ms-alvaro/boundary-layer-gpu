@@ -34,6 +34,7 @@
 module grid_mod
 
   use precision_mod, only: dp
+  use mpi_mod,       only: myid, nprocs
   use param_mod,     only: nx_global, ny_global, nz_global, file_ygrid, &
                            Lx_rand, Ly_rand, Lz_rand, alpha_rand
   use cudafor
@@ -49,6 +50,14 @@ module grid_mod
   integer, public :: nxg, nyg, nzg   ! centers + 2 ghosts   (n*g = n*m + 2)
 
   !--------------------------- host grid arrays ------------------------------
+  ! z-slab decomposition (P5.1; legacy initialization.f90:52-110 bookkeeping):
+  ! rank r owns global face planes k1..k2 and center(+ghost) planes kg1..kg2;
+  ! neighboring slabs overlap by two index planes by construction. nprocs = 1
+  ! collapses to k1 = 1, k2 = nz_global (identity).
+  integer, public :: nslices_z = 0
+  integer, public :: k1 = 1, k2 = 0, kg1 = 1, kg2 = 0
+  real(dp), allocatable, public :: z_global(:), zm_global(:)  ! for IO/Poisson
+
   real(dp), allocatable, public :: x(:),  y(:),  z(:)    ! faces
   real(dp), allocatable, public :: xm(:), ym(:), zm(:)   ! centers
   real(dp), allocatable, public :: xg(:), yg(:), zg(:)   ! centers + ghosts
@@ -103,17 +112,32 @@ contains
     ! face points (initialization.f90:84-86; nprocs=1 -> nz = nz_global)
     nx = nx_global
     ny = ny_global
-    nz = nz_global
 
-    ! center points (initialization.f90:93-95; nprocs=1 -> nzm = nz_global-1)
+    ! ---- z-slab decomposition (identity at nprocs = 1) ----
+    nslices_z = (nz_global - 2)/nprocs
+    if (nslices_z < 1) stop 'Error: nslices_z must be at least 1'
+    k1  = myid*nslices_z + 1
+    k2  = k1 + nslices_z + 1
+    kg1 = myid*nslices_z + 1
+    kg2 = kg1 + nslices_z + 1
+    if (myid == nprocs-1) then
+       k2  = nz_global
+       kg2 = nz_global + 1
+    end if
+    nz = k2 - k1 + 1
+
+    ! center points (initialization.f90:93-99). In z the counts come from
+    ! the center-slab bookkeeping: nzm = kg2-kg1-1, nzg = kg2-kg1+1 — for
+    ! interior ranks nzg = nz (NOT nz+1); the last rank (and nprocs = 1)
+    ! carries one extra center-ghost plane (nzg = nz+1).
     nxm = nx - 1
     nym = ny - 1
-    nzm = nz - 1
+    nzm = kg2 - kg1 + 1 - 2
 
-    ! centers + ghost cells (initialization.f90:102-104)
+    ! centers + ghost cells (initialization.f90:102-108)
     nxg = nxm + 2
     nyg = nym + 2
-    nzg = nzm + 2
+    nzg = kg2 - kg1 + 1
 
     !----------------------------- allocation ---------------------------------
     ! (initialization.f90:118-124, 482)
@@ -132,11 +156,18 @@ contains
     x = x - x(1)
     x = 1.0_dp + x/maxval(x)*Lx_rand
 
-    ! zmesh (uniform; last face duplicates the periodic image)
-    do k = 1, nz
-       z(k) = real(k-1, dp)
+    ! zmesh (uniform; last face duplicates the periodic image). Built
+    ! GLOBALLY, then sliced to this rank's slab (legacy generates global
+    ! grids in init_flow and slices in initialization.f90).
+    allocate ( z_global(nz_global), zm_global(nz_global-1) )
+    do k = 1, nz_global
+       z_global(k) = real(k-1, dp)
     end do
-    z = z/z(nz-1)*Lz_rand
+    z_global = z_global/z_global(nz_global-1)*Lz_rand
+    do k = 1, nz_global-1
+       zm_global(k) = 0.5_dp*( z_global(k) + z_global(k+1) )
+    end do
+    z = z_global(k1:k2)
 
     ! ymesh: either read from a file ('ygrid_file', e.g. a blended-sinh grid
     ! for HIT freestream resolution, inflow_flag=6 campaigns) or generated as
@@ -166,8 +197,11 @@ contains
     do j = 1, nym
        ym(j) = 0.5_dp*( y(j) + y(j+1) )
     end do
+    ! local z-centers are a SLICE of the global centers: local center m
+    ! corresponds to global center kg1+m-1 (matches the field-plane mapping
+    ! local plane p <-> global center plane kg1+p-1).
     do k = 1, nzm
-       zm(k) = 0.5_dp*( z(k) + z(k+1) )
+       zm(k) = zm_global(kg1 + k - 1)
     end do
 
     !--------------- ghost-extended grids (initialization.f90:197-211) --------
@@ -181,9 +215,25 @@ contains
     yg(1)       = ym(1)   - 2.0_dp*( ym(1) - y(1)  )
     yg(nym+2)   = ym(nym) + 2.0_dp*( y(ny) - ym(nym) )
 
-    zg(2:nzm+1) = zm
-    zg(1)       = zm(1)   - 2.0_dp*( zm(1) - z(1)  )
-    zg(nzm+2)   = zm(nzm) + 2.0_dp*( z(nz) - zm(nzm) )
+    ! zg: local center+ghost planes are the global center grid evaluated at
+    ! global indices kg1-1 .. kg1+nzg-2 shifted by the ghost convention. At
+    ! the global ends the reference ghost extrapolation applies; interior
+    ! slab edges take the neighboring GLOBAL center directly (identical for
+    ! the uniform z of this solver, and consistent across ranks).
+    do k = 1, nzg
+       block
+         integer :: gc
+         gc = kg1 + k - 2      ! global center index for local zg slot k
+         if (gc >= 1 .and. gc <= nz_global-1) then
+            zg(k) = zm_global(gc)
+         else if (gc < 1) then
+            zg(k) = zm_global(1) - 2.0_dp*( zm_global(1) - z_global(1) )
+         else
+            zg(k) = zm_global(nz_global-1) &
+                  + 2.0_dp*( z_global(nz_global) - zm_global(nz_global-1) )
+         end if
+       end block
+    end do
 
     !------------- yg midpoint hierarchies (initialization.f90:214-217) -------
     ! middle points for yg (.not. equal to y in general)
@@ -196,11 +246,12 @@ contains
     dxmin = minval ( xg(2:nxg) - xg(1:nxg-1) )
     dymin = minval ( yg(2:nyg) - yg(1:nyg-1) )
     dzmin = minval ( zg(2:nzg) - zg(1:nzg-1) )
+    ! (uniform z: local and global minima coincide on every rank)
 
     !------------------ total domain size (initialization.f90:225-227) --------
     Lx = x(nx) - x(1)
     Ly = y(ny) - y(1)
-    Lz = z(nz) - z(1)
+    Lz = z_global(nz_global) - z_global(1)
 
     !------- Fourier constant grid spacings (initialization.f90:254-255) ------
     dx = dxmin

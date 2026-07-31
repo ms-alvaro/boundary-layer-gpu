@@ -60,8 +60,14 @@ slow large-prime path).
 
 ```bash
 cd src && make          # -> ./boundary_layer_cuda at the repo root
-./boundary_layer_cuda -i laminar_test/laminar.turbb   # no mpirun needed
+mpirun -np 1 ./boundary_layer_cuda -i laminar_test/laminar.turbb
+# multi-GPU (P5.1, experimental): correctness-validated, but slower than
+# one rank until the distributed Poisson (P5.2) lands — see docs:
+CUDA_VISIBLE_DEVICES=0,1 mpirun -np 2 ./boundary_layer_cuda -i case.turbb
 ```
+
+(Launch through `mpirun` from the NVHPC `comm_libs` — OpenMPI singleton
+mode does not work in this environment.)
 
 `make DEBUG=1` builds -O0 with bounds checks and per-kernel launch-error
 checking.

@@ -56,10 +56,14 @@ module poisson_mod
   use cudafor
   use precision_mod, only: dp, pi, ceil_div
   use grid_mod,      only: nx, ny, nz, nxm, nzm, nxg, nyg, nzg,         &
+                           nslices_z, kg1,                               &
                            y, yg, dx, dz,                               &
                            x_d, y_d, z_d, xg_d, yg_d, zg_d
   use field_mod,     only: U_d, V_d, W_d, P_d, rhs_p_d
   use reductions,    only: device_max_abs3
+  use mpi_mod,       only: nprocs, myid, is_root, gather_dev, scatter_dev, &
+                           pressure_exchange_z, allreduce_max
+  use param_mod,     only: nz_global
 
   implicit none
   private
@@ -106,6 +110,10 @@ module poisson_mod
   ! divergence scratch: div(i,j,k) on centers, interior i = 2..nxg-2 as in
   ! the reference check (projection.f90:400-408); reduced by device_max_abs3.
   real(dp), device, allocatable :: div_d(:,:,:)
+
+  ! P5.1 gathered-Poisson work buffers (see poisson_init)
+  real(dp), device, allocatable :: divc_d(:,:,:)     ! (nxp, ns, nm) all ranks
+  real(dp), device, allocatable :: gath_d(:,:,:,:)   ! (nxp, ns, nm, P) root
 
 
   ! cuFFT plan handles (cufft_solver.f90)
@@ -190,7 +198,9 @@ contains
     ! nxp = nxp_global = nxm_global-1, nzp = local rows of the FFTW
     ! decomposition = nzp_global = nzm_global-1.
     nxp = nxm - 1
-    nzp = nzm - 1
+    ! GLOBAL z pack size (nprocs = 1: identical to the old nzm-1). The
+    ! gathered P5.1 solve runs entirely on rank 0 at global size.
+    nzp = nz_global - 2
     ! global indices for fourier modes starting from 0
     mx  = nxp - 1
     mz  = nzp - 1
@@ -205,10 +215,16 @@ contains
     if ( nxp < 1 .or. nzp < 1 .or. nm < 1 ) &
        stop ' ERROR: poisson_init called with invalid grid sizes'
 
-    write(*,*) 'initializing FFT...'
+    if (is_root()) write(*,*) 'initializing FFT...'
 
-    !------------- cuFFT plans (cufft_solver.f90:cufft_init_plans) ------------
-    call cufft_init_plans(nxp, nzp, nm)
+    !------------- cuFFT plans (root only: the gathered P5.1 solve runs on
+    ! rank 0 at global size; nprocs = 1 is its own root) ----------------------
+    if (is_root()) call cufft_init_plans(nxp, nzp, nm)
+
+    root_setup: if (is_root()) then
+    ! Everything inside this block exists only on rank 0 (or the single
+    ! rank): FFT work arrays, twiddles, operators, Thomas factors. Other
+    ! ranks only feed/receive the compact divergence/solution chunks.
 
     !------------- device work arrays (initialization.f90:314-315; the
     ! half-length pipeline needs only an nxp-long complex line per batch) ----
@@ -342,10 +358,27 @@ contains
     thomas_d_pivot_d = thomas_d_pivot
     thomas_du_d      = thomas_du
 
+    end if root_setup
+
     !--------------------------- divergence scratch ---------------------------
     ! interior-center divergence, i = 2..nxg-2 as in the reference check
     allocate ( div_d(2:nxg-2, 2:nyg-1, 2:nzg-1) )
     div_d = 0.0_dp
+
+    !----------------- P5.1 multi-rank gather buffers -------------------------
+    ! Every rank owns the compact chunk of ns = nslices_z z-center planes
+    ! (local planes 2..ns+1 <-> global pack indices myid*ns+1 .. (myid+1)*ns);
+    ! rank 0 additionally holds the gathered (nxp, ns, nm, nprocs) buffer.
+    if (nprocs > 1) then
+       allocate ( divc_d(nxp, nslices_z, nm) )
+       divc_d = 0.0_dp
+       if (is_root()) then
+          allocate ( gath_d(nxp, nslices_z, nm, nprocs) )
+       else
+          allocate ( gath_d(1, 1, 1, 1) )   ! dummy (root-significant arg)
+       end if
+       gath_d = 0.0_dp
+    end if
 
   end subroutine poisson_init
 
@@ -448,7 +481,11 @@ contains
     integer,  intent(in) :: rk_step
     real(dp), intent(in) :: dt
 
-    call solve_poisson_gpu()
+    if (nprocs == 1) then
+       call solve_poisson_gpu()
+    else
+       call solve_poisson_gathered()
+    end if
 
     ! periodic boundary conditions in z
     call apply_periodic_z_pressure()
@@ -538,6 +575,84 @@ contains
   end subroutine solve_poisson_gpu
 
   !----------------------------------------------------------------------------
+  ! solve_poisson_gathered — P5.1 multi-rank Poisson: every rank computes the
+  ! divergence on its ns owned z-center planes into a compact chunk; the
+  ! chunks are gathered to rank 0, which runs the identical single-GPU
+  ! half-length-DCT solve at GLOBAL size; the solution chunks are scattered
+  ! back and unpacked into each rank's local rhs_p interior. Per-point
+  ! arithmetic is identical to the single-rank solve (same kernels on rank 0);
+  ! only the divergence's storage location differs. The pressure ghost planes
+  ! are then filled by apply_periodic_z_pressure's exchange path.
+  !----------------------------------------------------------------------------
+  subroutine solve_poisson_gathered()
+
+    type(dim3)     :: tb, gr
+    integer(c_int) :: istat
+    real(dp)       :: fft_norm
+
+    tb = dim3(64, 4, 1)
+
+    ! 1. local divergence chunk (physical x order; owned planes 2..ns+1)
+    gr = dim3( ceil_div(nxp, 64), ceil_div(nslices_z, 4), nm )
+    call k_div_compact<<<gr, tb>>>(divc_d, U_d, V_d, W_d, x_d, y_d, z_d, &
+                                   nxp, nslices_z, nm, nx, ny, nz, nxg, nyg, nzg)
+    call debug_check('k_div_compact')
+
+    ! 2. gather all chunks to rank 0 (device-direct)
+    call gather_dev(divc_d, nxp*nslices_z*nm, gath_d)
+
+    ! 3. rank 0: identical solve at global size
+    if (is_root()) then
+       fft_norm = 1.0_dp / real(nxp*nzp, dp)
+
+       gr = dim3( ceil_div(nxp, 64), ceil_div(nzp, 4), nm )
+       call k_pack_from_gather<<<gr, tb>>>(plane_d, gath_d, nxp, nzp, nm, &
+                                           nslices_z)
+       call debug_check('k_pack_from_gather')
+
+       istat = cufftExecZ2Z(cufft_plan_x, plane_d, plane_d, CUFFT_FORWARD)
+       call debug_check_cufft('cufftExecZ2Z(plan_x fwd)', istat)
+
+       gr = dim3( ceil_div(mx+1, 64), ceil_div(mz+1, 4), nm )
+       call k_extract_dct<<<gr, tb>>>(rhs_hat_d, plane_d, dct_twiddle_d, &
+                                      mx+1, mz+1, nm, nxp, nzp)
+       call debug_check('k_extract_dct')
+
+       istat = cufftExecZ2Z(cufft_plan_z, rhs_hat_d, rhs_hat_d, CUFFT_FORWARD)
+       call debug_check_cufft('cufftExecZ2Z(plan_z fwd)', istat)
+
+       gr = dim3( ceil_div(mx+1, 64), ceil_div(mz+1, 4), 1 )
+       call k_thomas<<<gr, tb>>>(rhs_hat_d, thomas_dl_fact_d, thomas_d_pivot_d, &
+                                 thomas_du_d, mx+1, mz+1, nm)
+       call debug_check('k_thomas')
+
+       istat = cufftExecZ2Z(cufft_plan_z, rhs_hat_d, rhs_hat_d, CUFFT_INVERSE)
+       call debug_check_cufft('cufftExecZ2Z(plan_z inv)', istat)
+
+       gr = dim3( ceil_div(nxp, 64), ceil_div(nzp, 4), nm )
+       call k_build_vprime<<<gr, tb>>>(plane_d, rhs_hat_d, dct_twiddle_d, &
+                                       nxp, nzp, nm, mx+1, mz+1)
+       call debug_check('k_build_vprime')
+
+       istat = cufftExecZ2Z(cufft_plan_x, plane_d, plane_d, CUFFT_INVERSE)
+       call debug_check_cufft('cufftExecZ2Z(plan_x inv)', istat)
+
+       call k_extract_compact<<<gr, tb>>>(gath_d, plane_d, fft_norm, &
+                                          nxp, nzp, nm, nslices_z)
+       call debug_check('k_extract_compact')
+    end if
+
+    ! 4. scatter solution chunks; 5. unpack into local rhs_p interior
+    call scatter_dev(gath_d, nxp*nslices_z*nm, divc_d)
+
+    gr = dim3( ceil_div(nxp, 64), ceil_div(nslices_z, 4), nm )
+    call k_unpack_phi<<<gr, tb>>>(rhs_p_d, divc_d, nxp, nslices_z, nm, &
+                                  nxg, nyg, nzg)
+    call debug_check('k_unpack_phi')
+
+  end subroutine solve_poisson_gathered
+
+  !----------------------------------------------------------------------------
   ! apply_periodic_z_pressure — periodic fix-up of the solved rhs_p
   ! (projection.f90:293-318, nprocs = 1 path):
   !   rhs_p(nxg-1, :, :)       = rhs_p(nxg-2, :, :)   (duplicate last column)
@@ -556,13 +671,19 @@ contains
     call k_periodic_x_copy<<<gr, tb>>>(rhs_p_d, nxg, nyg, nzg)
     call debug_check('k_periodic_x_copy')
 
-    ! rhs_p( 2:nxg-1, :, nzp+1+1 ) = rhs_p( 2:nxg-1, :, 2 )
-    kz = nzp + 1 + 1
-    gr = dim3( ceil_div(nxg-2, 64), ceil_div(nyg-2, 4), 1 )
-    call k_periodic_z_copy<<<gr, tb>>>(rhs_p_d, kz, nxg, nyg, nzg)
-    call debug_check('k_periodic_z_copy')
-
-    ! update_ghost_interior_planes_pressure: no-op for nprocs = 1 (dropped)
+    if (nprocs == 1) then
+       ! rhs_p( 2:nxg-1, :, nzp+1+1 ) = rhs_p( 2:nxg-1, :, 2 )
+       kz = nzp + 1 + 1
+       gr = dim3( ceil_div(nxg-2, 64), ceil_div(nyg-2, 4), 1 )
+       call k_periodic_z_copy<<<gr, tb>>>(rhs_p_d, kz, nxg, nyg, nzg)
+       call debug_check('k_periodic_z_copy')
+       ! update_ghost_interior_planes_pressure: no-op for nprocs = 1
+    else
+       ! P5.1: interior top-ghost from the upper neighbor's first owned
+       ! plane + periodic wrap rank0 -> last (device-direct; legacy
+       ! update_ghost_interior_planes_pressure / apply_periodic_z_pressure)
+       call pressure_exchange_z(rhs_p_d, nxg-2, nyg-2, nzg-1, 31)
+    end if
 
   end subroutine apply_periodic_z_pressure
 
@@ -660,6 +781,9 @@ contains
     max_divergence = device_max_abs3(div_d, nxg-3, nyg-2, nzg-2, &
                                      1, nxg-3, 1, nyg-2, 1, nzg-2)
 
+    ! P5.1: global maximum across ranks (legacy MPI_Reduce equivalent)
+    call allreduce_max(max_divergence)
+
   end subroutine check_divergence
 
   !============================================================================
@@ -754,6 +878,114 @@ contains
     plane(ii, k, b) = cmplx( div, 0.0_dp, dp )
 
   end subroutine k_div_pack
+
+  !----------------------------------------------------------------------------
+  ! k_div_compact — P5.1: divergence of u* at this rank's OWNED z-center
+  ! planes (local planes kk+1, kk = 1..ns) in PHYSICAL x order (ix), into
+  ! the compact chunk divc(ix, kk, b). Same expression as k_div_pack.
+  !----------------------------------------------------------------------------
+  attributes(global) subroutine k_div_compact(divc, U, V, W, x, y, z, &
+                                              nxp, ns, nm, nx, ny, nz, &
+                                              nxg, nyg, nzg)
+    integer, value :: nxp, ns, nm, nx, ny, nz, nxg, nyg, nzg
+    real(dp), intent(out) :: divc(nxp, ns, nm)
+    real(dp), intent(in) :: U(nx, nyg, nzg), V(nxg, ny, nzg), W(nxg, nyg, nz)
+    real(dp), intent(in) :: x(nx), y(ny), z(nz)
+    integer  :: ix, kk, b, i, j, kl
+
+    ix = 1 + (blockIdx%x-1)*blockDim%x + threadIdx%x - 1
+    kk = 1 + (blockIdx%y-1)*blockDim%y + threadIdx%y - 1
+    b  = 1 + blockIdx%z - 1
+    if (ix > nxp .or. kk > ns .or. b > nm) return
+
+    i  = ix + 1
+    j  = b  + 1
+    kl = kk + 1     ! local z-center plane
+
+    divc(ix, kk, b) = ( U(i,j,kl) - U(i-1,j,kl) )/( x(i)-x(i-1) ) + &
+                      ( V(i,j,kl) - V(i,j-1,kl) )/( y(j)-y(j-1) ) + &
+                      ( W(i,j,kl) - W(i,j,kl-1) )/( z(kl)-z(kl-1) )
+
+  end subroutine k_div_compact
+
+  !----------------------------------------------------------------------------
+  ! k_pack_from_gather — root: Makhoul even/odd pack of the gathered global
+  ! divergence. Global pack index k = r*ns + kk maps to gathered chunk
+  ! (ix, kk, b, r+1); slot ii reads physical column ix via the standard map.
+  !----------------------------------------------------------------------------
+  attributes(global) subroutine k_pack_from_gather(plane, gath, nxp, nzp, &
+                                                   nm, ns)
+    integer, value :: nxp, nzp, nm, ns
+    complex(dp), intent(inout) :: plane(nxp, nzp, nm)
+    real(dp),    intent(in)    :: gath(nxp, ns, nm, *)
+    integer :: ii, k, b, ix, r, kk
+
+    ii = 1 + (blockIdx%x-1)*blockDim%x + threadIdx%x - 1
+    k  = 1 + (blockIdx%y-1)*blockDim%y + threadIdx%y - 1
+    b  = 1 + blockIdx%z - 1
+    if (ii > nxp .or. k > nzp .or. b > nm) return
+
+    if (ii <= nxp/2) then
+       ix = 2*ii - 1
+    else
+       ix = 2*(nxp - ii) + 2
+    end if
+    r  = (k-1)/ns
+    kk = k - r*ns
+
+    plane(ii, k, b) = cmplx( gath(ix, kk, b, r+1), 0.0_dp, dp )
+
+  end subroutine k_pack_from_gather
+
+  !----------------------------------------------------------------------------
+  ! k_extract_compact — root: unpack the physical-space solution (with the
+  ! half-length normalization) back into gathered-chunk order for scatter.
+  !----------------------------------------------------------------------------
+  attributes(global) subroutine k_extract_compact(gath, plane, fft_norm, &
+                                                  nxp, nzp, nm, ns)
+    integer,  value :: nxp, nzp, nm, ns
+    real(dp), value :: fft_norm
+    real(dp),    intent(out) :: gath(nxp, ns, nm, *)
+    complex(dp), intent(in)  :: plane(nxp, nzp, nm)
+    integer :: ii, k, b, ix, r, kk
+
+    ii = 1 + (blockIdx%x-1)*blockDim%x + threadIdx%x - 1
+    k  = 1 + (blockIdx%y-1)*blockDim%y + threadIdx%y - 1
+    b  = 1 + blockIdx%z - 1
+    if (ii > nxp .or. k > nzp .or. b > nm) return
+
+    if (ii <= nxp/2) then
+       ix = 2*ii - 1
+    else
+       ix = 2*(nxp - ii) + 2
+    end if
+    r  = (k-1)/ns
+    kk = k - r*ns
+
+    gath(ix, kk, b, r+1) = real(plane(ii, k, b), dp) * fft_norm
+
+  end subroutine k_extract_compact
+
+  !----------------------------------------------------------------------------
+  ! k_unpack_phi — every rank: copy its scattered solution chunk into the
+  ! local rhs_p interior (planes 2..ns+1); ghost planes are filled by the
+  ! subsequent pressure exchanges.
+  !----------------------------------------------------------------------------
+  attributes(global) subroutine k_unpack_phi(rhs_p, phic, nxp, ns, nm, &
+                                             nxg, nyg, nzg)
+    integer, value :: nxp, ns, nm, nxg, nyg, nzg
+    real(dp), intent(inout) :: rhs_p(2:nxg-1, 2:nyg-1, 2:nzg)
+    real(dp), intent(in)    :: phic(nxp, ns, nm)
+    integer :: ix, kk, b
+
+    ix = 1 + (blockIdx%x-1)*blockDim%x + threadIdx%x - 1
+    kk = 1 + (blockIdx%y-1)*blockDim%y + threadIdx%y - 1
+    b  = 1 + blockIdx%z - 1
+    if (ix > nxp .or. kk > ns .or. b > nm) return
+
+    rhs_p(ix+1, b+1, kk+1) = phic(ix, kk, b)
+
+  end subroutine k_unpack_phi
 
   !----------------------------------------------------------------------------
   ! k_extract_dct — DCT-II coefficients from the half-length x-FFT:
