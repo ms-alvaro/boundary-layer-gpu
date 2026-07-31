@@ -79,7 +79,7 @@ module poisson_mod
   integer, public :: nxp, nzp, mx, mz, nm
 
   ! Device work arrays and operators (design-doc names; owned by this module):
-  !   plane_d     (2*nxp, nzp, nm)  DCT-II symmetric-extension complex plane
+  !   plane_d     (nxp, nzp, nm)    Makhoul half-length DCT complex plane
   !   rhs_hat_d   (mx+1, nm, mz+1)  spectral RHS / solution (transposed in z)
   !   dct_twiddle_d(0:mx)           exp(-i*pi*k/(2*nxp))
   !   thomas_dl_fact_d / thomas_d_pivot_d (mx+1, mz+1, nm), thomas_du_d(nm)
