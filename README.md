@@ -110,11 +110,14 @@ See `legacy/input_parameters.turbb` for a documented template. Key ones:
 | `inflow_flag` | Inflow BC (CUDA solver: 1 = Blasius + temporal modes) |
 | `nsteps` / `nsave` / `nstats` / `nmonitor` | Run control / output cadence |
 
-The CUDA solver covers the DNS path: RK2/RK3, `inflow_flag=1`,
-Dirichlet top, no-slip wall, single GPU. LES, wall models, Lund
-recycling inflow, and other top BCs currently run only in `legacy/`
-(they are the next porting phases) — the solver stops with a clear
-message if one is requested.
+The CUDA solver covers the full DNS production path: RK2/RK3,
+`inflow_flag=1` (Blasius + temporal modes) and `inflow_flag=6` (Blasius
++ HIT plane library with no-wrap guard), `top_flag=0` (Dirichlet) and
+`top_flag=4` (zero-shear), `ygrid_file` custom wall-normal grids,
+subvolume `boxout_*` output for causal-analysis campaigns, no-slip
+wall, restart, single GPU. LES, wall models, and Lund recycling inflow
+currently run only in `legacy/` (next porting phase) — the solver stops
+with a clear message if one is requested.
 
 ## Code structure (src/)
 
