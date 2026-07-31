@@ -1,0 +1,713 @@
+!------------------------------------------------------------------------------
+! timestep_mod — RK2/RK3 time-integration driver, advance kernels, CFL dt
+!
+! Part of the CUDA Fortran port of the boundary-layer DNS solver
+! (see docs/CUDA_PORT_DESIGN.md). Single GPU, nprocs = 1, no MPI.
+!
+! Reference provenance (verbatim numerics):
+!   * time_integration.f90
+!       compute_time_step_RK2   (lines ~145-300)  -> compute_time_step_rk2
+!       compute_time_step_RK3   (lines ~305-465)  -> compute_time_step_rk3
+!       compute_dt              (lines ~528-591)  -> compute_dt
+!     Explicit Euler (compute_time_step_Euler) is deliberately NOT ported
+!     (design doc: GPU-incoherent in the reference; param_mod rejects
+!     RKscheme = 1).
+!   * initialization.f90 (lines ~503-530): RK2/RK3 tableau values rk2_coef,
+!     rk2_t, rk_coef, rk_t — copied exactly.
+!   * global.f90: time-state scalars t, dt, dt_min_cfl, rk_step,
+!     step_beginning, istep — owned here in the port (the reference keeps
+!     them in the global module; the port has no global module, and
+!     bc_kernels/poisson_mod receive what they need as arguments to avoid
+!     circular module use).
+!
+! Per-substep orchestration (identical to the reference):
+!   save Uo,Vo,Wo once per step; then per substep s:
+!     RHS (Fu_s,Fv_s,Fw_s) -> advance U = Uo + dt*sum_q rk_coef(s,q)*Fu_q
+!     (interior points only) -> t = to + rk_t(s)*dt -> BCs -> projection
+!     -> BCs.
+!
+! REFERENCE QUIRK PRESERVED: the GPU boundary conditions
+! (boundary_conditions.f90:195-197) scale the convective outflow with
+! rk_t(rk_step)*dt using the RK3 time table rk_t EVEN IN RK2 RUNS (both
+! tableaus are always allocated in the reference). The product
+! rk_t(rk_step)*dt is therefore passed to apply_boundary_conditions_gpu
+! in both the RK2 and the RK3 driver.
+!
+! CFL time step: the fixed-dt path (CFL < 0 means dt = |CFL|) is verbatim.
+! The CFL > 0 path replaces the reference's HOST loop (which first copies
+! U,V,W to the CPU, time_integration.f90:549-558) with deterministic device
+! reductions (reductions.cuf::device_max_ratio3) — an improvement allowed by
+! the design doc; the reduced quantity, per-direction, is the reference's
+!   lUmax = Max( lUmax, (xg(i+1)-xg(i))/Abs(U(i,j,k)) )
+! transcribed exactly (precomputed spacing vectors are bitwise-identical to
+! the inline subtractions; zero velocity gives +Inf as in the reference,
+! and the reference's max-of-ratio semantics — NOT min — are kept verbatim).
+!
+! Profiling: the substep-1 section timers of the reference RK2 driver
+! (time_integration.f90:149-298) are ported, printing the exact line
+!   ' PROFILE n=', prof_n, ' (substep1 avg ms):', ' copy=', ... ' RHS=', ...
+! every 100 steps (format '(A,I6,A,5(A,F9.4))'; the harness parses it).
+! The reference fences each section with '!$acc wait'; here each fence is
+! one cudaDeviceSynchronize(). NOTE: these fences serialize the substep-1
+! pipeline exactly like the reference's acc waits do — same cost, no extra
+! synchronization beyond the five fence points. The reference only profiles
+! RK2; this port applies the same substep-1 fences to RK3 as well so the
+! harness gets PROFILE lines for either scheme (reported as a choice).
+!
+! Public API:
+!   timestep_init()          allocate + fill RK tableaus and the device CFL
+!                            spacing vectors (call after grid_generate()
+!                            and grid_to_device())
+!   advance_one_step(istep)  compute dt, then run one full RK2/RK3 step
+!                            (reference main.f90 loop body: compute_dt +
+!                            compute_time_step_*)
+!   t, dt, dt_min_cfl        time state (reference global.f90 names);
+!   rk_step, step_beginning, istep      for io_mod/monitor
+!   rk_coef, rk_t, rk2_coef, rk2_t      tableaus (reference names/values)
+!------------------------------------------------------------------------------
+module timestep_mod
+
+  use cudafor
+  use iso_fortran_env, only: int64
+  use precision_mod,   only: dp, ceil_div
+  use param_mod,       only: nu, CFL, itime_step
+  use grid_mod,        only: nx, ny, nz, nxg, nyg, nzg, xg, yg, zg, &
+                             dxmin, dymin, dzmin
+  use field_mod,       only: U_d, V_d, W_d, Uo_d, Vo_d, Wo_d, &
+                             Fu1_d, Fu2_d, Fu3_d, &
+                             Fv1_d, Fv2_d, Fv3_d, &
+                             Fw1_d, Fw2_d, Fw3_d
+  use reductions,      only: device_max_ratio3
+  ! Modules written in parallel (assumed public APIs — see doc comments at
+  ! the call sites and the integration notes in the module header):
+  use rhs_kernels,     only: compute_rhs_u, compute_rhs_v, compute_rhs_w
+  use bc_kernels,      only: apply_boundary_conditions_gpu => apply_bc
+  use poisson_mod,     only: compute_projection_step => projection_step
+
+  implicit none
+  private
+
+  public :: timestep_init
+  public :: advance_one_step
+
+  ! time state (reference global.f90 names, owned here in the port)
+  public :: t, dt, dt_min_cfl
+  public :: rk_step, step_beginning, istep
+
+  ! RK tableaus (reference global.f90 names; values initialization.f90)
+  public :: rk_coef, rk_t, rk2_coef, rk2_t
+
+  !--------------------------- time state -------------------------------------
+  real(dp) :: t          = 0.0_dp  !< current physical time (restart I/O
+                                   !! may overwrite before the first step)
+  real(dp) :: dt         = 0.0_dp  !< current time step
+  real(dp) :: dt_min_cfl = 0.0_dp  !< dt/|CFL|, saved for monitor output
+
+  integer :: istep          = 0    !< current step number (set on entry to
+                                   !! advance_one_step; reference main.f90)
+  integer :: rk_step        = 0    !< current RK substep (1..itime_step)
+  integer :: step_beginning = 0    !< reference flag set at step start
+                                   !! (kept for fidelity/monitor parity)
+
+  !--------------------------- RK tableaus ------------------------------------
+  ! Allocated and filled by timestep_init, values copied exactly from
+  ! initialization.f90:504-530 (the reference allocates BOTH regardless of
+  ! itime_step; so does the port — the BCs use rk_t in RK2 runs too).
+  real(dp), allocatable :: rk_t(:), rk2_t(:)          ! rk_t(0:3), rk2_t(0:2)
+  real(dp), allocatable :: rk_coef(:,:), rk2_coef(:,:)! (3,3), (2,2)
+
+  !------------------ device spacing vectors for the CFL reduction ------------
+  ! dxg_d(i) = xg(i+1)-xg(i), i = 1..nxg-1 (and analogously in y, z), the
+  ! precomputed forms of the inline subtractions of time_integration.f90:
+  ! 553-555. Filled by timestep_init.
+  real(dp), device, allocatable :: dxg_d(:), dyg_d(:), dzg_d(:)
+
+  !--------------------------- profiling state --------------------------------
+  ! Substep-1 section accumulators (time_integration.f90:150-151). The
+  ! reference declares them as saved locals of the RK2 driver; module
+  ! variables are equivalent (one scheme runs per execution).
+  real(dp) :: acc_copy = 0.0_dp, acc_rhs = 0.0_dp, acc_adv = 0.0_dp
+  real(dp) :: acc_bc   = 0.0_dp, acc_proj = 0.0_dp
+  integer  :: prof_n = 0
+
+contains
+
+  !============================================================================
+  ! Host-side driver routines
+  !============================================================================
+
+  !----------------------------------------------------------------------------
+  ! timestep_init — allocate and fill the RK tableaus (verbatim values from
+  ! initialization.f90:504-530) and the device grid-spacing vectors used by
+  ! the CFL reduction. Call once, after grid_generate() (host grids and size
+  ! scalars set) and grid_to_device(). Does NOT touch t: the initial time is
+  ! 0 (module default) or whatever the restart reader (io_mod) has set.
+  !----------------------------------------------------------------------------
+  subroutine timestep_init()
+
+    real(dp), allocatable :: dxg_h(:), dyg_h(:), dzg_h(:)
+    integer :: i, j, k
+
+    !------------------------Runge-Kutta 2-------------------------!
+    allocate ( rk2_coef(2,2), rk2_t(0:2) )
+
+    rk2_t(0)      =  0.0_dp
+    rk2_t(1)      =  1.0_dp/2.0_dp
+    rk2_t(2)      =  1.0_dp
+
+    rk2_coef      =  0.0_dp
+    rk2_coef(1,1) =  1.0_dp/2.0_dp
+    rk2_coef(2,1) =  0.0_dp
+    rk2_coef(2,2) =  1.0_dp
+
+    !------------------------Runge-Kutta 3-------------------------!
+    write(*,*) 'initializing time integration...'
+    allocate ( rk_coef(3,3), rk_t(0:3) )
+
+    rk_t(0)      =  0.0_dp
+    rk_t(1)      =  8.0_dp/15.0_dp
+    rk_t(2)      =  2.0_dp/3.0_dp
+    rk_t(3)      =  1.0_dp
+
+    rk_coef      =  0.0_dp
+    rk_coef(1,1) =  8.0_dp/15.0_dp
+    rk_coef(2,1) =  1.0_dp/4.0_dp
+    rk_coef(2,2) =  5.0_dp/12.0_dp
+    rk_coef(3,1) =  1.0_dp/4.0_dp
+    rk_coef(3,2) =  0.0_dp
+    rk_coef(3,3) =  3.0_dp/4.0_dp
+
+    !-------------- CFL spacing vectors (time_integration.f90:553-555) --------
+    ! Precomputing xg(i+1)-xg(i) on the host is bitwise-identical to the
+    ! reference's inline subtraction inside the max loop.
+    allocate ( dxg_h(nxg-1), dyg_h(nyg-1), dzg_h(nzg-1) )
+    do i = 1, nxg-1
+       dxg_h(i) = xg(i+1) - xg(i)
+    end do
+    do j = 1, nyg-1
+       dyg_h(j) = yg(j+1) - yg(j)
+    end do
+    do k = 1, nzg-1
+       dzg_h(k) = zg(k+1) - zg(k)
+    end do
+    allocate ( dxg_d(nxg-1), dyg_d(nyg-1), dzg_d(nzg-1) )
+    dxg_d = dxg_h
+    dyg_d = dyg_h
+    dzg_d = dzg_h
+    deallocate ( dxg_h, dyg_h, dzg_h )
+
+    !----------------------------- profiling ----------------------------------
+    acc_copy = 0.0_dp
+    acc_rhs  = 0.0_dp
+    acc_adv  = 0.0_dp
+    acc_bc   = 0.0_dp
+    acc_proj = 0.0_dp
+    prof_n   = 0
+
+  end subroutine timestep_init
+
+  !----------------------------------------------------------------------------
+  ! advance_one_step — one full time step: CFL dt, then the RK2 or RK3
+  ! driver. Ports the loop body of the reference main.f90:84-96 (compute_dt
+  ! + compute_time_step_RK2/RK3; Euler is rejected by param_mod's
+  ! check_supported and guarded here defensively).
+  !----------------------------------------------------------------------------
+  subroutine advance_one_step(istep_in)
+
+    integer, intent(in) :: istep_in
+
+    istep = istep_in
+
+    ! compute dt based on CFL
+    call compute_dt()
+
+    ! time step
+    if     ( itime_step == 2 ) then
+       call compute_time_step_rk2()
+    elseif ( itime_step == 3 ) then
+       call compute_time_step_rk3()
+    else
+       write(*,*) 'ERROR: advance_one_step: RKscheme = ', itime_step, &
+                  ' is not supported (use 2 or 3).'
+       error stop 'unsupported RKscheme in timestep_mod'
+    end if
+
+  end subroutine advance_one_step
+
+  !----------------------------------------------------------------------------
+  ! compute_dt — time step from the CFL condition
+  ! (time_integration.f90:528-591, subroutine compute_dt).
+  !
+  ! CFL < 0: fixed time step dt = |CFL|; the CFL computation is skipped
+  !          entirely (verbatim, including dt_min_cfl = dt/CFLa).
+  ! CFL > 0: convective limit from three deterministic DEVICE max-of-ratio
+  !          reductions (the reference copies U,V,W to the host and loops;
+  !          the port keeps the data on the GPU — design-doc improvement).
+  !          Per direction the reduced quantity is exactly the reference's
+  !             lUmax = Max( lUmax, (xg(i+1)-xg(i))/Abs(U(i,j,k)) )
+  !          over i=2:nxg-1, j=2:nyg-1, k=2:nzg-1 (identical index ranges;
+  !          note nxg-1 = nx, nyg-1 = ny, nzg-1 = nz so all three sections
+  !          are in bounds for the staggered shapes). The reference's
+  !          max-of-ratio semantics (and +Inf for zero velocity) are kept
+  !          verbatim; combined with the viscous limits exactly as in the
+  !          reference. Single rank: the MPI_Allreduce(min) is the identity.
+  !----------------------------------------------------------------------------
+  subroutine compute_dt()
+
+    real(dp) :: lUmax, lVmax, lWmax, dt_local
+    real(dp) :: dt_conv_u, dt_conv_v, dt_conv_w, dt_conv
+    real(dp) :: dt_vis_u, dt_vis_v, dt_vis_w, dt_vis
+    real(dp) :: CFLa
+
+    CFLa = abs( CFL )   ! absolute value of CFL ( for when CFL is dt )
+
+    ! Fixed time step: skip CFL computation entirely (avoids GPU->CPU transfer)
+    if ( CFL < 0 ) then
+       dt = -CFL
+       dt_min_cfl = dt / CFLa
+       return
+    end if
+
+    ! convective time step (device reductions; reference lines 546-558)
+    lUmax = device_max_ratio3(U_d, nx , nyg, nzg, 2, nxg-1, 2, nyg-1, &
+                              2, nzg-1, dxg_d, nxg-1, 1)
+    lVmax = device_max_ratio3(V_d, nxg, ny , nzg, 2, nxg-1, 2, nyg-1, &
+                              2, nzg-1, dyg_d, nyg-1, 2)
+    lWmax = device_max_ratio3(W_d, nxg, nyg, nz , 2, nxg-1, 2, nyg-1, &
+                              2, nzg-1, dzg_d, nzg-1, 3)
+
+    dt_conv_u = CFLa*lUmax
+    dt_conv_v = CFLa*lVmax
+    dt_conv_w = CFLa*lWmax
+
+    dt_conv = minval( (/ dt_conv_u, dt_conv_v, dt_conv_w /) )
+
+    ! viscous time step
+    dt_vis_u = CFLa*dxmin**2.0_dp/nu
+    dt_vis_v = CFLa*dymin**2.0_dp/nu
+    dt_vis_w = CFLa*dzmin**2.0_dp/nu
+
+    dt_vis = minval( (/ dt_vis_u, dt_vis_v, dt_vis_w /) )
+
+    ! time step (single rank: the reference MPI_Allreduce(min) is dropped)
+    dt_local = min ( dt_conv, dt_vis )
+    dt       = dt_local
+
+    dt_min_cfl = dt / CFLa ! save min dt for monitor output
+
+  end subroutine compute_dt
+
+  !----------------------------------------------------------------------------
+  ! compute_time_step_rk2 — one RK2 step
+  ! (time_integration.f90:145-300, subroutine compute_time_step_RK2).
+  !
+  ! Substep s (s = 1, 2):
+  !   RHS at the current state into Fu_s/Fv_s/Fw_s, then
+  !     U = Uo + dt*rk2_coef(1,1)*Fu1                       (s = 1)
+  !     U = Uo + dt*( rk2_coef(2,1)*Fu1 + rk2_coef(2,2)*Fu2 ) (s = 2)
+  !   over the interior (2:nx-1, 2:nyg-1, 2:nzg-1) etc., then
+  !   t = to + rk2_t(s)*dt, BCs, projection, BCs.
+  ! LES/wall-model hooks are dropped (not ported; param_mod rejects them).
+  !
+  ! Substep-1 profiling fences (c0..c5) are cudaDeviceSynchronize() calls at
+  ! the same five points where the reference has '!$acc wait' — they
+  ! serialize the substep-1 pipeline exactly as the reference does, and the
+  ! PROFILE output line is format-identical (time_integration.f90:290-297).
+  !----------------------------------------------------------------------------
+  subroutine compute_time_step_rk2()
+
+    real(dp) :: to
+    integer(int64) :: c0, c1, c2, c3, c4, c5, crate
+    type(dim3) :: tB, g
+    integer :: istat
+
+    tB = dim3(64, 4, 1)
+
+    step_beginning = 1
+
+    call system_clock(c0, crate)
+
+    ! save previous state
+    to = t
+    g = dim3( ceil_div(nx, 64), ceil_div(nyg, 4), nzg )
+    call copy3d_kernel<<<g, tB>>>(Uo_d, U_d, nx , nyg, nzg)
+    call debug_check('copy3d_kernel (Uo)')
+    g = dim3( ceil_div(nxg, 64), ceil_div(ny, 4), nzg )
+    call copy3d_kernel<<<g, tB>>>(Vo_d, V_d, nxg, ny , nzg)
+    call debug_check('copy3d_kernel (Vo)')
+    g = dim3( ceil_div(nxg, 64), ceil_div(nyg, 4), nz )
+    call copy3d_kernel<<<g, tB>>>(Wo_d, W_d, nxg, nyg, nz )
+    call debug_check('copy3d_kernel (Wo)')
+
+    ! step 1
+    rk_step = 1
+
+    ! RHS, advance, BC, projection — all on GPU
+    istat = cudaDeviceSynchronize()          ! fence (reference: !$acc wait)
+    call system_clock(c1)
+    call compute_rhs_u(U_d, V_d, W_d, Fu1_d)
+    call compute_rhs_v(U_d, V_d, W_d, Fv1_d)
+    call compute_rhs_w(U_d, V_d, W_d, Fw1_d)
+    istat = cudaDeviceSynchronize()          ! fence (reference: !$acc wait)
+    call system_clock(c2)
+
+    call advance_stage1(rk2_coef(1,1))
+    t = to + rk2_t(rk_step)*dt
+    istat = cudaDeviceSynchronize()          ! fence (reference: !$acc wait)
+    call system_clock(c3)
+
+    ! NOTE: rk_t (RK3 table) on purpose — reference quirk, see module header
+    call apply_boundary_conditions_gpu(t, rk_t(rk_step)*dt)
+    istat = cudaDeviceSynchronize()          ! fence (reference: !$acc wait)
+    call system_clock(c4)
+
+    call compute_projection_step(rk_step, dt)
+    istat = cudaDeviceSynchronize()          ! fence (reference: !$acc wait)
+    call system_clock(c5)
+
+    call apply_boundary_conditions_gpu(t, rk_t(rk_step)*dt)
+
+    ! step 2
+    rk_step = 2
+
+    call compute_rhs_u(U_d, V_d, W_d, Fu2_d)
+    call compute_rhs_v(U_d, V_d, W_d, Fv2_d)
+    call compute_rhs_w(U_d, V_d, W_d, Fw2_d)
+
+    call advance_stage2(rk2_coef(2,1), rk2_coef(2,2))
+    t = to + rk2_t(rk_step)*dt
+
+    call apply_boundary_conditions_gpu(t, rk_t(rk_step)*dt)
+    call compute_projection_step(rk_step, dt)
+    call apply_boundary_conditions_gpu(t, rk_t(rk_step)*dt)
+
+    ! Accumulate profiling (step 1 only — step 2 is symmetric)
+    acc_copy = acc_copy + real(c1-c0)/real(crate)
+    acc_rhs  = acc_rhs  + real(c2-c1)/real(crate)
+    acc_adv  = acc_adv  + real(c3-c2)/real(crate)
+    acc_bc   = acc_bc   + real(c4-c3)/real(crate)
+    acc_proj = acc_proj + real(c5-c4)/real(crate)
+    prof_n = prof_n + 1
+    if ( mod(prof_n, 100) == 0 ) then
+       write(*,'(A,I6,A,5(A,F9.4))') ' PROFILE n=', prof_n, ' (substep1 avg ms):', &
+            ' copy=', acc_copy/prof_n*1e3, &
+            ' RHS=',  acc_rhs/prof_n*1e3, &
+            ' adv=',  acc_adv/prof_n*1e3, &
+            ' BC=',   acc_bc/prof_n*1e3, &
+            ' proj=', acc_proj/prof_n*1e3
+       flush(6)
+    end if
+
+  end subroutine compute_time_step_rk2
+
+  !----------------------------------------------------------------------------
+  ! compute_time_step_rk3 — one RK3 step
+  ! (time_integration.f90:305-465, subroutine compute_time_step_RK3).
+  !
+  ! Substep s (s = 1, 2, 3): RHS into Fu_s/Fv_s/Fw_s, then
+  !     U = Uo + dt*rk_coef(1,1)*Fu1                                    (s=1)
+  !     U = Uo + dt*( rk_coef(2,1)*Fu1 + rk_coef(2,2)*Fu2 )             (s=2)
+  !     U = Uo + dt*( rk_coef(3,1)*Fu1 + rk_coef(3,2)*Fu2
+  !                   + rk_coef(3,3)*Fu3 )                              (s=3)
+  !   over the interior, then t = to + rk_t(s)*dt, BCs, projection, BCs.
+  !
+  ! PORT CHOICE: the reference profiles only the RK2 driver; the same
+  ! substep-1 fences + PROFILE line are applied here too, so the harness
+  ! gets profiling output for RK3 runs as well (the fences add five
+  ! cudaDeviceSynchronize calls per step that the reference RK3 does not
+  ! have — remove them if RK3 bench parity with the fence-free reference
+  ! driver is required).
+  !----------------------------------------------------------------------------
+  subroutine compute_time_step_rk3()
+
+    real(dp) :: to
+    integer(int64) :: c0, c1, c2, c3, c4, c5, crate
+    type(dim3) :: tB, g
+    integer :: istat
+
+    tB = dim3(64, 4, 1)
+
+    step_beginning = 1
+
+    call system_clock(c0, crate)
+
+    ! save previous state
+    to = t
+    g = dim3( ceil_div(nx, 64), ceil_div(nyg, 4), nzg )
+    call copy3d_kernel<<<g, tB>>>(Uo_d, U_d, nx , nyg, nzg)
+    call debug_check('copy3d_kernel (Uo)')
+    g = dim3( ceil_div(nxg, 64), ceil_div(ny, 4), nzg )
+    call copy3d_kernel<<<g, tB>>>(Vo_d, V_d, nxg, ny , nzg)
+    call debug_check('copy3d_kernel (Vo)')
+    g = dim3( ceil_div(nxg, 64), ceil_div(nyg, 4), nz )
+    call copy3d_kernel<<<g, tB>>>(Wo_d, W_d, nxg, nyg, nz )
+    call debug_check('copy3d_kernel (Wo)')
+
+    ! step 1
+    rk_step = 1
+    istat = cudaDeviceSynchronize()          ! fence (profiling, see header)
+    call system_clock(c1)
+    call compute_rhs_u(U_d, V_d, W_d, Fu1_d)
+    call compute_rhs_v(U_d, V_d, W_d, Fv1_d)
+    call compute_rhs_w(U_d, V_d, W_d, Fw1_d)
+    istat = cudaDeviceSynchronize()          ! fence (profiling, see header)
+    call system_clock(c2)
+
+    call advance_stage1(rk_coef(1,1))
+    t = to + rk_t(rk_step)*dt
+    istat = cudaDeviceSynchronize()          ! fence (profiling, see header)
+    call system_clock(c3)
+
+    call apply_boundary_conditions_gpu(t, rk_t(rk_step)*dt)
+    istat = cudaDeviceSynchronize()          ! fence (profiling, see header)
+    call system_clock(c4)
+
+    call compute_projection_step(rk_step, dt)
+    istat = cudaDeviceSynchronize()          ! fence (profiling, see header)
+    call system_clock(c5)
+
+    call apply_boundary_conditions_gpu(t, rk_t(rk_step)*dt)
+
+    ! step 2
+    rk_step = 2
+    call compute_rhs_u(U_d, V_d, W_d, Fu2_d)
+    call compute_rhs_v(U_d, V_d, W_d, Fv2_d)
+    call compute_rhs_w(U_d, V_d, W_d, Fw2_d)
+
+    call advance_stage2(rk_coef(2,1), rk_coef(2,2))
+    t = to + rk_t(rk_step)*dt
+
+    call apply_boundary_conditions_gpu(t, rk_t(rk_step)*dt)
+    call compute_projection_step(rk_step, dt)
+    call apply_boundary_conditions_gpu(t, rk_t(rk_step)*dt)
+
+    ! step 3
+    rk_step = 3
+    call compute_rhs_u(U_d, V_d, W_d, Fu3_d)
+    call compute_rhs_v(U_d, V_d, W_d, Fv3_d)
+    call compute_rhs_w(U_d, V_d, W_d, Fw3_d)
+
+    call advance_stage3(rk_coef(3,1), rk_coef(3,2), rk_coef(3,3))
+    t = to + rk_t(rk_step)*dt
+
+    call apply_boundary_conditions_gpu(t, rk_t(rk_step)*dt)
+    call compute_projection_step(rk_step, dt)
+    call apply_boundary_conditions_gpu(t, rk_t(rk_step)*dt)
+
+    ! Accumulate profiling (step 1 only)
+    acc_copy = acc_copy + real(c1-c0)/real(crate)
+    acc_rhs  = acc_rhs  + real(c2-c1)/real(crate)
+    acc_adv  = acc_adv  + real(c3-c2)/real(crate)
+    acc_bc   = acc_bc   + real(c4-c3)/real(crate)
+    acc_proj = acc_proj + real(c5-c4)/real(crate)
+    prof_n = prof_n + 1
+    if ( mod(prof_n, 100) == 0 ) then
+       write(*,'(A,I6,A,5(A,F9.4))') ' PROFILE n=', prof_n, ' (substep1 avg ms):', &
+            ' copy=', acc_copy/prof_n*1e3, &
+            ' RHS=',  acc_rhs/prof_n*1e3, &
+            ' adv=',  acc_adv/prof_n*1e3, &
+            ' BC=',   acc_bc/prof_n*1e3, &
+            ' proj=', acc_proj/prof_n*1e3
+       flush(6)
+    end if
+
+  end subroutine compute_time_step_rk3
+
+  !============================================================================
+  ! Advance-launch helpers: one launcher per RK stage pattern, each firing
+  ! the three component kernels over the reference interior ranges
+  !   U: 2:nx-1,  2:nyg-1, 2:nzg-1
+  !   V: 2:nxg-1, 2:ny-1,  2:nzg-1
+  !   W: 2:nxg-1, 2:nyg-1, 2:nz-1
+  ! (time_integration.f90:202-225, 253-276, 351-374, 393-416, 435-458).
+  !============================================================================
+
+  !> Stage with one accumulated RHS: X = Xo + dt*c1*F1 (substep 1).
+  subroutine advance_stage1(c1)
+    real(dp), intent(in) :: c1
+    type(dim3) :: tB, g
+
+    tB = dim3(64, 4, 1)
+
+    g = dim3( ceil_div(nx-2, 64), ceil_div(nyg-2, 4), nzg-2 )
+    call advance1_kernel<<<g, tB>>>(U_d, Uo_d, Fu1_d, nx , nyg, nzg, &
+                                    nx-1 , nyg-1, nzg-1, dt, c1)
+    call debug_check('advance1_kernel (U)')
+
+    g = dim3( ceil_div(nxg-2, 64), ceil_div(ny-2, 4), nzg-2 )
+    call advance1_kernel<<<g, tB>>>(V_d, Vo_d, Fv1_d, nxg, ny , nzg, &
+                                    nxg-1, ny-1 , nzg-1, dt, c1)
+    call debug_check('advance1_kernel (V)')
+
+    g = dim3( ceil_div(nxg-2, 64), ceil_div(nyg-2, 4), nz-2 )
+    call advance1_kernel<<<g, tB>>>(W_d, Wo_d, Fw1_d, nxg, nyg, nz , &
+                                    nxg-1, nyg-1, nz-1 , dt, c1)
+    call debug_check('advance1_kernel (W)')
+  end subroutine advance_stage1
+
+  !> Stage with two accumulated RHS: X = Xo + dt*( c1*F1 + c2*F2 )
+  !> (RK2 substep 2 / RK3 substep 2).
+  subroutine advance_stage2(c1, c2)
+    real(dp), intent(in) :: c1, c2
+    type(dim3) :: tB, g
+
+    tB = dim3(64, 4, 1)
+
+    g = dim3( ceil_div(nx-2, 64), ceil_div(nyg-2, 4), nzg-2 )
+    call advance2_kernel<<<g, tB>>>(U_d, Uo_d, Fu1_d, Fu2_d, nx , nyg, nzg, &
+                                    nx-1 , nyg-1, nzg-1, dt, c1, c2)
+    call debug_check('advance2_kernel (U)')
+
+    g = dim3( ceil_div(nxg-2, 64), ceil_div(ny-2, 4), nzg-2 )
+    call advance2_kernel<<<g, tB>>>(V_d, Vo_d, Fv1_d, Fv2_d, nxg, ny , nzg, &
+                                    nxg-1, ny-1 , nzg-1, dt, c1, c2)
+    call debug_check('advance2_kernel (V)')
+
+    g = dim3( ceil_div(nxg-2, 64), ceil_div(nyg-2, 4), nz-2 )
+    call advance2_kernel<<<g, tB>>>(W_d, Wo_d, Fw1_d, Fw2_d, nxg, nyg, nz , &
+                                    nxg-1, nyg-1, nz-1 , dt, c1, c2)
+    call debug_check('advance2_kernel (W)')
+  end subroutine advance_stage2
+
+  !> Stage with three accumulated RHS:
+  !> X = Xo + dt*( c1*F1 + c2*F2 + c3*F3 ) (RK3 substep 3).
+  subroutine advance_stage3(c1, c2, c3)
+    real(dp), intent(in) :: c1, c2, c3
+    type(dim3) :: tB, g
+
+    tB = dim3(64, 4, 1)
+
+    g = dim3( ceil_div(nx-2, 64), ceil_div(nyg-2, 4), nzg-2 )
+    call advance3_kernel<<<g, tB>>>(U_d, Uo_d, Fu1_d, Fu2_d, Fu3_d, &
+                                    nx , nyg, nzg, nx-1 , nyg-1, nzg-1, &
+                                    dt, c1, c2, c3)
+    call debug_check('advance3_kernel (U)')
+
+    g = dim3( ceil_div(nxg-2, 64), ceil_div(ny-2, 4), nzg-2 )
+    call advance3_kernel<<<g, tB>>>(V_d, Vo_d, Fv1_d, Fv2_d, Fv3_d, &
+                                    nxg, ny , nzg, nxg-1, ny-1 , nzg-1, &
+                                    dt, c1, c2, c3)
+    call debug_check('advance3_kernel (V)')
+
+    g = dim3( ceil_div(nxg-2, 64), ceil_div(nyg-2, 4), nz-2 )
+    call advance3_kernel<<<g, tB>>>(W_d, Wo_d, Fw1_d, Fw2_d, Fw3_d, &
+                                    nxg, nyg, nz , nxg-1, nyg-1, nz-1 , &
+                                    dt, c1, c2, c3)
+    call debug_check('advance3_kernel (W)')
+  end subroutine advance_stage3
+
+  !> Debug-build kernel-launch check (design doc: `make DEBUG=1` defines
+  !> -DDEBUG_KERNELS; the Makefile must compile .cuf with preprocessing).
+  subroutine debug_check(kname)
+    character(*), intent(in) :: kname
+#ifdef DEBUG_KERNELS
+    integer :: istat
+    istat = cudaGetLastError()
+    if (istat /= cudaSuccess) then
+       write (*, '(a)') 'timestep_mod: kernel '//kname//' failed: ' &
+                        //trim(cudaGetErrorString(istat))
+       error stop 1
+    end if
+#endif
+  end subroutine debug_check
+
+  !============================================================================
+  ! Device kernels
+  !
+  ! Thread mapping (binding convention, docs/CUDA_PORT_DESIGN.md): 3-D
+  ! (i,j,k) with i fastest, tBlock = dim3(64,4,1),
+  ! grid = dim3(ceil_div(ihi-ilo+1,64), ceil_div(jhi-jlo+1,4), khi-klo+1),
+  !   i = ilo + (blockIdx%x-1)*blockDim%x + threadIdx%x - 1   (etc.)
+  ! with a bounds guard. Copy kernels run over the FULL arrays (ilo = 1);
+  ! advance kernels run over the interior (ilo = 2), matching the RHS/stage
+  ! arrays' non-default lower bounds of 2 (field_mod).
+  !============================================================================
+
+  !> copy3d_kernel — full-array state save dst = src
+  !> (time_integration.f90:159-182 / 314-337: Uo = U, Vo = V, Wo = W over
+  !> 1:n1, 1:n2, 1:n3 including all ghost/boundary planes).
+  attributes(global) subroutine copy3d_kernel(dst, src, n1, n2, n3)
+    integer,  value       :: n1, n2, n3
+    real(dp), intent(out) :: dst(n1, n2, n3)
+    real(dp), intent(in)  :: src(n1, n2, n3)
+    integer :: i, j, k
+
+    i = 1 + (blockIdx%x-1)*blockDim%x + threadIdx%x - 1
+    j = 1 + (blockIdx%y-1)*blockDim%y + threadIdx%y - 1
+    k = 1 + (blockIdx%z-1)*blockDim%z + threadIdx%z - 1
+    if (i > n1 .or. j > n2 .or. k > n3) return
+
+    dst(i,j,k) = src(i,j,k)
+  end subroutine copy3d_kernel
+
+  !> advance1_kernel — RK substep 1 interior update
+  !>   X(i,j,k) = Xo(i,j,k) + dt*c1*F1(i,j,k)
+  !> over i = 2:ihi, j = 2:jhi, k = 2:khi (time_integration.f90:202-225 with
+  !> c1 = rk2_coef(1,1), and 351-374 with c1 = rk_coef(1,1)). Expression
+  !> transcribed verbatim; F1 keeps the reference lower bounds of 2.
+  attributes(global) subroutine advance1_kernel(X, Xo, F1, n1, n2, n3, &
+                                                ihi, jhi, khi, dt, c1)
+    integer,  value         :: n1, n2, n3, ihi, jhi, khi
+    real(dp), value         :: dt, c1
+    real(dp), intent(inout) :: X (n1, n2, n3)
+    real(dp), intent(in)    :: Xo(n1, n2, n3)
+    real(dp), intent(in)    :: F1(2:ihi, 2:jhi, 2:khi)
+    integer :: i, j, k
+
+    i = 2 + (blockIdx%x-1)*blockDim%x + threadIdx%x - 1
+    j = 2 + (blockIdx%y-1)*blockDim%y + threadIdx%y - 1
+    k = 2 + (blockIdx%z-1)*blockDim%z + threadIdx%z - 1
+    if (i > ihi .or. j > jhi .or. k > khi) return
+
+    X(i,j,k) = Xo(i,j,k) + dt*c1*F1(i,j,k)
+  end subroutine advance1_kernel
+
+  !> advance2_kernel — RK substep with two stage RHS
+  !>   X(i,j,k) = Xo(i,j,k) + dt*( c1*F1(i,j,k) + c2*F2(i,j,k) )
+  !> over i = 2:ihi, j = 2:jhi, k = 2:khi (time_integration.f90:253-276 with
+  !> c = rk2_coef(2,:), and 393-416 with c = rk_coef(2,:)). Verbatim
+  !> expression, including the parenthesized stage sum.
+  attributes(global) subroutine advance2_kernel(X, Xo, F1, F2, n1, n2, n3, &
+                                                ihi, jhi, khi, dt, c1, c2)
+    integer,  value         :: n1, n2, n3, ihi, jhi, khi
+    real(dp), value         :: dt, c1, c2
+    real(dp), intent(inout) :: X (n1, n2, n3)
+    real(dp), intent(in)    :: Xo(n1, n2, n3)
+    real(dp), intent(in)    :: F1(2:ihi, 2:jhi, 2:khi)
+    real(dp), intent(in)    :: F2(2:ihi, 2:jhi, 2:khi)
+    integer :: i, j, k
+
+    i = 2 + (blockIdx%x-1)*blockDim%x + threadIdx%x - 1
+    j = 2 + (blockIdx%y-1)*blockDim%y + threadIdx%y - 1
+    k = 2 + (blockIdx%z-1)*blockDim%z + threadIdx%z - 1
+    if (i > ihi .or. j > jhi .or. k > khi) return
+
+    X(i,j,k) = Xo(i,j,k) + dt*( c1*F1(i,j,k) + c2*F2(i,j,k) )
+  end subroutine advance2_kernel
+
+  !> advance3_kernel — RK3 substep 3 interior update
+  !>   X(i,j,k) = Xo(i,j,k) + dt*( c1*F1(i,j,k) + c2*F2(i,j,k)
+  !>                               + c3*F3(i,j,k) )
+  !> over i = 2:ihi, j = 2:jhi, k = 2:khi (time_integration.f90:435-458 with
+  !> c = rk_coef(3,:)). Verbatim expression and summation order.
+  attributes(global) subroutine advance3_kernel(X, Xo, F1, F2, F3, &
+                                                n1, n2, n3, ihi, jhi, khi, &
+                                                dt, c1, c2, c3)
+    integer,  value         :: n1, n2, n3, ihi, jhi, khi
+    real(dp), value         :: dt, c1, c2, c3
+    real(dp), intent(inout) :: X (n1, n2, n3)
+    real(dp), intent(in)    :: Xo(n1, n2, n3)
+    real(dp), intent(in)    :: F1(2:ihi, 2:jhi, 2:khi)
+    real(dp), intent(in)    :: F2(2:ihi, 2:jhi, 2:khi)
+    real(dp), intent(in)    :: F3(2:ihi, 2:jhi, 2:khi)
+    integer :: i, j, k
+
+    i = 2 + (blockIdx%x-1)*blockDim%x + threadIdx%x - 1
+    j = 2 + (blockIdx%y-1)*blockDim%y + threadIdx%y - 1
+    k = 2 + (blockIdx%z-1)*blockDim%z + threadIdx%z - 1
+    if (i > ihi .or. j > jhi .or. k > khi) return
+
+    X(i,j,k) = Xo(i,j,k) + dt*( c1*F1(i,j,k) + c2*F2(i,j,k) + c3*F3(i,j,k) )
+  end subroutine advance3_kernel
+
+end module timestep_mod

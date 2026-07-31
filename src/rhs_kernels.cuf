@@ -1,0 +1,621 @@
+!------------------------------------------------------------------------------
+! rhs_kernels — Navier-Stokes RHS kernels for u, v, w (DNS branch)
+!
+! Part of the CUDA Fortran port of the boundary-layer DNS solver
+! (see docs/CUDA_PORT_DESIGN.md).
+!
+! Reference provenance (verbatim numerics):
+!   equations.f90, Module equations —
+!     compute_rhs_u (lines ~24-156): convective kernel, DNS viscous+dPdx
+!       kernel (LES_model == 0 branch), last-plane dummy kernel
+!     compute_rhs_v (lines ~163-294): same structure (no imposed pressure
+!       gradient in the v equation)
+!     compute_rhs_w (lines ~301-415): same structure with dPdz
+!
+! The discrete equations (staggered 2nd-order FD, divergence-form convection):
+!   du/dt = -du^2/dx - duv/dy - duw/dz + nu*Laplacian(u) + dPdx
+!   dv/dt = -duv/dx - dv^2/dy - dvw/dz + nu*Laplacian(v)
+!   dw/dt = -duw/dx - dvw/dy - dw^2/dz + nu*Laplacian(w) + dPdz
+!
+! Kernel structure mirrors the reference exactly (fusion is Phase 3): per
+! velocity component one convective kernel, one viscous(+pressure-gradient)
+! kernel that accumulates into the same RHS array, and one small 2-D kernel
+! zeroing the dummy last x-plane. Loop bodies are transcribed UNCHANGED from
+! the reference (same expressions, same operation order, same statement
+! splitting); only d0 literals became _dp per the design-doc convention.
+!
+! Not ported (Phase 2 non-goals, enforced by a runtime guard in the host
+! wrappers): the LES branch (LES_model /= 0, variable nu_t) and the rotation
+! branch (Abs(Omega_z) > 1e-6, equations.f90:136-146 / 274-284). param_mod's
+! check_supported() already rejects LES_model > 0, and Omega_z is identically
+! zero in this port (Rossby_plus is never read), so the guard is a safety
+! net, not a reachable path in the harness.
+!
+! Host API (see interface comments below):
+!   compute_rhs_u(U_, V_, W_, rhs_u)   — reference-shaped wrappers; inputs
+!   compute_rhs_v(U_, V_, W_, rhs_v)     and output are device arrays, e.g.
+!   compute_rhs_w(U_, V_, W_, rhs_w)     compute_rhs_u(U_d, V_d, W_d, Fu1_d)
+!   compute_rhs(stage)                 — convenience: computes all three
+!                                        RHS from field_mod's U_d/V_d/W_d
+!                                        into stage arrays Fu<stage>_d,
+!                                        Fv<stage>_d, Fw<stage>_d
+!
+! Thread mapping (design-doc convention): tBlock = dim3(64,4,1), one z-plane
+! per grid z-slot, i fastest; 2-D dummy-plane kernels map (j,k) onto the
+! (x,y) block dimensions with the same 64x4 block.
+!
+! Debug builds: compile with -DDEBUG_KERNELS (file requires preprocessing,
+! e.g. -Mpreprocess or the .cuf default) to check cudaGetLastError after
+! every launch, matching reductions.cuf.
+!------------------------------------------------------------------------------
+module rhs_kernels
+
+  use precision_mod, only: dp, ceil_div
+  use param_mod,     only: nu, dPdx, dPdz, Omega_z, LES_model, itime_step
+  use grid_mod,      only: nx, ny, nz, nxg, nyg, nzg,              &
+                           x_d, y_d, z_d, xg_d, yg_d, zg_d,        &
+                           weight_y_0_d, weight_y_1_d
+  use field_mod,     only: U_d, V_d, W_d,                          &
+                           Fu1_d, Fu2_d, Fu3_d,                    &
+                           Fv1_d, Fv2_d, Fv3_d,                    &
+                           Fw1_d, Fw2_d, Fw3_d
+  use cudafor
+
+  implicit none
+  private
+
+  public :: compute_rhs_u, compute_rhs_v, compute_rhs_w, compute_rhs
+
+contains
+
+  !===========================================================================
+  ! host wrappers
+  !===========================================================================
+
+  !----------------------------------------------------------------------------
+  ! compute_rhs_u — RHS of the u-momentum equation on interior u-points
+  !                 (i = 2..nx-1, j = 2..nyg-1, k = 2..nzg-1).
+  !
+  ! Port of equations.f90:compute_rhs_u, DNS branch. Launches, in order:
+  !   1. rhs_u_conv  : rhs_u  = -du^2/dx - duv/dy - duw/dz
+  !   2. rhs_u_visc  : rhs_u += dPdx + nu*Laplacian(u)
+  !   3. rhs_u_dummy : rhs_u(nx-1,:,:) = 0   (last x-plane is dummy)
+  !
+  ! Typical call from timestep_mod: compute_rhs_u(U_d, V_d, W_d, Fu1_d).
+  !----------------------------------------------------------------------------
+  subroutine compute_rhs_u(U_, V_, W_, rhs_u)
+
+    real(dp), device, intent(in)  :: U_(nx,  nyg, nzg)
+    real(dp), device, intent(in)  :: V_(nxg, ny,  nzg)
+    real(dp), device, intent(in)  :: W_(nxg, nyg, nz )
+    real(dp), device, intent(out) :: rhs_u(2:nx-1, 2:nyg-1, 2:nzg-1)
+
+    type(dim3) :: tBlock, grid3, grid2
+
+    call check_dns_only()
+
+    tBlock = dim3(64, 4, 1)
+    grid3  = dim3(ceil_div(nx-2, 64), ceil_div(nyg-2, 4), nzg-2)
+    grid2  = dim3(ceil_div(nyg-2, 64), ceil_div(nzg-2, 4), 1)
+
+    call rhs_u_conv<<<grid3, tBlock>>>(U_, V_, W_, rhs_u,           &
+                                       xg_d, y_d, z_d,              &
+                                       weight_y_0_d, weight_y_1_d,  &
+                                       nx, ny, nz, nxg, nyg, nzg)
+    call debug_check('rhs_u_conv')
+
+    call rhs_u_visc<<<grid3, tBlock>>>(U_, rhs_u,                   &
+                                       x_d, xg_d, y_d, yg_d,        &
+                                       z_d, zg_d, nu, dPdx,         &
+                                       nx, ny, nz, nxg, nyg, nzg)
+    call debug_check('rhs_u_visc')
+
+    call rhs_u_dummy<<<grid2, tBlock>>>(rhs_u, nx, nyg, nzg)
+    call debug_check('rhs_u_dummy')
+
+  end subroutine compute_rhs_u
+
+  !----------------------------------------------------------------------------
+  ! compute_rhs_v — RHS of the v-momentum equation on interior v-points
+  !                 (i = 2..nxg-1, j = 2..ny-1, k = 2..nzg-1).
+  !
+  ! Port of equations.f90:compute_rhs_v, DNS branch. Launches, in order:
+  !   1. rhs_v_conv  : rhs_v  = -dv^2/dy - duv/dx - dvw/dz
+  !   2. rhs_v_visc  : rhs_v += nu*Laplacian(v)      (no imposed dP/dy)
+  !   3. rhs_v_dummy : rhs_v(nxg-1,:,:) = 0
+  !
+  ! Typical call from timestep_mod: compute_rhs_v(U_d, V_d, W_d, Fv1_d).
+  !----------------------------------------------------------------------------
+  subroutine compute_rhs_v(U_, V_, W_, rhs_v)
+
+    real(dp), device, intent(in)  :: U_(nx,  nyg, nzg)
+    real(dp), device, intent(in)  :: V_(nxg, ny,  nzg)
+    real(dp), device, intent(in)  :: W_(nxg, nyg, nz )
+    real(dp), device, intent(out) :: rhs_v(2:nxg-1, 2:ny-1, 2:nzg-1)
+
+    type(dim3) :: tBlock, grid3, grid2
+
+    call check_dns_only()
+
+    tBlock = dim3(64, 4, 1)
+    grid3  = dim3(ceil_div(nxg-2, 64), ceil_div(ny-2, 4), nzg-2)
+    grid2  = dim3(ceil_div(ny-2, 64), ceil_div(nzg-2, 4), 1)
+
+    call rhs_v_conv<<<grid3, tBlock>>>(U_, V_, W_, rhs_v,           &
+                                       x_d, yg_d, z_d,              &
+                                       weight_y_0_d, weight_y_1_d,  &
+                                       nx, ny, nz, nxg, nyg, nzg)
+    call debug_check('rhs_v_conv')
+
+    call rhs_v_visc<<<grid3, tBlock>>>(V_, rhs_v,                   &
+                                       x_d, xg_d, y_d, yg_d,        &
+                                       z_d, zg_d, nu,               &
+                                       nx, ny, nz, nxg, nyg, nzg)
+    call debug_check('rhs_v_visc')
+
+    call rhs_v_dummy<<<grid2, tBlock>>>(rhs_v, ny, nxg, nzg)
+    call debug_check('rhs_v_dummy')
+
+  end subroutine compute_rhs_v
+
+  !----------------------------------------------------------------------------
+  ! compute_rhs_w — RHS of the w-momentum equation on interior w-points
+  !                 (i = 2..nxg-1, j = 2..nyg-1, k = 2..nz-1).
+  !
+  ! Port of equations.f90:compute_rhs_w, DNS branch. Launches, in order:
+  !   1. rhs_w_conv  : rhs_w  = -dw^2/dz - duw/dx - dvw/dy
+  !   2. rhs_w_visc  : rhs_w += dPdz + nu*Laplacian(w)
+  !   3. rhs_w_dummy : rhs_w(nxg-1,:,:) = 0
+  !
+  ! Typical call from timestep_mod: compute_rhs_w(U_d, V_d, W_d, Fw1_d).
+  !----------------------------------------------------------------------------
+  subroutine compute_rhs_w(U_, V_, W_, rhs_w)
+
+    real(dp), device, intent(in)  :: U_(nx,  nyg, nzg)
+    real(dp), device, intent(in)  :: V_(nxg, ny,  nzg)
+    real(dp), device, intent(in)  :: W_(nxg, nyg, nz )
+    real(dp), device, intent(out) :: rhs_w(2:nxg-1, 2:nyg-1, 2:nz-1)
+
+    type(dim3) :: tBlock, grid3, grid2
+
+    call check_dns_only()
+
+    tBlock = dim3(64, 4, 1)
+    grid3  = dim3(ceil_div(nxg-2, 64), ceil_div(nyg-2, 4), nz-2)
+    grid2  = dim3(ceil_div(nyg-2, 64), ceil_div(nz-2, 4), 1)
+
+    call rhs_w_conv<<<grid3, tBlock>>>(U_, V_, W_, rhs_w,           &
+                                       x_d, y_d, zg_d,              &
+                                       weight_y_0_d, weight_y_1_d,  &
+                                       nx, ny, nz, nxg, nyg, nzg)
+    call debug_check('rhs_w_conv')
+
+    call rhs_w_visc<<<grid3, tBlock>>>(W_, rhs_w,                   &
+                                       x_d, xg_d, y_d, yg_d,        &
+                                       z_d, zg_d, nu, dPdz,         &
+                                       nx, ny, nz, nxg, nyg, nzg)
+    call debug_check('rhs_w_visc')
+
+    call rhs_w_dummy<<<grid2, tBlock>>>(rhs_w, nz, nxg, nyg)
+    call debug_check('rhs_w_dummy')
+
+  end subroutine compute_rhs_w
+
+  !----------------------------------------------------------------------------
+  ! compute_rhs — convenience dispatcher for the RK substeps: computes all
+  ! three RHS from the CURRENT fields (field_mod's U_d, V_d, W_d) into the
+  ! stage arrays Fu<stage>_d, Fv<stage>_d, Fw<stage>_d.
+  !
+  ! Mirrors the reference call pattern (time_integration.f90):
+  !   stage 1: Call compute_rhs_u(U,V,W,Fu1) ...  (RK2 + RK3 substep 1)
+  !   stage 2: Call compute_rhs_u(U,V,W,Fu2) ...  (RK2 + RK3 substep 2)
+  !   stage 3: Call compute_rhs_u(U,V,W,Fu3) ...  (RK3 substep 3 only)
+  ! The reference always passes the current U,V,W (never Uo) on the RK paths;
+  ! the Euler path (which used Uo and rhs_uo) is not ported.
+  !
+  ! stage = 3 with itime_step /= 3 is a hard error: field_mod then allocates
+  ! the *3 stage arrays as (1,1,1) placeholders and writing through the
+  ! full-shape dummies would corrupt memory.
+  !----------------------------------------------------------------------------
+  subroutine compute_rhs(stage)
+
+    integer, intent(in) :: stage
+
+    select case (stage)
+    case (1)
+       call compute_rhs_u(U_d, V_d, W_d, Fu1_d)
+       call compute_rhs_v(U_d, V_d, W_d, Fv1_d)
+       call compute_rhs_w(U_d, V_d, W_d, Fw1_d)
+    case (2)
+       call compute_rhs_u(U_d, V_d, W_d, Fu2_d)
+       call compute_rhs_v(U_d, V_d, W_d, Fv2_d)
+       call compute_rhs_w(U_d, V_d, W_d, Fw2_d)
+    case (3)
+       if (itime_step /= 3) then
+          write (*, '(a)') 'rhs_kernels: compute_rhs(3) requires RK3 '// &
+                           '(itime_step == 3); stage-3 arrays not allocated'
+          error stop 1
+       end if
+       call compute_rhs_u(U_d, V_d, W_d, Fu3_d)
+       call compute_rhs_v(U_d, V_d, W_d, Fv3_d)
+       call compute_rhs_w(U_d, V_d, W_d, Fw3_d)
+    case default
+       write (*, '(a,i0)') 'rhs_kernels: invalid RK stage ', stage
+       error stop 1
+    end select
+
+  end subroutine compute_rhs
+
+  !----------------------------------------------------------------------------
+  ! check_dns_only — runtime guard: this module ports ONLY the DNS branch of
+  ! equations.f90. The LES branch (variable nu_t) and the rotating-force
+  ! branch (2*Omega_z terms, threshold Abs(Omega_z) > 1d-6 as in the
+  ! reference) are Phase 2 non-goals; stop with a clear message if requested.
+  !----------------------------------------------------------------------------
+  subroutine check_dns_only()
+
+    if (LES_model /= 0) then
+       write (*, '(a)') 'rhs_kernels: LES_model /= 0 not supported '// &
+                        '(only the DNS branch of equations.f90 is ported)'
+       error stop 1
+    end if
+    if (abs(Omega_z) > 1.0e-6_dp) then
+       write (*, '(a)') 'rhs_kernels: rotating force (Omega_z /= 0) not '// &
+                        'supported (rotation branch of equations.f90 not ported)'
+       error stop 1
+    end if
+
+  end subroutine check_dns_only
+
+  !----------------------------------------------------------------------------
+  ! debug_check — abort with the kernel name if the last launch failed.
+  ! Active only when compiled with -DDEBUG_KERNELS (same pattern as
+  ! reductions.cuf).
+  !----------------------------------------------------------------------------
+  subroutine debug_check(kname)
+    character(*), intent(in) :: kname
+#ifdef DEBUG_KERNELS
+    integer :: istat
+    istat = cudaGetLastError()
+    if (istat /= cudaSuccess) then
+       write (*, '(a)') 'rhs_kernels: kernel '//kname//' failed: ' &
+                        //trim(cudaGetErrorString(istat))
+       error stop 1
+    end if
+#endif
+  end subroutine debug_check
+
+  !===========================================================================
+  ! kernels — u component (equations.f90:47-94, 149-154)
+  !===========================================================================
+
+  !----------------------------------------------------------------------------
+  ! rhs_u_conv — convective terms of the u equation, fully inlined
+  ! (equations.f90:47-67). For each interior u-point:
+  !   1) -du^2/dx : interp_x(U, faces->centers) = simple average, then d/dx
+  !      u_c(i) = 0.5*(U(i)+U(i+1)),  du^2/dx = (u_c(i)^2 - u_c(i-1)^2)/dxg
+  !   2) -duv/dy  : interp_y(U, centers->y-faces) = weighted,
+  !      interp_x(V, centers->x-faces) = simple average, then d/dy
+  !   3) -duw/dz  : interp_z(U, centers->z-faces) = simple average,
+  !      interp_x(W, centers->x-faces) = simple average, then d/dz
+  ! Statement splitting and operation order kept verbatim from the reference.
+  !----------------------------------------------------------------------------
+  attributes(global) subroutine rhs_u_conv(U_, V_, W_, rhs_u, xg, y, z,  &
+                                           weight_y_0, weight_y_1,       &
+                                           nx, ny, nz, nxg, nyg, nzg)
+
+    integer, value :: nx, ny, nz, nxg, nyg, nzg
+    real(dp), intent(in)  :: U_(nx,  nyg, nzg)
+    real(dp), intent(in)  :: V_(nxg, ny,  nzg)
+    real(dp), intent(in)  :: W_(nxg, nyg, nz )
+    real(dp), intent(out) :: rhs_u(2:nx-1, 2:nyg-1, 2:nzg-1)
+    real(dp), intent(in)  :: xg(nxg), y(ny), z(nz)
+    real(dp), intent(in)  :: weight_y_0(ny), weight_y_1(ny)
+
+    integer :: i, j, k
+
+    i = 2 + (blockIdx%x - 1)*blockDim%x + threadIdx%x - 1
+    j = 2 + (blockIdx%y - 1)*blockDim%y + threadIdx%y - 1
+    k = 2 + (blockIdx%z - 1)*blockDim%z + threadIdx%z - 1
+    if (i > nx-1 .or. j > nyg-1 .or. k > nzg-1) return
+
+    ! 1) -du^2/dx (interp_x faces->centers = simple average)
+    rhs_u(i,j,k) = -( (0.5_dp*(U_(i,j,k)+U_(i+1,j,k)))**2 &
+                     - (0.5_dp*(U_(i-1,j,k)+U_(i,j,k)))**2 ) / (xg(i+1)-xg(i))
+    ! 2) -duv/dy (interp_y centers->faces = weighted, interp_x centers->faces)
+    rhs_u(i,j,k) = rhs_u(i,j,k) &
+       - ( (weight_y_0(j)*U_(i,j,k)+weight_y_1(j)*U_(i,j+1,k)) &
+           * 0.5_dp*(V_(i,j,k)+V_(i+1,j,k)) &
+         - (weight_y_0(j-1)*U_(i,j-1,k)+weight_y_1(j-1)*U_(i,j,k)) &
+           * 0.5_dp*(V_(i,j-1,k)+V_(i+1,j-1,k)) ) / (y(j)-y(j-1))
+    ! 3) -duw/dz (interp_z centers->faces = simple avg, interp_x centers->faces)
+    rhs_u(i,j,k) = rhs_u(i,j,k) &
+       - ( 0.5_dp*(U_(i,j,k)+U_(i,j,k+1)) * 0.5_dp*(W_(i,j,k)+W_(i+1,j,k)) &
+         - 0.5_dp*(U_(i,j,k-1)+U_(i,j,k)) * 0.5_dp*(W_(i,j,k-1)+W_(i+1,j,k-1)) ) / (z(k)-z(k-1))
+
+  end subroutine rhs_u_conv
+
+  !----------------------------------------------------------------------------
+  ! rhs_u_visc — DNS viscous term + imposed pressure gradient for u
+  ! (equations.f90:71-94, LES_model == 0 branch). Accumulates
+  !   rhs_u += dPdx + nu * Laplacian(U)
+  ! with the conservative staggered Laplacian: fluxes at x-faces (spacing
+  ! dx_1/dx_2), y-centers (yg spacings), z-faces (zg spacings), divided by
+  ! the u-cell widths dx_3 = xg(i+1)-xg(i), dy_3 = y(j)-y(j-1),
+  ! dz_3 = z(k)-z(k-1).
+  !----------------------------------------------------------------------------
+  attributes(global) subroutine rhs_u_visc(U_, rhs_u, x, xg, y, yg, z, zg,  &
+                                           nu, dPdx, nx, ny, nz, nxg, nyg, nzg)
+
+    integer, value :: nx, ny, nz, nxg, nyg, nzg
+    real(dp), value :: nu, dPdx
+    real(dp), intent(in)    :: U_(nx, nyg, nzg)
+    real(dp), intent(inout) :: rhs_u(2:nx-1, 2:nyg-1, 2:nzg-1)
+    real(dp), intent(in)    :: x(nx), xg(nxg), y(ny), yg(nyg), z(nz), zg(nzg)
+
+    integer  :: i, j, k
+    real(dp) :: dx_1, dx_2, dx_3, dy_3, dz_1, dz_2, dz_3
+
+    i = 2 + (blockIdx%x - 1)*blockDim%x + threadIdx%x - 1
+    j = 2 + (blockIdx%y - 1)*blockDim%y + threadIdx%y - 1
+    k = 2 + (blockIdx%z - 1)*blockDim%z + threadIdx%z - 1
+    if (i > nx-1 .or. j > nyg-1 .or. k > nzg-1) return
+
+    dx_1 = x(i) - x(i-1)
+    dx_2 = x(i+1) - x(i)
+    dx_3 = xg(i+1) - xg(i)
+    dy_3 = y(j) - y(j-1)
+    dz_1 = zg(k) - zg(k-1)
+    dz_2 = zg(k+1) - zg(k)
+    dz_3 = z(k) - z(k-1)
+    rhs_u(i,j,k) = rhs_u(i,j,k) + dPdx + nu * ( &
+       (1.0_dp/dx_2*(U_(i+1,j,k)-U_(i,j,k)) - 1.0_dp/dx_1*(U_(i,j,k)-U_(i-1,j,k)))/dx_3 + &
+       ((U_(i,j+1,k)-U_(i,j,k))/(yg(j+1)-yg(j)) - (U_(i,j,k)-U_(i,j-1,k))/(yg(j)-yg(j-1)))/dy_3 + &
+       (1.0_dp/dz_2*(U_(i,j,k+1)-U_(i,j,k)) - 1.0_dp/dz_1*(U_(i,j,k)-U_(i,j,k-1)))/dz_3 )
+
+  end subroutine rhs_u_visc
+
+  !----------------------------------------------------------------------------
+  ! rhs_u_dummy — zero the dummy last x-plane of rhs_u
+  ! (equations.f90:149-154): rhs_u(nx-1, j, k) = 0 for j = 2..nyg-1,
+  ! k = 2..nzg-1. The last u-face duplicates plane nx-1 (outflow BC), so its
+  ! RHS is never used and is kept at exactly zero as in the reference.
+  ! 2-D mapping: j on block x, k on block y.
+  !----------------------------------------------------------------------------
+  attributes(global) subroutine rhs_u_dummy(rhs_u, nx, nyg, nzg)
+
+    integer, value :: nx, nyg, nzg
+    real(dp), intent(inout) :: rhs_u(2:nx-1, 2:nyg-1, 2:nzg-1)
+
+    integer :: j, k
+
+    j = 2 + (blockIdx%x - 1)*blockDim%x + threadIdx%x - 1
+    k = 2 + (blockIdx%y - 1)*blockDim%y + threadIdx%y - 1
+    if (j > nyg-1 .or. k > nzg-1) return
+
+    rhs_u(nx-1,j,k) = 0.0_dp
+
+  end subroutine rhs_u_dummy
+
+  !===========================================================================
+  ! kernels — v component (equations.f90:183-230, 287-292)
+  !===========================================================================
+
+  !----------------------------------------------------------------------------
+  ! rhs_v_conv — convective terms of the v equation, fully inlined
+  ! (equations.f90:183-204). For each interior v-point:
+  !   1) -dv^2/dy : interp_y(V, faces->centers) = 0.5 average, then d/dy
+  !      over the center spacing yg(j+1)-yg(j)
+  !   2) -duv/dx  : interp_y(U, centers->y-faces) = weighted,
+  !      interp_x(V, centers->x-faces) = 0.5 average, then d/dx
+  !   3) -dvw/dz  : interp_z(V, centers->z-faces) = 0.5 average,
+  !      interp_y(W, centers->y-faces) = weighted, then d/dz
+  !----------------------------------------------------------------------------
+  attributes(global) subroutine rhs_v_conv(U_, V_, W_, rhs_v, x, yg, z,  &
+                                           weight_y_0, weight_y_1,       &
+                                           nx, ny, nz, nxg, nyg, nzg)
+
+    integer, value :: nx, ny, nz, nxg, nyg, nzg
+    real(dp), intent(in)  :: U_(nx,  nyg, nzg)
+    real(dp), intent(in)  :: V_(nxg, ny,  nzg)
+    real(dp), intent(in)  :: W_(nxg, nyg, nz )
+    real(dp), intent(out) :: rhs_v(2:nxg-1, 2:ny-1, 2:nzg-1)
+    real(dp), intent(in)  :: x(nx), yg(nyg), z(nz)
+    real(dp), intent(in)  :: weight_y_0(ny), weight_y_1(ny)
+
+    integer :: i, j, k
+
+    i = 2 + (blockIdx%x - 1)*blockDim%x + threadIdx%x - 1
+    j = 2 + (blockIdx%y - 1)*blockDim%y + threadIdx%y - 1
+    k = 2 + (blockIdx%z - 1)*blockDim%z + threadIdx%z - 1
+    if (i > nxg-1 .or. j > ny-1 .or. k > nzg-1) return
+
+    ! 1) -dv^2/dy (interp_y faces->centers = 0.5 average)
+    rhs_v(i,j,k) = -( (0.5_dp*(V_(i,j,k)+V_(i,j+1,k)))**2 &
+                     - (0.5_dp*(V_(i,j-1,k)+V_(i,j,k)))**2 ) / (yg(j+1)-yg(j))
+    ! 2) -duv/dx (interp_y centers->faces=weighted, interp_x centers->faces=0.5avg)
+    rhs_v(i,j,k) = rhs_v(i,j,k) &
+       - ( (weight_y_0(j)*U_(i,j,k)+weight_y_1(j)*U_(i,j+1,k)) &
+           * 0.5_dp*(V_(i,j,k)+V_(i+1,j,k)) &
+         - (weight_y_0(j)*U_(i-1,j,k)+weight_y_1(j)*U_(i-1,j+1,k)) &
+           * 0.5_dp*(V_(i-1,j,k)+V_(i,j,k)) ) / (x(i)-x(i-1))
+    ! 3) -dvw/dz (interp_z centers->faces=0.5avg, interp_y centers->faces=weighted)
+    rhs_v(i,j,k) = rhs_v(i,j,k) &
+       - ( 0.5_dp*(V_(i,j,k)+V_(i,j,k+1)) &
+           * (weight_y_0(j)*W_(i,j,k)+weight_y_1(j)*W_(i,j+1,k)) &
+         - 0.5_dp*(V_(i,j,k-1)+V_(i,j,k)) &
+           * (weight_y_0(j)*W_(i,j,k-1)+weight_y_1(j)*W_(i,j+1,k-1)) ) / (z(k)-z(k-1))
+
+  end subroutine rhs_v_conv
+
+  !----------------------------------------------------------------------------
+  ! rhs_v_visc — DNS viscous term for v (equations.f90:208-230,
+  ! LES_model == 0 branch). Accumulates
+  !   rhs_v += nu * Laplacian(V)
+  ! (no imposed pressure gradient in the v equation). Fluxes at x-centers
+  ! (xg spacings), y-faces (y spacings), z-faces (zg spacings), divided by
+  ! the v-cell widths dx_3 = x(i)-x(i-1), dy_3 = yg(j+1)-yg(j),
+  ! dz_3 = z(k)-z(k-1).
+  !----------------------------------------------------------------------------
+  attributes(global) subroutine rhs_v_visc(V_, rhs_v, x, xg, y, yg, z, zg,  &
+                                           nu, nx, ny, nz, nxg, nyg, nzg)
+
+    integer, value :: nx, ny, nz, nxg, nyg, nzg
+    real(dp), value :: nu
+    real(dp), intent(in)    :: V_(nxg, ny, nzg)
+    real(dp), intent(inout) :: rhs_v(2:nxg-1, 2:ny-1, 2:nzg-1)
+    real(dp), intent(in)    :: x(nx), xg(nxg), y(ny), yg(nyg), z(nz), zg(nzg)
+
+    integer  :: i, j, k
+    real(dp) :: dx_1, dx_2, dx_3, dy_1, dy_2, dy_3, dz_1, dz_2, dz_3
+
+    i = 2 + (blockIdx%x - 1)*blockDim%x + threadIdx%x - 1
+    j = 2 + (blockIdx%y - 1)*blockDim%y + threadIdx%y - 1
+    k = 2 + (blockIdx%z - 1)*blockDim%z + threadIdx%z - 1
+    if (i > nxg-1 .or. j > ny-1 .or. k > nzg-1) return
+
+    dx_1 = xg(i) - xg(i-1)
+    dx_2 = xg(i+1) - xg(i)
+    dx_3 = x(i) - x(i-1)
+    dy_1 = y(j) - y(j-1)
+    dy_2 = y(j+1) - y(j)
+    dy_3 = yg(j+1) - yg(j)
+    dz_1 = zg(k) - zg(k-1)
+    dz_2 = zg(k+1) - zg(k)
+    dz_3 = z(k) - z(k-1)
+    rhs_v(i,j,k) = rhs_v(i,j,k) + nu * ( &
+       (1.0_dp/dx_2*(V_(i+1,j,k)-V_(i,j,k)) - 1.0_dp/dx_1*(V_(i,j,k)-V_(i-1,j,k)))/dx_3 + &
+       (1.0_dp/dy_2*(V_(i,j+1,k)-V_(i,j,k)) - 1.0_dp/dy_1*(V_(i,j,k)-V_(i,j-1,k)))/dy_3 + &
+       (1.0_dp/dz_2*(V_(i,j,k+1)-V_(i,j,k)) - 1.0_dp/dz_1*(V_(i,j,k)-V_(i,j,k-1)))/dz_3 )
+
+  end subroutine rhs_v_visc
+
+  !----------------------------------------------------------------------------
+  ! rhs_v_dummy — zero the dummy last x-plane of rhs_v
+  ! (equations.f90:287-292): rhs_v(nxg-1, j, k) = 0 for j = 2..ny-1,
+  ! k = 2..nzg-1. 2-D mapping: j on block x, k on block y.
+  !----------------------------------------------------------------------------
+  attributes(global) subroutine rhs_v_dummy(rhs_v, ny, nxg, nzg)
+
+    integer, value :: ny, nxg, nzg
+    real(dp), intent(inout) :: rhs_v(2:nxg-1, 2:ny-1, 2:nzg-1)
+
+    integer :: j, k
+
+    j = 2 + (blockIdx%x - 1)*blockDim%x + threadIdx%x - 1
+    k = 2 + (blockIdx%y - 1)*blockDim%y + threadIdx%y - 1
+    if (j > ny-1 .or. k > nzg-1) return
+
+    rhs_v(nxg-1,j,k) = 0.0_dp
+
+  end subroutine rhs_v_dummy
+
+  !===========================================================================
+  ! kernels — w component (equations.f90:323-366, 408-413)
+  !===========================================================================
+
+  !----------------------------------------------------------------------------
+  ! rhs_w_conv — convective terms of the w equation, fully inlined
+  ! (equations.f90:323-342). For each interior w-point:
+  !   1) -dw^2/dz : interp_z(W, faces->centers) = 0.5 average, then d/dz
+  !      over the center spacing zg(k+1)-zg(k)
+  !   2) -duw/dx  : interp_z(U, centers->z-faces) = 0.5 average,
+  !      interp_x(W, centers->x-faces) = 0.5 average, then d/dx
+  !   3) -dvw/dy  : interp_z(V, centers->z-faces) = 0.5 average,
+  !      interp_y(W, centers->y-faces) = weighted, then d/dy
+  !----------------------------------------------------------------------------
+  attributes(global) subroutine rhs_w_conv(U_, V_, W_, rhs_w, x, y, zg,  &
+                                           weight_y_0, weight_y_1,       &
+                                           nx, ny, nz, nxg, nyg, nzg)
+
+    integer, value :: nx, ny, nz, nxg, nyg, nzg
+    real(dp), intent(in)  :: U_(nx,  nyg, nzg)
+    real(dp), intent(in)  :: V_(nxg, ny,  nzg)
+    real(dp), intent(in)  :: W_(nxg, nyg, nz )
+    real(dp), intent(out) :: rhs_w(2:nxg-1, 2:nyg-1, 2:nz-1)
+    real(dp), intent(in)  :: x(nx), y(ny), zg(nzg)
+    real(dp), intent(in)  :: weight_y_0(ny), weight_y_1(ny)
+
+    integer :: i, j, k
+
+    i = 2 + (blockIdx%x - 1)*blockDim%x + threadIdx%x - 1
+    j = 2 + (blockIdx%y - 1)*blockDim%y + threadIdx%y - 1
+    k = 2 + (blockIdx%z - 1)*blockDim%z + threadIdx%z - 1
+    if (i > nxg-1 .or. j > nyg-1 .or. k > nz-1) return
+
+    ! 1) -dw^2/dz (interp_z faces->centers = 0.5 average)
+    rhs_w(i,j,k) = -( (0.5_dp*(W_(i,j,k)+W_(i,j,k+1)))**2 &
+                     - (0.5_dp*(W_(i,j,k-1)+W_(i,j,k)))**2 ) / (zg(k+1)-zg(k))
+    ! 2) -duw/dx (interp_z centers->faces=0.5avg, interp_x centers->faces=0.5avg)
+    rhs_w(i,j,k) = rhs_w(i,j,k) &
+       - ( 0.5_dp*(U_(i,j,k)+U_(i,j,k+1)) * 0.5_dp*(W_(i,j,k)+W_(i+1,j,k)) &
+         - 0.5_dp*(U_(i-1,j,k)+U_(i-1,j,k+1)) * 0.5_dp*(W_(i-1,j,k)+W_(i,j,k)) ) / (x(i)-x(i-1))
+    ! 3) -dvw/dy (interp_z centers->faces=0.5avg, interp_y centers->faces=weighted)
+    rhs_w(i,j,k) = rhs_w(i,j,k) &
+       - ( 0.5_dp*(V_(i,j,k)+V_(i,j,k+1)) &
+           * (weight_y_0(j)*W_(i,j,k)+weight_y_1(j)*W_(i,j+1,k)) &
+         - 0.5_dp*(V_(i,j-1,k)+V_(i,j-1,k+1)) &
+           * (weight_y_0(j-1)*W_(i,j-1,k)+weight_y_1(j-1)*W_(i,j,k)) ) / (y(j)-y(j-1))
+
+  end subroutine rhs_w_conv
+
+  !----------------------------------------------------------------------------
+  ! rhs_w_visc — DNS viscous term + imposed spanwise pressure gradient for w
+  ! (equations.f90:346-366, LES_model == 0 branch). Accumulates
+  !   rhs_w += dPdz + nu * Laplacian(W)
+  ! Fluxes at x-centers (xg spacings), y-centers (yg spacings), z-faces
+  ! (z spacings), divided by the w-cell widths dx_3 = x(i)-x(i-1),
+  ! dy_3 = y(j)-y(j-1), dz_3 = zg(k+1)-zg(k).
+  !----------------------------------------------------------------------------
+  attributes(global) subroutine rhs_w_visc(W_, rhs_w, x, xg, y, yg, z, zg,  &
+                                           nu, dPdz, nx, ny, nz, nxg, nyg, nzg)
+
+    integer, value :: nx, ny, nz, nxg, nyg, nzg
+    real(dp), value :: nu, dPdz
+    real(dp), intent(in)    :: W_(nxg, nyg, nz)
+    real(dp), intent(inout) :: rhs_w(2:nxg-1, 2:nyg-1, 2:nz-1)
+    real(dp), intent(in)    :: x(nx), xg(nxg), y(ny), yg(nyg), z(nz), zg(nzg)
+
+    integer  :: i, j, k
+    real(dp) :: dx_1, dx_2, dx_3, dy_3, dz_1, dz_2, dz_3
+
+    i = 2 + (blockIdx%x - 1)*blockDim%x + threadIdx%x - 1
+    j = 2 + (blockIdx%y - 1)*blockDim%y + threadIdx%y - 1
+    k = 2 + (blockIdx%z - 1)*blockDim%z + threadIdx%z - 1
+    if (i > nxg-1 .or. j > nyg-1 .or. k > nz-1) return
+
+    dx_1 = xg(i) - xg(i-1)
+    dx_2 = xg(i+1) - xg(i)
+    dx_3 = x(i) - x(i-1)
+    dy_3 = y(j) - y(j-1)
+    dz_1 = z(k) - z(k-1)
+    dz_2 = z(k+1) - z(k)
+    dz_3 = zg(k+1) - zg(k)
+    rhs_w(i,j,k) = rhs_w(i,j,k) + dPdz + nu * ( &
+       (1.0_dp/dx_2*(W_(i+1,j,k)-W_(i,j,k)) - 1.0_dp/dx_1*(W_(i,j,k)-W_(i-1,j,k)))/dx_3 + &
+       ((W_(i,j+1,k)-W_(i,j,k))/(yg(j+1)-yg(j)) - (W_(i,j,k)-W_(i,j-1,k))/(yg(j)-yg(j-1)))/dy_3 + &
+       (1.0_dp/dz_2*(W_(i,j,k+1)-W_(i,j,k)) - 1.0_dp/dz_1*(W_(i,j,k)-W_(i,j,k-1)))/dz_3 )
+
+  end subroutine rhs_w_visc
+
+  !----------------------------------------------------------------------------
+  ! rhs_w_dummy — zero the dummy last x-plane of rhs_w
+  ! (equations.f90:408-413): rhs_w(nxg-1, j, k) = 0 for j = 2..nyg-1,
+  ! k = 2..nz-1. 2-D mapping: j on block x, k on block y.
+  !----------------------------------------------------------------------------
+  attributes(global) subroutine rhs_w_dummy(rhs_w, nz, nxg, nyg)
+
+    integer, value :: nz, nxg, nyg
+    real(dp), intent(inout) :: rhs_w(2:nxg-1, 2:nyg-1, 2:nz-1)
+
+    integer :: j, k
+
+    j = 2 + (blockIdx%x - 1)*blockDim%x + threadIdx%x - 1
+    k = 2 + (blockIdx%y - 1)*blockDim%y + threadIdx%y - 1
+    if (j > nyg-1 .or. k > nz-1) return
+
+    rhs_w(nxg-1,j,k) = 0.0_dp
+
+  end subroutine rhs_w_dummy
+
+end module rhs_kernels
