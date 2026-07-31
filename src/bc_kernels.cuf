@@ -1,0 +1,636 @@
+!=======================================================================
+! bc_kernels.cuf — GPU boundary conditions for the single-GPU CUDA
+! Fortran port of the boundary-layer DNS solver.
+!
+! Reference provenance
+! --------------------
+! Port of Subroutine apply_boundary_conditions_gpu,
+! boundary_conditions.f90 lines 127-262 (the OpenACC GPU path), which is
+! the semantic reference for nprocs = 1, inflow_boundary_flag = 1,
+! top_boundary_flag = 0, iwall_model = 0 (the only configuration Phase 2
+! supports; param_mod::check_supported rejects everything else).
+! Loop bodies are transcribed VERBATIM (same expressions, same operation
+! order; d0 literals -> _dp) per docs/CUDA_PORT_DESIGN.md.
+!
+! BC sequence implemented by apply_bc (reference order):
+!   1. ghost-plane exchange            — no-op at nprocs = 1 (dropped)
+!   2. temporal-inflow synthesis       — Ut/Vt/Wt_inlet from Fourier
+!      modes (only when n_modes_inlet > 0)          [ref lines 137-180]
+!   3. inflow application at i = 1     — Blasius base + perturbation
+!                                                   [ref lines 181-190]
+!   4. convective outflow at i = n-1,n — from Uo/Vo/Wo and rk_t(s)*dt
+!                                                   [ref lines 192-201]
+!   5. periodic z (centers for U,V; faces for W)    [ref lines 203-216]
+!   6. Dirichlet top from U_top/V_top/W_top         [ref lines 218-227]
+!   7. no-slip wall (U,W antisymmetric ghost, V=0)  [ref lines 229-237]
+!   8. global mass conservation (deterministic device reduction,
+!      NO MPI: Q_total = Q_local)                   [ref lines 239-260]
+!
+! Dependency notes (binding for the integrator)
+! ---------------------------------------------
+! * rk_t(rk_step)*dt and the substep time t are ARGUMENTS of apply_bc,
+!   not use-associated from timestep_mod, to avoid a circular module
+!   dependency (timestep_mod calls apply_bc). timestep_mod must pass
+!   them exactly as the reference sets its globals — see the apply_bc
+!   header, including the RK2 quirk documented there.
+! * The inflow/top tables are use-associated from ic_inflow_mod, whose
+!   writer runs in parallel with this file's. The names/shapes assumed
+!   here follow the design-doc convention (reference global.f90 names,
+!   device copies suffixed _d) and the reference allocations
+!   (boundary_conditions.f90:1380-1388, 1690-1700); see the use
+!   statement below for the exact assumed list.
+!
+! Thread mapping
+! --------------
+! Every kernel here works on a 2-D index plane (a boundary of the 3-D
+! box). Per the design-doc convention the block is dim3(64,4,1) with the
+! FIRST varying index on threadIdx%x, grid extents from ceil_div, and an
+! upper-bounds guard inside the kernel. All launches go to the default
+! stream, so the BC sequence is stream-ordered with the rest of the
+! timestep; reductions.cuf calls are synchronous.
+!
+! Determinism: no atomics anywhere; the mass-flux integrals use the
+! fixed-order reductions of reductions.cuf (device_wsum3). Same input
+! -> bitwise-same result every run.
+!
+! Debug builds (make DEBUG=1 -> -DDEBUG_KERNELS, file compiled with
+! preprocessing): every kernel launch is checked with cudaGetLastError
+! and aborts with the kernel name on failure.
+!=======================================================================
+module bc_kernels
+
+  use cudafor
+  use precision_mod, only: dp, ceil_div
+  use grid_mod,      only: nx, ny, nz, nxg, nyg, nzg, &   ! sizes
+                           x, y, xg,                  &   ! host grids
+                           z_d, zg_d                      ! device z coords
+  use field_mod,     only: U_d, V_d, W_d, Uo_d, Vo_d, Wo_d
+  !--------------------------------------------------------------------
+  ! ASSUMED ic_inflow_mod public API (module written in parallel; names
+  ! follow the design-doc _d convention and reference global.f90):
+  !   host:   integer  :: n_modes_inlet, m_modes_inlet
+  !           real(dp) :: U_top(nx)               (host mirror; only
+  !                       U_top(nx) is read here, for Uc)
+  !   device: real(dp)    :: U_inlet_d(nyg), V_inlet_d(ny), W_inlet_d(nyg)
+  !           real(dp)    :: U_top_d(nx), V_top_d(nxg), W_top_d(nxg)
+  !           real(dp)    :: Ut_inlet_d(nyg,nzg), Vt_inlet_d(ny,nzg),
+  !                          Wt_inlet_d(nyg,nz)
+  !                          (allocated AND zero-initialized even when
+  !                           n_modes_inlet == 0, as in the reference's
+  !                           no-temporal-file branch, so the inflow
+  !                           addition below is always valid)
+  !           complex(dp) :: qu_inlet_d(nyg,n_modes_inlet,m_modes_inlet)
+  !                          qv_inlet_d(ny ,n_modes_inlet,m_modes_inlet)
+  !                          qw_inlet_d(nyg,n_modes_inlet,m_modes_inlet)
+  !           real(dp)    :: zmode_inlet_d(n_modes_inlet),
+  !                          tmode_inlet_d(m_modes_inlet)
+  ! If ic_inflow_mod ends up exporting different names, only this use
+  ! statement (and nothing else in the file) needs updating.
+  !--------------------------------------------------------------------
+  use ic_inflow_mod, only: n_modes_inlet, m_modes_inlet, U_top, &
+                           U_inlet_d, V_inlet_d, W_inlet_d, &
+                           U_top_d, V_top_d, W_top_d, &
+                           Ut_inlet_d, Vt_inlet_d, Wt_inlet_d, &
+                           qu_inlet_d, qv_inlet_d, qw_inlet_d, &
+                           zmode_inlet_d, tmode_inlet_d
+  use reductions,    only: device_wsum3
+
+  implicit none
+  private
+
+  public :: apply_bc
+  public :: bc_finalize
+
+  ! Thread-block shape for all 2-D plane kernels (design-doc convention).
+  integer, parameter :: BX = 64, BY = 4
+
+  !--------------------------------------------------------------------
+  ! Mass-conservation scratch, built once on first apply_bc call
+  ! (grid is time-invariant):
+  !   dy_d(j) = y(j) - y(j-1)   for j = 2..nyg-1   (0 elsewhere)
+  !   dx_d(i) = x(i) - x(i-1)   for i = 2..nxg-2   (0 elsewhere)
+  !   length_y = sum_{j=2}^{nyg-1} ( y(j) - y(j-1) )  [host, verbatim
+  !              accumulation order of boundary_conditions.f90:245-248]
+  ! The precomputed spacings are bitwise-identical to the reference's
+  ! inline subtractions (host and device grids hold identical values).
+  !--------------------------------------------------------------------
+  real(dp), device, allocatable :: dy_d(:), dx_d(:)
+  real(dp) :: length_y = 0.0_dp
+  logical  :: bc_initialized = .false.
+
+contains
+
+  !====================================================================
+  ! Host-side helpers
+  !====================================================================
+
+  !> Debug-build kernel-launch check; aborts with the kernel name.
+  subroutine debug_check(kname)
+    character(*), intent(in) :: kname
+#ifdef DEBUG_KERNELS
+    integer :: istat
+    istat = cudaGetLastError()
+    if (istat /= cudaSuccess) then
+       write (*, '(a)') 'bc_kernels: kernel '//kname//' failed: ' &
+                        //trim(cudaGetErrorString(istat))
+       error stop 1
+    end if
+#endif
+  end subroutine debug_check
+
+  !> One-time setup of the mass-conservation scratch (see above).
+  subroutine bc_setup()
+    real(dp), allocatable :: dyh(:), dxh(:)
+    integer :: i, j
+
+    allocate (dyh(nyg), dxh(nxg))
+    dyh = 0.0_dp
+    dxh = 0.0_dp
+
+    ! y(j)-y(j-1) over the reduction's j range 2..nyg-1 (nyg-1 == ny)
+    do j = 2, nyg - 1
+       dyh(j) = y(j) - y(j-1)
+    end do
+    ! x(i)-x(i-1) over the reduction's i range 2..nxg-2 (nxg-2 == nx-1)
+    do i = 2, nxg - 2
+       dxh(i) = x(i) - x(i-1)
+    end do
+
+    allocate (dy_d(nyg), dx_d(nxg))
+    dy_d = dyh
+    dx_d = dxh
+    deallocate (dyh, dxh)
+
+    ! length_y — verbatim host accumulation (boundary_conditions.f90:
+    ! 245-248; grid-only, so computed once instead of every call:
+    ! identical value every step).
+    length_y = 0.0_dp
+    do j = 2, nyg - 1
+       length_y = length_y + y(j) - y(j-1)
+    end do
+
+    bc_initialized = .true.
+  end subroutine bc_setup
+
+  !> Free the mass-conservation scratch (optional, at shutdown).
+  subroutine bc_finalize()
+    if (allocated(dy_d)) deallocate (dy_d)
+    if (allocated(dx_d)) deallocate (dx_d)
+    bc_initialized = .false.
+  end subroutine bc_finalize
+
+  !====================================================================
+  ! Kernels
+  !====================================================================
+
+  !--------------------------------------------------------------------
+  ! bc_synth_kernel — temporal-inflow Fourier synthesis
+  ! (boundary_conditions.f90:137-180, all three loops share this body).
+  !
+  ! For each boundary point (j,k) of one perturbation table:
+  !
+  !   Qt(j,k) = sum_{n=1}^{nmod} sum_{m=1}^{mmod}
+  !             Real( q(j,n,m) * cdexp( i*zmode(n)*zc(k)
+  !                                   - i*tmode(m)*t ) )
+  !
+  ! i.e. the real part of the (spanwise wavenumber, temporal frequency)
+  ! mode expansion evaluated at spanwise coordinate zc(k) and time t.
+  ! Called three times: Ut (nj=nyg, nk=nzg, zc=zg), Vt (nj=ny, nk=nzg,
+  ! zc=zg), Wt (nj=nyg, nk=nz, zc=z — W lives on z-faces).
+  !
+  ! The in-kernel cdexp structure is kept VERBATIM (one complex exp per
+  ! (n,m) term, accumulation in the reference's n-outer/m-inner order);
+  ! hoisting/precomputation is Phase 3. The accumulator is a register
+  ! initialized to 0 exactly like the reference's Qt(j,k) = 0d0, with
+  ! bit-identical addition order.
+  !--------------------------------------------------------------------
+  attributes(global) subroutine bc_synth_kernel(Qt, q, zmode, tmode, zc, &
+                                                t, nj, nk, nmod, mmod)
+    integer,     value       :: nj, nk, nmod, mmod
+    real(dp),    value       :: t
+    real(dp),    intent(out) :: Qt(nj, nk)
+    complex(dp), intent(in)  :: q(nj, nmod, mmod)
+    real(dp),    intent(in)  :: zmode(nmod), tmode(mmod), zc(nk)
+    integer  :: j, k, n, m
+    real(dp) :: acc
+
+    j = (blockIdx%x - 1)*blockDim%x + threadIdx%x
+    k = (blockIdx%y - 1)*blockDim%y + threadIdx%y
+    if (j > nj .or. k > nk) return
+
+    acc = 0.0_dp                                  ! Qt(j,k) = 0d0
+    do n = 1, nmod
+       do m = 1, mmod
+          acc = acc + &
+             real( q(j,n,m)*exp( cmplx(0.0_dp,1.0_dp,dp)*zmode(n)*zc(k) &
+                   - cmplx(0.0_dp,1.0_dp,dp)*tmode(m)*t ) , dp)
+       end do
+    end do
+    Qt(j,k) = acc
+  end subroutine bc_synth_kernel
+
+  !--------------------------------------------------------------------
+  ! bc_inflow_kernel — apply the inflow plane at i = 1
+  ! (boundary_conditions.f90:181-190):
+  !
+  !   F(1,j,k) = base(j) + pert(j,k)      j = 1..n2, k = 1..n3
+  !
+  ! base = steady Blasius profile (U_inlet/V_inlet/W_inlet), pert = the
+  ! temporal perturbation table (Ut/Vt/Wt_inlet, zero when no modes).
+  !--------------------------------------------------------------------
+  attributes(global) subroutine bc_inflow_kernel(F, n1, n2, n3, base, pert)
+    integer,  value         :: n1, n2, n3
+    real(dp), intent(inout) :: F(n1, n2, n3)
+    real(dp), intent(in)    :: base(n2), pert(n2, n3)
+    integer :: j, k
+
+    j = (blockIdx%x - 1)*blockDim%x + threadIdx%x
+    k = (blockIdx%y - 1)*blockDim%y + threadIdx%y
+    if (j > n2 .or. k > n3) return
+
+    F(1,j,k) = base(j) + pert(j,k)
+  end subroutine bc_inflow_kernel
+
+  !--------------------------------------------------------------------
+  ! bc_outflow_kernel — first-order convective outflow at the last
+  ! interior x-plane (boundary_conditions.f90:192-201), semi-discrete
+  ! dF/dt + Uc dF/dx = 0 advanced with the frozen beginning-of-step
+  ! field Fo:
+  !
+  !   F(n1-1,j,k) = Fo(n1-1,j,k)
+  !               - coef*( Fo(n1-1,j,k) - Fo(n1-2,j,k) )/dxo
+  !   F(n1  ,j,k) = F(n1-1,j,k)              (last plane is dummy)
+  !
+  ! coef = rk_t(rk_step)*dt*Uc and dxo = x(n-1)-x(n-2) (resp. xg) are
+  ! precomputed on the host in exactly the reference's evaluation order,
+  ! so the arithmetic is bit-identical to the inline expression.
+  ! Called for U (n1 = nx, dxo from x), V and W (n1 = nxg, dxo from xg).
+  ! Both plane writes happen in the same thread, so the copy uses the
+  ! freshly computed value — no ordering hazard.
+  !--------------------------------------------------------------------
+  attributes(global) subroutine bc_outflow_kernel(F, Fo, n1, n2, n3, coef, dxo)
+    integer,  value         :: n1, n2, n3
+    real(dp), value         :: coef, dxo
+    real(dp), intent(inout) :: F(n1, n2, n3)
+    real(dp), intent(in)    :: Fo(n1, n2, n3)
+    integer  :: j, k
+    real(dp) :: fnew
+
+    j = (blockIdx%x - 1)*blockDim%x + threadIdx%x
+    k = (blockIdx%y - 1)*blockDim%y + threadIdx%y
+    if (j > n2 .or. k > n3) return
+
+    fnew = Fo(n1-1,j,k) - coef*( Fo(n1-1,j,k) - Fo(n1-2,j,k) )/dxo
+    F(n1-1,j,k) = fnew
+    F(n1  ,j,k) = fnew
+  end subroutine bc_outflow_kernel
+
+  !--------------------------------------------------------------------
+  ! bc_periodic_z_centers_kernel — z-periodicity for a z-CENTERED array
+  ! (U, V; boundary_conditions.f90:204-212):
+  !
+  !   F(i,j,1)    = F(i,j,n3-2)     (left ghost  <- last interior)
+  !   F(i,j,n3-1) = F(i,j,2)        (right image <- first interior)
+  !   F(i,j,n3)   = F(i,j,3)        (right ghost <- second interior)
+  !
+  ! Source planes (n3-2, 2, 3) are disjoint from written planes
+  ! (1, n3-1, n3) for any n3 >= 5, so one thread per (i,j) doing all
+  ! three copies is race-free.
+  !--------------------------------------------------------------------
+  attributes(global) subroutine bc_periodic_z_centers_kernel(F, n1, n2, n3)
+    integer,  value         :: n1, n2, n3
+    real(dp), intent(inout) :: F(n1, n2, n3)
+    integer :: i, j
+
+    i = (blockIdx%x - 1)*blockDim%x + threadIdx%x
+    j = (blockIdx%y - 1)*blockDim%y + threadIdx%y
+    if (i > n1 .or. j > n2) return
+
+    F(i,j,1)    = F(i,j,n3-2)
+    F(i,j,n3-1) = F(i,j,2)
+    F(i,j,n3)   = F(i,j,3)
+  end subroutine bc_periodic_z_centers_kernel
+
+  !--------------------------------------------------------------------
+  ! bc_periodic_z_faces_kernel — z-periodicity for a z-FACE array
+  ! (W; boundary_conditions.f90:213-215):
+  !
+  !   F(i,j,1)  = F(i,j,n3-1)       (first face <- periodic image)
+  !   F(i,j,n3) = F(i,j,2)          (last face  <- periodic image)
+  !--------------------------------------------------------------------
+  attributes(global) subroutine bc_periodic_z_faces_kernel(F, n1, n2, n3)
+    integer,  value         :: n1, n2, n3
+    real(dp), intent(inout) :: F(n1, n2, n3)
+    integer :: i, j
+
+    i = (blockIdx%x - 1)*blockDim%x + threadIdx%x
+    j = (blockIdx%y - 1)*blockDim%y + threadIdx%y
+    if (i > n1 .or. j > n2) return
+
+    F(i,j,1)  = F(i,j,n3-1)
+    F(i,j,n3) = F(i,j,2)
+  end subroutine bc_periodic_z_faces_kernel
+
+  !--------------------------------------------------------------------
+  ! bc_top_kernel — Dirichlet top boundary (top_boundary_flag = 0;
+  ! boundary_conditions.f90:218-227): the free-stream profile Ftop(i)
+  ! is imposed on the topmost y-plane, which is the LAST y index of
+  ! each array (nyg for U and W ghosts, ny for the V face):
+  !
+  !   F(i,n2,k) = Ftop(i)           i = 1..n1, k = 1..n3
+  !--------------------------------------------------------------------
+  attributes(global) subroutine bc_top_kernel(F, n1, n2, n3, Ftop)
+    integer,  value         :: n1, n2, n3
+    real(dp), intent(inout) :: F(n1, n2, n3)
+    real(dp), intent(in)    :: Ftop(n1)
+    integer :: i, k
+
+    i = (blockIdx%x - 1)*blockDim%x + threadIdx%x
+    k = (blockIdx%y - 1)*blockDim%y + threadIdx%y
+    if (i > n1 .or. k > n3) return
+
+    F(i,n2,k) = Ftop(i)
+  end subroutine bc_top_kernel
+
+  !--------------------------------------------------------------------
+  ! bc_wall_antisym_kernel — no-slip wall for a y-CENTERED array
+  ! (U, W; boundary_conditions.f90:230-232, 235-236): antisymmetric
+  ! ghost so the wall-face interpolant vanishes:
+  !
+  !   F(i,1,k) = -F(i,2,k)
+  !--------------------------------------------------------------------
+  attributes(global) subroutine bc_wall_antisym_kernel(F, n1, n2, n3)
+    integer,  value         :: n1, n2, n3
+    real(dp), intent(inout) :: F(n1, n2, n3)
+    integer :: i, k
+
+    i = (blockIdx%x - 1)*blockDim%x + threadIdx%x
+    k = (blockIdx%y - 1)*blockDim%y + threadIdx%y
+    if (i > n1 .or. k > n3) return
+
+    F(i,1,k) = -F(i,2,k)
+  end subroutine bc_wall_antisym_kernel
+
+  !--------------------------------------------------------------------
+  ! bc_wall_zero_kernel — no-slip wall for the y-FACE array
+  ! (V; boundary_conditions.f90:233-234): zero wall-normal velocity at
+  ! the wall face:
+  !
+  !   F(i,1,k) = 0
+  !--------------------------------------------------------------------
+  attributes(global) subroutine bc_wall_zero_kernel(F, n1, n2, n3)
+    integer,  value         :: n1, n2, n3
+    real(dp), intent(inout) :: F(n1, n2, n3)
+    integer :: i, k
+
+    i = (blockIdx%x - 1)*blockDim%x + threadIdx%x
+    k = (blockIdx%y - 1)*blockDim%y + threadIdx%y
+    if (i > n1 .or. k > n3) return
+
+    F(i,1,k) = 0.0_dp
+  end subroutine bc_wall_zero_kernel
+
+  !--------------------------------------------------------------------
+  ! bc_massflux_correct_kernel — outflow correction of the global mass
+  ! balance (boundary_conditions.f90:257-260): the uniform velocity
+  ! increment Delta_U (computed on the host from the deterministic flux
+  ! reduction) is added to the outflow plane, and the dummy last plane
+  ! is refreshed from it:
+  !
+  !   F(n1-1,j,k) = F(n1-1,j,k) + Delta_U
+  !   F(n1  ,j,k) = F(n1-1,j,k)
+  !--------------------------------------------------------------------
+  attributes(global) subroutine bc_massflux_correct_kernel(F, n1, n2, n3, Delta_U)
+    integer,  value         :: n1, n2, n3
+    real(dp), value         :: Delta_U
+    real(dp), intent(inout) :: F(n1, n2, n3)
+    integer  :: j, k
+    real(dp) :: fnew
+
+    j = (blockIdx%x - 1)*blockDim%x + threadIdx%x
+    k = (blockIdx%y - 1)*blockDim%y + threadIdx%y
+    if (j > n2 .or. k > n3) return
+
+    fnew = F(n1-1,j,k) + Delta_U
+    F(n1-1,j,k) = fnew
+    F(n1  ,j,k) = fnew
+  end subroutine bc_massflux_correct_kernel
+
+  !====================================================================
+  ! apply_bc — public host wrapper: full BC application to U_d/V_d/W_d.
+  !
+  ! Port of apply_boundary_conditions_gpu (boundary_conditions.f90:
+  ! 127-262). Call after every RK advance and after every projection,
+  ! exactly where the reference time_integration.f90 calls it.
+  !
+  ! Arguments (passed by the caller = timestep_mod; they are arguments
+  ! rather than use-associated globals to avoid a circular dependency
+  ! bc_kernels <-> timestep_mod):
+  !
+  !   t      — substep physical time at which the temporal inflow modes
+  !            are evaluated. The reference sets its global t BEFORE
+  !            each BC call as
+  !               t = to + rk2_t(rk_step)*dt   (RK2 path)
+  !               t = to +  rk_t(rk_step)*dt   (RK3 path)
+  !            (time_integration.f90:226,277,375,417,459); pass that
+  !            value here.
+  !
+  !   rk_tdt — the factor rk_t(rk_step)*dt of the convective outflow.
+  !            REFERENCE QUIRK (must be reproduced for bitwise match):
+  !            apply_outflow_bc_x / the GPU path use the RK3 tableau
+  !            rk_t = (8/15, 2/3, 1) indexed by the current substep
+  !            EVEN when itime_step == 2 (rk_t is allocated
+  !            unconditionally, initialization.f90:517-522, while the
+  !            RK2 path sets t with rk2_t). So timestep_mod must pass
+  !            rk_t(rk_step)*dt — with rk_t the RK3 values — for BOTH
+  !            schemes, which then differs from (t - to) in RK2 runs.
+  !
+  ! Everything else (fields, grids, inflow tables) is use-associated
+  ! from field_mod / grid_mod / ic_inflow_mod.
+  !
+  ! Preconditions: grid_generate + grid_to_device done, fields
+  ! allocated, ic_inflow tables on the device. First call builds the
+  ! mass-conservation scratch (dy_d, dx_d, length_y).
+  !
+  ! All launches are stream-ordered on the default stream; the two
+  ! reduction calls synchronize internally, and the routine returns
+  ! with the final correction kernel enqueued (any subsequent
+  ! default-stream work or copy sees the completed BCs).
+  !====================================================================
+  subroutine apply_bc(t, rk_tdt)
+    real(dp), intent(in) :: t       ! substep time (see header)
+    real(dp), intent(in) :: rk_tdt  ! rk_t(rk_step)*dt (see header)
+
+    type(dim3) :: tBlock, gridS
+    real(dp)   :: Uc, coef, dxo_u, dxo_vw
+    real(dp)   :: Qx, Qy, Q_total, Delta_U
+
+    if (.not. bc_initialized) call bc_setup()
+
+    tBlock = dim3(BX, BY, 1)
+
+    !------------------------------------------------------------------
+    ! Ghost cell updates: nprocs=1 -> no-op (reference line 133)
+    !------------------------------------------------------------------
+
+    !------------------------------------------------------------------
+    ! 1. Temporal-inflow synthesis (reference lines 137-180): rebuild
+    !    the perturbation tables at the current substep time. Skipped
+    !    when there are no modes — the tables then stay identically
+    !    zero (set by ic_inflow_mod), as in the reference.
+    !------------------------------------------------------------------
+    if (n_modes_inlet > 0) then
+       ! Ut_inlet(j=1:nyg, k=1:nzg), spanwise coordinate zg (centers)
+       gridS = dim3(ceil_div(nyg, BX), ceil_div(nzg, BY), 1)
+       call bc_synth_kernel<<<gridS, tBlock>>>(Ut_inlet_d, qu_inlet_d, &
+            zmode_inlet_d, tmode_inlet_d, zg_d, t, nyg, nzg, &
+            n_modes_inlet, m_modes_inlet)
+       call debug_check('bc_synth_kernel(Ut)')
+
+       ! Vt_inlet(j=1:ny, k=1:nzg), spanwise coordinate zg (centers)
+       gridS = dim3(ceil_div(ny, BX), ceil_div(nzg, BY), 1)
+       call bc_synth_kernel<<<gridS, tBlock>>>(Vt_inlet_d, qv_inlet_d, &
+            zmode_inlet_d, tmode_inlet_d, zg_d, t, ny, nzg, &
+            n_modes_inlet, m_modes_inlet)
+       call debug_check('bc_synth_kernel(Vt)')
+
+       ! Wt_inlet(j=1:nyg, k=1:nz), spanwise coordinate z (faces)
+       gridS = dim3(ceil_div(nyg, BX), ceil_div(nz, BY), 1)
+       call bc_synth_kernel<<<gridS, tBlock>>>(Wt_inlet_d, qw_inlet_d, &
+            zmode_inlet_d, tmode_inlet_d, z_d, t, nyg, nz, &
+            n_modes_inlet, m_modes_inlet)
+       call debug_check('bc_synth_kernel(Wt)')
+    end if
+
+    !------------------------------------------------------------------
+    ! 2. Inflow application at i = 1 (reference lines 181-190):
+    !    U(1,j,:) = U_inlet(j) + Ut_inlet(j,:)   etc.
+    !------------------------------------------------------------------
+    gridS = dim3(ceil_div(nyg, BX), ceil_div(nzg, BY), 1)
+    call bc_inflow_kernel<<<gridS, tBlock>>>(U_d, nx, nyg, nzg, &
+         U_inlet_d, Ut_inlet_d)
+    call debug_check('bc_inflow_kernel(U)')
+
+    gridS = dim3(ceil_div(nyg, BX), ceil_div(nz, BY), 1)
+    call bc_inflow_kernel<<<gridS, tBlock>>>(W_d, nxg, nyg, nz, &
+         W_inlet_d, Wt_inlet_d)
+    call debug_check('bc_inflow_kernel(W)')
+
+    gridS = dim3(ceil_div(ny, BX), ceil_div(nzg, BY), 1)
+    call bc_inflow_kernel<<<gridS, tBlock>>>(V_d, nxg, ny, nzg, &
+         V_inlet_d, Vt_inlet_d)
+    call debug_check('bc_inflow_kernel(V)')
+
+    !------------------------------------------------------------------
+    ! 3. Convective outflow (reference lines 192-201). Uc = U_top(nx)
+    !    (free-stream velocity at the top-outlet corner, host mirror).
+    !    coef and the grid spacings replicate the reference's
+    !    left-to-right evaluation rk_t(rk_step)*dt*Uc*(...)/(x(nx-1)-
+    !    x(nx-2)) exactly: coef = (rk_t*dt)*Uc, then coef*(diff)/dxo.
+    !------------------------------------------------------------------
+    Uc     = U_top(nx)
+    coef   = rk_tdt*Uc
+    dxo_u  = x(nx-1)   - x(nx-2)
+    dxo_vw = xg(nxg-1) - xg(nxg-2)
+
+    gridS = dim3(ceil_div(nyg, BX), ceil_div(nzg, BY), 1)
+    call bc_outflow_kernel<<<gridS, tBlock>>>(U_d, Uo_d, nx, nyg, nzg, &
+         coef, dxo_u)
+    call debug_check('bc_outflow_kernel(U)')
+
+    gridS = dim3(ceil_div(ny, BX), ceil_div(nzg, BY), 1)
+    call bc_outflow_kernel<<<gridS, tBlock>>>(V_d, Vo_d, nxg, ny, nzg, &
+         coef, dxo_vw)
+    call debug_check('bc_outflow_kernel(V)')
+
+    gridS = dim3(ceil_div(nyg, BX), ceil_div(nz, BY), 1)
+    call bc_outflow_kernel<<<gridS, tBlock>>>(W_d, Wo_d, nxg, nyg, nz, &
+         coef, dxo_vw)
+    call debug_check('bc_outflow_kernel(W)')
+
+    !------------------------------------------------------------------
+    ! 4. Periodicity in z (reference lines 203-216): U, V are
+    !    z-centered (three ghost/image planes), W is z-faced (two).
+    !------------------------------------------------------------------
+    gridS = dim3(ceil_div(nx, BX), ceil_div(nyg, BY), 1)
+    call bc_periodic_z_centers_kernel<<<gridS, tBlock>>>(U_d, nx, nyg, nzg)
+    call debug_check('bc_periodic_z_centers_kernel(U)')
+
+    gridS = dim3(ceil_div(nxg, BX), ceil_div(ny, BY), 1)
+    call bc_periodic_z_centers_kernel<<<gridS, tBlock>>>(V_d, nxg, ny, nzg)
+    call debug_check('bc_periodic_z_centers_kernel(V)')
+
+    gridS = dim3(ceil_div(nxg, BX), ceil_div(nyg, BY), 1)
+    call bc_periodic_z_faces_kernel<<<gridS, tBlock>>>(W_d, nxg, nyg, nz)
+    call debug_check('bc_periodic_z_faces_kernel(W)')
+
+    !------------------------------------------------------------------
+    ! 5. Dirichlet top (top_flag = 0; reference lines 218-227).
+    !------------------------------------------------------------------
+    gridS = dim3(ceil_div(nx, BX), ceil_div(nzg, BY), 1)
+    call bc_top_kernel<<<gridS, tBlock>>>(U_d, nx, nyg, nzg, U_top_d)
+    call debug_check('bc_top_kernel(U)')
+
+    gridS = dim3(ceil_div(nxg, BX), ceil_div(nzg, BY), 1)
+    call bc_top_kernel<<<gridS, tBlock>>>(V_d, nxg, ny, nzg, V_top_d)
+    call debug_check('bc_top_kernel(V)')
+
+    gridS = dim3(ceil_div(nxg, BX), ceil_div(nz, BY), 1)
+    call bc_top_kernel<<<gridS, tBlock>>>(W_d, nxg, nyg, nz, W_top_d)
+    call debug_check('bc_top_kernel(W)')
+
+    !------------------------------------------------------------------
+    ! 6. No-slip wall (iwall_model = 0; reference lines 229-237).
+    !------------------------------------------------------------------
+    gridS = dim3(ceil_div(nx, BX), ceil_div(nzg, BY), 1)
+    call bc_wall_antisym_kernel<<<gridS, tBlock>>>(U_d, nx, nyg, nzg)
+    call debug_check('bc_wall_antisym_kernel(U)')
+
+    gridS = dim3(ceil_div(nxg, BX), ceil_div(nzg, BY), 1)
+    call bc_wall_zero_kernel<<<gridS, tBlock>>>(V_d, nxg, ny, nzg)
+    call debug_check('bc_wall_zero_kernel(V)')
+
+    gridS = dim3(ceil_div(nxg, BX), ceil_div(nz, BY), 1)
+    call bc_wall_antisym_kernel<<<gridS, tBlock>>>(W_d, nxg, nyg, nz)
+    call debug_check('bc_wall_antisym_kernel(W)')
+
+    !------------------------------------------------------------------
+    ! 7. Global mass conservation (reference lines 239-260), NO MPI:
+    !    Q_total = Q_local. nprocs = 1 puts this rank last, so kk = 2
+    !    and the z range is 2:nzg-2 (last periodic point excluded);
+    !    nzg_global == nzg in the Delta_U denominator.
+    !
+    !    Flux integrals via the deterministic weighted-sum reduction:
+    !      Qx = sum_{j=2:nyg-1, k=2:nzg-2}
+    !             ( U(1,j,k) - U(nx-1,j,k) )*( y(j)-y(j-1) )
+    !      Qy = sum_{i=2:nxg-2, k=2:nzg-2}
+    !             ( V(i,1,k) - V(i,ny,k) )*( x(i)-x(i-1) )
+    !    computed as plane-wsum minus plane-wsum (each wsum is
+    !    fixed-order; the plane split only changes rounding order,
+    !    which the OpenACC reduction never guaranteed either — well
+    !    within the 1e-8 gate, see reductions.cuf notes).
+    !------------------------------------------------------------------
+    Qx = device_wsum3(U_d, nx, nyg, nzg,    1,     1, 2, nyg-1, 2, nzg-2, &
+                      dy_d, nyg, 2) &
+       - device_wsum3(U_d, nx, nyg, nzg, nx-1,  nx-1, 2, nyg-1, 2, nzg-2, &
+                      dy_d, nyg, 2)
+    Qy = device_wsum3(V_d, nxg, ny, nzg,    2, nxg-2, 1,     1, 2, nzg-2, &
+                      dx_d, nxg, 1) &
+       - device_wsum3(V_d, nxg, ny, nzg,    2, nxg-2, ny,   ny, 2, nzg-2, &
+                      dx_d, nxg, 1)
+
+    ! total mass flow (Q_local = Qx_local + Qy_local; Allreduce dropped)
+    Q_total = Qx + Qy
+
+    ! velocity correction (reference line 256; nzg_global-3 -> nzg-3)
+    Delta_U = Q_total/length_y/real(nzg-3, dp)
+
+    ! U(nx-1,:,:) += Delta_U; U(nx,:,:) = U(nx-1,:,:)
+    gridS = dim3(ceil_div(nyg, BX), ceil_div(nzg, BY), 1)
+    call bc_massflux_correct_kernel<<<gridS, tBlock>>>(U_d, nx, nyg, nzg, &
+         Delta_U)
+    call debug_check('bc_massflux_correct_kernel(U)')
+
+  end subroutine apply_bc
+
+end module bc_kernels

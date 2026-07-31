@@ -1,0 +1,1127 @@
+!------------------------------------------------------------------------------
+! poisson_mod — cuFFT pressure Poisson solver + fractional-step projection
+!
+! Part of the CUDA Fortran port of the boundary-layer DNS solver
+! (contract: docs/CUDA_PORT_DESIGN.md). Single GPU, nprocs = 1, no MPI.
+!
+! Purpose:
+!   Owns the whole pressure/projection concern of the fractional-step method:
+!     1. operator setup (host, once): modified wavenumbers kxx/kzz, the y
+!        second-derivative tridiagonal Dyy with its Neumann boundary closures
+!        and the 00-mode fix, mode maps, DCT-II twiddle factors, and the
+!        pre-factorized Thomas LU factors in the transposed (i,k,j) layout;
+!     2. cuFFT Z2Z plans (2D batched forward, strided 1D z-inverse, 1D
+!        x-inverse) via iso_c_binding interfaces, executed directly on
+!        device arrays (no host_data);
+!     3. the per-substep projection: rhs_p = div(u*), spectral Poisson solve
+!        (DCT-II in x by symmetric extension, DFT in z, Thomas in y),
+!        periodic-z fix-up, P save on substep 1, and u = u* - grad(phi);
+!     4. the deterministic divergence check for the monitor.
+!
+! Reference provenance (verbatim numerics):
+!   * operator setup:            initialization.f90, subroutine initialize
+!       Fourier sizes/dx/dz          lines ~253-283   (single-rank collapse)
+!       cuFFT plans + work arrays    lines ~310-326
+!       dct_twiddle                  lines ~317-320
+!       kxx / kzz                    lines ~329-344
+!       imode_map / kmode_map        lines ~347-356
+!       Dyy + boundary closures      lines ~394-425
+!       Thomas pre-factorization     lines ~428-469   (Block construct)
+!   * cuFFT plan parameters:     cufft_solver.f90, cufft_init_plans
+!   * solve sequence + kernels:  projection.f90
+!       compute_pseudo_pressure_rhs  lines 34-49
+!       solve_poisson_gpu            lines 93-204
+!       apply_periodic_z_pressure    lines 293-318    (nprocs = 1 path)
+!       P save on substep 1          lines 75-85
+!       project_velocity             lines 355-386
+!       check_divergence             lines 391-413
+!
+! Single-GPU simplifications:
+!   * nprocs = 1: nxp = nxm-1, nzp = nzm-1, mx = nxp-1, mz = nzp-1,
+!     imode_map/kmode_map are identities, and
+!     update_ghost_interior_planes_pressure (projection.f90:323-350) is a
+!     no-op (the reference returns immediately for nprocs = 1) — dropped.
+!   * The FFTW-MPI CPU fallback (solve_poisson_cpu) is not ported; the cuFFT
+!     path is always used (the reference's use_cufft flag is dropped).
+!
+! Determinism: all kernels write disjoint locations; the only reduction
+! (divergence max) goes through the deterministic reductions module.
+!
+! NOTE: this file needs preprocessing for the DEBUG_KERNELS path
+! (compile .cuf with -Mpreprocess or equivalent; `make DEBUG=1`).
+!------------------------------------------------------------------------------
+module poisson_mod
+
+  use, intrinsic :: iso_c_binding, only: c_int
+  use cudafor
+  use precision_mod, only: dp, pi, ceil_div
+  use grid_mod,      only: nx, ny, nz, nxm, nzm, nxg, nyg, nzg,         &
+                           y, yg, dx, dz,                               &
+                           x_d, y_d, z_d, xg_d, yg_d, zg_d
+  use field_mod,     only: U_d, V_d, W_d, P_d, rhs_p_d
+  use reductions,    only: device_max_abs3
+
+  implicit none
+  private
+
+  !----------------------------- public API ----------------------------------
+  public :: poisson_init       ! operator setup + cuFFT plans (call once)
+  public :: projection_step    ! full fractional-step projection (per substep)
+  public :: check_divergence   ! max |div(u)| over interior (monitor)
+  public :: poisson_finalize   ! destroy plans, free device work arrays
+
+  ! Fourier-space sizes (set by poisson_init; single-rank values):
+  !   nxp = nxm-1  points of the periodic x-domain (last face + duplicate
+  !                center column excluded), nzp = nzm-1 likewise in z,
+  !   mx  = nxp-1  highest x cosine-mode index (modes 0..mx),
+  !   mz  = nzp-1  highest z Fourier-mode index (modes 0..mz),
+  !   nm  = nyg-2  number of y-center planes = Thomas systems per mode.
+  integer, public :: nxp, nzp, mx, mz, nm
+
+  ! Device work arrays and operators (design-doc names; owned by this module):
+  !   plane_d     (2*nxp, nzp, nm)  DCT-II symmetric-extension complex plane
+  !   rhs_hat_d   (mx+1, nm, mz+1)  spectral RHS / solution (transposed in z)
+  !   dct_twiddle_d(0:mx)           exp(-i*pi*k/(2*nxp))
+  !   thomas_dl_fact_d / thomas_d_pivot_d (mx+1, mz+1, nm), thomas_du_d(nm)
+  !     pre-factorized LU of (Dyy + kxx + kzz) in the transposed (i,k,j)
+  !     layout for coalesced access; d_pivot stores 1/pivot (multiply,
+  !     not divide, at runtime).
+  complex(dp), device, allocatable, public :: plane_d(:,:,:)
+  complex(dp), device, allocatable, public :: rhs_hat_d(:,:,:)
+  complex(dp), device, allocatable, public :: dct_twiddle_d(:)
+  complex(dp), device, allocatable, public :: thomas_dl_fact_d(:,:,:)
+  complex(dp), device, allocatable, public :: thomas_d_pivot_d(:,:,:)
+  complex(dp), device, allocatable, public :: thomas_du_d(:)
+
+  !------------------------- private module state -----------------------------
+  ! host operator arrays (setup only)
+  real(dp),    allocatable :: kxx(:)              ! (0:mx) modified wavenumber, DCT-II in x
+  real(dp),    allocatable :: kzz(:)              ! (0:mz) modified wavenumber, DFT in z
+  complex(dp), allocatable :: Dyy(:,:)            ! (2:nyg-1, 2:nyg-1) y second-derivative matrix
+  integer,     allocatable :: imode_map(:)        ! (0:mx) local -> global x-mode (identity)
+  integer,     allocatable :: kmode_map(:)        ! (0:mz) local -> global z-mode (identity)
+  complex(dp), allocatable :: dct_twiddle(:)      ! (0:mx) host twiddle
+  complex(dp), allocatable :: thomas_dl_fact(:,:,:), thomas_d_pivot(:,:,:), thomas_du(:)
+
+  ! divergence scratch: div(i,j,k) on centers, interior i = 2..nxg-2 as in
+  ! the reference check (projection.f90:400-408); reduced by device_max_abs3.
+  real(dp), device, allocatable :: div_d(:,:,:)
+
+  ! nx2 = 2*nxp, length of the symmetric extension
+  integer :: nx2
+
+  ! cuFFT plan handles (cufft_solver.f90)
+  integer(c_int) :: cufft_plan_2d = 0   ! 2D C2C forward (2*nxp x nzp, nm batches)
+  integer(c_int) :: cufft_plan_zi = 0   ! 1D C2C inverse z (on rhs_hat_d)
+  integer(c_int) :: cufft_plan_xi = 0   ! 1D C2C inverse x (on plane_d)
+  logical        :: plans_created = .false.
+
+  ! RK tableau entry used by the reference P save (initialization.f90:511:
+  ! rk2_coef(1,1) = 1d0/2d0). The reference divides by dt*rk2_coef(1,1)
+  ! REGARDLESS of RK2/RK3 (projection.f90:77) — quirk copied exactly.
+  real(dp), parameter :: rk2_coef_1_1 = 1.0_dp/2.0_dp
+
+  !----------------------- cuFFT iso_c_binding interfaces ---------------------
+  ! Ported from cufft_solver.f90 (which used the NVHPC `cufft` module); here
+  ! the C entry points are bound directly. Device arrays are declared with
+  ! the `device` attribute in the interface, so cufftExecZ2Z is called
+  ! directly on device arrays (their device address is passed) — no
+  ! host_data, per the port design.
+  integer(c_int), parameter :: CUFFT_FORWARD = -1
+  integer(c_int), parameter :: CUFFT_INVERSE = +1
+  integer(c_int), parameter :: CUFFT_Z2Z     = int(z'69', c_int)  ! 105
+  integer(c_int), parameter :: CUFFT_SUCCESS = 0
+
+  interface
+     integer(c_int) function cufftPlanMany(plan, rank, n, inembed, istride,  &
+                                           idist, onembed, ostride, odist,   &
+                                           ctype, batch)                     &
+          bind(c, name='cufftPlanMany')
+       import :: c_int
+       integer(c_int)        :: plan          ! out: plan handle (by reference)
+       integer(c_int), value :: rank
+       integer(c_int)        :: n(*)
+       integer(c_int)        :: inembed(*)
+       integer(c_int), value :: istride, idist
+       integer(c_int)        :: onembed(*)
+       integer(c_int), value :: ostride, odist
+       integer(c_int), value :: ctype, batch
+     end function cufftPlanMany
+
+     integer(c_int) function cufftExecZ2Z(plan, idata, odata, direction)     &
+          bind(c, name='cufftExecZ2Z')
+       import :: c_int, dp
+       integer(c_int), value  :: plan
+       complex(dp), device    :: idata(*), odata(*)
+       integer(c_int), value  :: direction
+     end function cufftExecZ2Z
+
+     integer(c_int) function cufftDestroy(plan) bind(c, name='cufftDestroy')
+       import :: c_int
+       integer(c_int), value :: plan
+     end function cufftDestroy
+  end interface
+
+contains
+
+  !============================================================================
+  !                              INITIALIZATION
+  !============================================================================
+
+  !----------------------------------------------------------------------------
+  ! poisson_init — one-time host operator setup + device copies + cuFFT plans.
+  !
+  ! Call after grid_generate() / grid_to_device() and fields_allocate().
+  ! Transcribes, in order (initialization.f90):
+  !   Fourier sizes, cuFFT plans + work arrays, dct_twiddle, kxx, kzz,
+  !   imode_map/kmode_map, Dyy (+ Neumann closures), Thomas pre-factorization
+  !   with the 00-mode fix, then copies all device operators.
+  !----------------------------------------------------------------------------
+  subroutine poisson_init()
+
+    integer  :: i, j, k, ii, kk, jj, ig, kg
+    real(dp) :: a, b, c
+    complex(dp) :: dd
+
+    !----------------- Fourier sizes (initialization.f90:253-283) -------------
+    ! dx = dxmin, dz = dzmin are already set in grid_mod (grid_generate).
+    ! global points for periodic domain in physical space; single rank:
+    ! nxp = nxp_global = nxm_global-1, nzp = local rows of the FFTW
+    ! decomposition = nzp_global = nzm_global-1.
+    nxp = nxm - 1
+    nzp = nzm - 1
+    ! global indices for fourier modes starting from 0
+    mx  = nxp - 1
+    mz  = nzp - 1
+    ! number of y-center planes (batch count / Thomas system length)
+    nm  = nyg - 2
+    ! extension length for the half-size DCT trick
+    nx2 = 2*nxp
+
+    if ( nxp < 1 .or. nzp < 1 .or. nm < 1 ) &
+       stop ' ERROR: poisson_init called with invalid grid sizes'
+
+    write(*,*) 'initializing FFT...'
+
+    !------------- cuFFT plans (cufft_solver.f90:cufft_init_plans) ------------
+    call cufft_init_plans(nxp, nzp, nm)
+
+    !------------- device work arrays (initialization.f90:314-315) ------------
+    allocate ( plane_d  (2*nxp, nzp, nyg-2) )
+    allocate ( rhs_hat_d(mx+1,  nyg-2, mz+1) )
+    plane_d   = (0.0_dp, 0.0_dp)
+    rhs_hat_d = (0.0_dp, 0.0_dp)
+
+    !------------- DCT-II twiddle factors (initialization.f90:317-320) --------
+    ! dct_twiddle(i) = exp(-i*pi*i/(2*nxp)) for i = 0..mx
+    allocate ( dct_twiddle(0:mx) )
+    do i = 0, mx
+       dct_twiddle(i) = exp( cmplx( 0.0_dp, -pi*real(i,dp)/(2.0_dp*real(nxp,dp)), dp ) )
+    end do
+    write(*,*) 'cuFFT half-size DCT:', 2*nxp, 'x', nzp, ',', nyg-2, 'batches'
+
+    !------------- modified wavenumbers (initialization.f90:329-344) ----------
+    allocate ( kxx(0:mx), kzz(0:mz) )
+
+    ! modified wave-number for cosine transform
+    kxx = 0.0_dp
+    do i = 0, mx
+       kxx(i) = 2.0_dp*( cos(pi*real(i,dp)/real(nxp,dp)) - 1.0_dp )/dx**2.0_dp
+    end do
+
+    ! modified wave-number for Fourier transform
+    kzz = 0.0_dp
+    do k = 0, ceiling( real(nzp,dp)/2.0_dp )
+       kzz(k) = 2.0_dp*( cos(2.0_dp*pi*real(k,dp)/real(nzp,dp)) - 1.0_dp )/dz**2.0_dp
+    end do
+    do k = ceiling( real(nzp,dp)/2.0_dp )+1, mz
+       kzz(k) = 2.0_dp*( cos(2.0_dp*pi*real(-nzp+k,dp)/real(nzp,dp)) - 1.0_dp )/dz**2.0_dp
+    end do
+
+    !------------- mode maps (initialization.f90:347-356; myid = 0) -----------
+    allocate ( imode_map(0:mx), kmode_map(0:mz) )
+    imode_map = 0
+    kmode_map = 0
+    do i = 0, mx
+       imode_map(i) = i
+    end do
+    do k = 0, mz
+       kmode_map(k) = k          ! + myid*nslices_z = 0 for the single rank
+    end do
+
+    !------------- Dyy tridiagonal (initialization.f90:389-425) ---------------
+    write(*,*) 'initializing pressure solver...'
+    allocate ( Dyy(2:nyg-1, 2:nyg-1) )
+
+    ! second derivative matrix for pressure (full data in y assumed)
+    Dyy = 0.0_dp
+    do j = 3, nyg-2
+
+       a = 1.0_dp/( y(j)-y(j-1) )/( yg(j+1) - yg(j) )
+       b = 1.0_dp/( y(j)-y(j-1) )*( -1.0_dp/( yg(j+1) - yg(j) ) -1.0_dp/( yg(j) - yg(j-1) ) )
+       c = 1.0_dp/( y(j)-y(j-1) )/( yg(j) - yg(j-1) )
+
+       Dyy(j,j+1) = a
+       Dyy(j,j-1) = c
+       Dyy(j,j  ) = b
+
+    end do
+
+    ! Boundary conditions for pressure (full data in y assumed)
+    j = 2
+    a = 1.0_dp/( y(j)-y(j-1) )/( yg(j+1) - yg(j) )
+    b = 1.0_dp/( y(j)-y(j-1) )*( -1.0_dp/( yg(j+1) - yg(j) ) -1.0_dp/( yg(j) - yg(j-1) ) )
+    c = 1.0_dp/( y(j)-y(j-1) )/( yg(j) - yg(j-1) )
+    ! Neumann in V: p(1)==p(2)
+    Dyy(2,2) = b + c
+    Dyy(2,3) = a
+
+    j = nyg-1
+    a = 1.0_dp/( y(j)-y(j-1) )/( yg(j+1) - yg(j) )
+    b = 1.0_dp/( y(j)-y(j-1) )*( -1.0_dp/( yg(j+1) - yg(j) ) -1.0_dp/( yg(j) - yg(j-1) ) )
+    c = 1.0_dp/( y(j)-y(j-1) )/( yg(j) - yg(j-1) )
+    ! Neumann in V: p(nyg)==p(nyg-1)
+    Dyy(nyg-1,nyg-1) = a + b
+    Dyy(nyg-1,nyg-2) = c
+
+    !------------- Thomas pre-factorization (initialization.f90:428-469) ------
+    ! LU-factorize the tridiagonal (Dyy + kxx(i) + kzz(k)) for every (i,k)
+    ! mode pair. Transposed layout (i, k, j) for coalesced GPU access:
+    ! threads at (i,k) read thomas_*(i,k,jj), contiguous in i.
+    allocate ( thomas_dl_fact(mx+1, mz+1, nm) )
+    allocate ( thomas_d_pivot(mx+1, mz+1, nm) )
+    allocate ( thomas_du(nm) )
+
+    ! DU is the same for all modes
+    do jj = 1, nm-1
+       thomas_du(jj) = cmplx( Dyy(jj+1, jj+2), kind=dp )
+    end do
+    thomas_du(nm) = (0.0_dp, 0.0_dp)
+
+    ! Factorize each (i,k) mode (stored transposed)
+    do kk = 1, mz+1
+       do ii = 1, mx+1
+          ig = imode_map(ii-1)
+          kg = kmode_map(kk-1)
+          do jj = 1, nm
+             thomas_d_pivot(ii, kk, jj) = cmplx( Dyy(jj+1, jj+1) + kxx(ig) + kzz(kg), kind=dp )
+          end do
+          do jj = 1, nm-1
+             thomas_dl_fact(ii, kk, jj) = cmplx( Dyy(jj+2, jj+1), kind=dp )
+          end do
+          thomas_dl_fact(ii, kk, nm) = (0.0_dp, 0.0_dp)
+          ! 00-mode fix: the singular (0,0) mode gets D(2) scaled by 3/2
+          ! (pins the pressure level; same as the CPU path's D(2)=3/2*D(2))
+          if ( ig==0 .and. kg==0 ) thomas_d_pivot(ii, kk, 1) = 3.0_dp/2.0_dp * thomas_d_pivot(ii, kk, 1)
+          ! Forward elimination (factorize)
+          do jj = 2, nm
+             dd = thomas_dl_fact(ii, kk, jj-1) / thomas_d_pivot(ii, kk, jj-1)
+             thomas_dl_fact(ii, kk, jj-1) = dd
+             thomas_d_pivot(ii, kk, jj) = thomas_d_pivot(ii, kk, jj) - dd * thomas_du(jj-1)
+          end do
+          ! Invert D_pivot for multiply instead of divide at runtime
+          do jj = 1, nm
+             thomas_d_pivot(ii, kk, jj) = (1.0_dp, 0.0_dp) / thomas_d_pivot(ii, kk, jj)
+          end do
+       end do
+    end do
+    write(*,*) 'Thomas LU precomputed:', nm, 'x', mx+1, 'x', mz+1
+
+    !--------------------------- device operator copies -----------------------
+    allocate ( dct_twiddle_d(0:mx) )
+    allocate ( thomas_dl_fact_d(mx+1, mz+1, nm) )
+    allocate ( thomas_d_pivot_d(mx+1, mz+1, nm) )
+    allocate ( thomas_du_d(nm) )
+    dct_twiddle_d    = dct_twiddle
+    thomas_dl_fact_d = thomas_dl_fact
+    thomas_d_pivot_d = thomas_d_pivot
+    thomas_du_d      = thomas_du
+
+    !--------------------------- divergence scratch ---------------------------
+    ! interior-center divergence, i = 2..nxg-2 as in the reference check
+    allocate ( div_d(2:nxg-2, 2:nyg-1, 2:nzg-1) )
+    div_d = 0.0_dp
+
+  end subroutine poisson_init
+
+  !----------------------------------------------------------------------------
+  ! cufft_init_plans — create the three Z2Z plans (cufft_solver.f90:26-62),
+  ! identical plan parameters:
+  !   plan_2d: 2D C2C, logical size (nzp, 2*nxp) [C order], contiguous
+  !            batches of plane_d(2*nxp, nzp, nm)         -> forward
+  !   plan_zi: 1D C2C length nzp, stride nxp*nm, dist 1,
+  !            batch nxp*nm, on rhs_hat_d(nxp, nm, nzp)   -> inverse z
+  !   plan_xi: 1D C2C length 2*nxp, stride 1, dist 2*nxp,
+  !            batch nzp*nm, on plane_d                   -> inverse x
+  !----------------------------------------------------------------------------
+  subroutine cufft_init_plans(nxp_in, nzp_in, nm_in)
+
+    integer, intent(in) :: nxp_in, nzp_in, nm_in
+
+    integer(c_int) :: istat, n2(2), ne(2), n1(1), ne1(1)
+    integer(c_int) :: nx2_l
+
+    nx2_l = 2 * nxp_in
+
+    ! Plan 1: 2D C2C forward — plane_d(2*nxp, nzp, nm)
+    n2(1) = nzp_in;  n2(2) = nx2_l
+    ne(1) = nzp_in;  ne(2) = nx2_l
+    istat = cufftPlanMany(cufft_plan_2d, 2, n2, &
+         ne, 1, nx2_l*nzp_in, ne, 1, nx2_l*nzp_in, CUFFT_Z2Z, nm_in)
+    if (istat /= CUFFT_SUCCESS) then
+       write(*,*) 'cufftPlanMany 2D failed:', istat; stop
+    end if
+
+    ! Plan 2: 1D C2C inverse z — rhs_hat_d(nxp, nm, nzp)
+    ! stride = nxp*nm (between consecutive z-values)
+    ! dist = 1, batch = nxp*nm
+    n1(1) = nzp_in; ne1(1) = nzp_in
+    istat = cufftPlanMany(cufft_plan_zi, 1, n1, &
+         ne1, nxp_in*nm_in, 1, ne1, nxp_in*nm_in, 1, CUFFT_Z2Z, nxp_in*nm_in)
+    if (istat /= CUFFT_SUCCESS) then
+       write(*,*) 'cufftPlanMany zi failed:', istat; stop
+    end if
+
+    ! Plan 3: 1D C2C inverse x — plane_d(2*nxp, nzp, nm)
+    ! stride = 1, dist = 2*nxp, batch = nzp*nm
+    n1(1) = nx2_l; ne1(1) = nx2_l
+    istat = cufftPlanMany(cufft_plan_xi, 1, n1, &
+         ne1, 1, nx2_l, ne1, 1, nx2_l, CUFFT_Z2Z, nzp_in*nm_in)
+    if (istat /= CUFFT_SUCCESS) then
+       write(*,*) 'cufftPlanMany xi failed:', istat; stop
+    end if
+
+    plans_created = .true.
+
+  end subroutine cufft_init_plans
+
+  !----------------------------------------------------------------------------
+  ! poisson_finalize — destroy the cuFFT plans and free the module's device
+  ! and host work/operator arrays. Optional; call once at shutdown.
+  !----------------------------------------------------------------------------
+  subroutine poisson_finalize()
+
+    integer(c_int) :: istat
+
+    if (plans_created) then
+       istat = cufftDestroy(cufft_plan_2d)
+       istat = cufftDestroy(cufft_plan_zi)
+       istat = cufftDestroy(cufft_plan_xi)
+       plans_created = .false.
+    end if
+
+    if (allocated(plane_d))          deallocate (plane_d)
+    if (allocated(rhs_hat_d))        deallocate (rhs_hat_d)
+    if (allocated(dct_twiddle_d))    deallocate (dct_twiddle_d)
+    if (allocated(thomas_dl_fact_d)) deallocate (thomas_dl_fact_d)
+    if (allocated(thomas_d_pivot_d)) deallocate (thomas_d_pivot_d)
+    if (allocated(thomas_du_d))      deallocate (thomas_du_d)
+    if (allocated(div_d))            deallocate (div_d)
+
+    if (allocated(kxx))              deallocate (kxx)
+    if (allocated(kzz))              deallocate (kzz)
+    if (allocated(Dyy))              deallocate (Dyy)
+    if (allocated(imode_map))        deallocate (imode_map)
+    if (allocated(kmode_map))        deallocate (kmode_map)
+    if (allocated(dct_twiddle))      deallocate (dct_twiddle)
+    if (allocated(thomas_dl_fact))   deallocate (thomas_dl_fact)
+    if (allocated(thomas_d_pivot))   deallocate (thomas_d_pivot)
+    if (allocated(thomas_du))        deallocate (thomas_du)
+
+  end subroutine poisson_finalize
+
+  !============================================================================
+  !                           PROJECTION (per substep)
+  !============================================================================
+
+  !----------------------------------------------------------------------------
+  ! projection_step — full fractional-step projection of one RK substep
+  ! (projection.f90: compute_projection_step + solve_poisson_equation).
+  !
+  !   subroutine projection_step(rk_step, dt)
+  !     integer,  intent(in) :: rk_step   ! RK substep index (1-based)
+  !     real(dp), intent(in) :: dt        ! full-step time increment
+  !
+  ! Sequence (order exactly as the reference):
+  !   1. rhs_p = div(u*) on centers            [compute_pseudo_pressure_rhs]
+  !      (NOT divided by dt: the dt is folded into the eigenvalue scaling)
+  !   2. spectral Poisson solve on the GPU     [solve_poisson_gpu]
+  !   3. periodic-z fix-up of rhs_p            [apply_periodic_z_pressure]
+  !      (update_ghost_interior_planes_pressure is a no-op at nprocs = 1)
+  !   4. if rk_step == 1: P = rhs_p/(dt*rk2_coef(1,1)) + ghost-face copies
+  !      (reference quirk: rk2_coef(1,1) is used for RK3 runs too)
+  !   5. u = u* - grad(phi) on interior faces  [project_velocity]
+  !----------------------------------------------------------------------------
+  subroutine projection_step(rk_step, dt)
+
+    integer,  intent(in) :: rk_step
+    real(dp), intent(in) :: dt
+
+    call compute_pseudo_pressure_rhs()
+
+    call solve_poisson_gpu()
+
+    ! periodic boundary conditions in z
+    call apply_periodic_z_pressure()
+
+    ! save pressure for statistics
+    if ( rk_step == 1 ) call save_pressure(dt)
+
+    call project_velocity()
+
+  end subroutine projection_step
+
+  !----------------------------------------------------------------------------
+  ! compute_pseudo_pressure_rhs — rhs_p(i,j,k) = div(u*) at cell centers
+  ! (projection.f90:34-49), over i = 2..nxg-1, j = 2..nyg-1, k = 2..nzg-1.
+  !----------------------------------------------------------------------------
+  subroutine compute_pseudo_pressure_rhs()
+
+    type(dim3) :: tb, gr
+
+    tb = dim3(64, 4, 1)
+    gr = dim3( ceil_div(nxg-2, 64), ceil_div(nyg-2, 4), nzg-2 )
+    call k_pseudo_rhs<<<gr, tb>>>(rhs_p_d, U_d, V_d, W_d, x_d, y_d, z_d, &
+                                  nx, ny, nz, nxg, nyg, nzg)
+    call debug_check('k_pseudo_rhs')
+
+  end subroutine compute_pseudo_pressure_rhs
+
+  !----------------------------------------------------------------------------
+  ! solve_poisson_gpu — spectral Poisson solve, all on the GPU
+  ! (projection.f90:93-204). Sequence:
+  !   forward:  DCT-II symmetric pack -> 2D batched FFT -> twiddle extract
+  !   solve:    batched Thomas solve in y (pre-factorized LU per (i,k) mode)
+  !   inverse:  z-IFFT (makes data real in z-physical space) ->
+  !             zero/untwiddle/Hermitian-extension pack -> x-IFFT ->
+  !             extract with 1/(2*nxp*nzp) normalization
+  !----------------------------------------------------------------------------
+  subroutine solve_poisson_gpu()
+
+    type(dim3)     :: tb, gr
+    integer(c_int) :: istat
+    real(dp)       :: fft_norm
+
+    fft_norm = 1.0_dp / real(2*nxp*nzp, dp)
+    tb = dim3(64, 4, 1)
+
+    ! ======== FORWARD: symmetric pack -> 2D FFT -> twiddle extract ========
+
+    ! Pack DCT-II symmetric extension: g[0..N-1]=f, g[2N-1..N]=f[0..N-1]
+    gr = dim3( ceil_div(nxp, 64), ceil_div(nzp, 4), nm )
+    call k_pack_dct<<<gr, tb>>>(plane_d, rhs_p_d, nx2, nxp, nzp, nm, &
+                                nxg, nyg, nzg)
+    call debug_check('k_pack_dct')
+
+    ! 2D batched forward FFT (2*nxp x nzp, nm batches)
+    istat = cufftExecZ2Z(cufft_plan_2d, plane_d, plane_d, CUFFT_FORWARD)
+    call debug_check_cufft('cufftExecZ2Z(plan_2d fwd)', istat)
+
+    ! Extract modes with DCT-II twiddle
+    gr = dim3( ceil_div(mx+1, 64), ceil_div(mz+1, 4), nm )
+    call k_twiddle_extract<<<gr, tb>>>(rhs_hat_d, plane_d, dct_twiddle_d, &
+                                       mx+1, mz+1, nm, nx2, nzp)
+    call debug_check('k_twiddle_extract')
+
+    ! ======== THOMAS TRIDIAGONAL SOLVE (batched over (k,i) modes) ========
+    gr = dim3( ceil_div(mx+1, 64), ceil_div(mz+1, 4), 1 )
+    call k_thomas<<<gr, tb>>>(rhs_hat_d, thomas_dl_fact_d, thomas_d_pivot_d, &
+                              thomas_du_d, mx+1, mz+1, nm)
+    call debug_check('k_thomas')
+
+    ! ======== INVERSE: z-IFFT first (makes data real), then x-IDCT ========
+
+    ! Step 1: z-IFFT on rhs_hat_d (nzp-point, batched over nxp*nm)
+    ! After this, rhs_hat_d(i,b,k) is in z-physical space
+    istat = cufftExecZ2Z(cufft_plan_zi, rhs_hat_d, rhs_hat_d, CUFFT_INVERSE)
+    call debug_check_cufft('cufftExecZ2Z(plan_zi inv)', istat)
+
+    ! Step 2: un-twiddle + Hermitian extend into plane_d for x-IFFT
+    ! Data is now real in z-physical, so Hermitian in x is valid
+    gr = dim3( ceil_div(nx2, 64), ceil_div(nzp, 4), nm )
+    call k_zero_plane<<<gr, tb>>>(plane_d, nx2, nzp, nm)
+    call debug_check('k_zero_plane')
+
+    ! First nxp modes with inverse twiddle
+    gr = dim3( ceil_div(nxp, 64), ceil_div(nzp, 4), nm )
+    call k_untwiddle<<<gr, tb>>>(plane_d, rhs_hat_d, dct_twiddle_d, &
+                                 nxp, nx2, nzp, nm, mx+1, mz+1)
+    call debug_check('k_untwiddle')
+
+    ! Hermitian extension: plane(2N+2-ii) = conj(plane(ii)) for ii=2..nxp
+    gr = dim3( ceil_div(nxp-1, 64), ceil_div(nzp, 4), nm )
+    call k_hermitian_ext<<<gr, tb>>>(plane_d, nxp, nx2, nzp, nm)
+    call debug_check('k_hermitian_ext')
+
+    ! Step 3: x-IFFT (1D, batched over nzp*nm)
+    istat = cufftExecZ2Z(cufft_plan_xi, plane_d, plane_d, CUFFT_INVERSE)
+    call debug_check_cufft('cufftExecZ2Z(plan_xi inv)', istat)
+
+    ! Extract physical-space result (normalized)
+    gr = dim3( ceil_div(nxp, 64), ceil_div(nzp, 4), nm )
+    call k_extract_out<<<gr, tb>>>(rhs_p_d, plane_d, fft_norm, &
+                                   nxp, nx2, nzp, nm, nxg, nyg, nzg)
+    call debug_check('k_extract_out')
+
+  end subroutine solve_poisson_gpu
+
+  !----------------------------------------------------------------------------
+  ! apply_periodic_z_pressure — periodic fix-up of the solved rhs_p
+  ! (projection.f90:293-318, nprocs = 1 path):
+  !   rhs_p(nxg-1, :, :)       = rhs_p(nxg-2, :, :)   (duplicate last column)
+  !   rhs_p(2:nxg-1, :, nzp+2) = rhs_p(2:nxg-1, :, 2) (periodic image in z;
+  !                                                    nzp+1+1 = nzg-1)
+  !----------------------------------------------------------------------------
+  subroutine apply_periodic_z_pressure()
+
+    type(dim3) :: tb, gr
+    integer    :: kz
+
+    tb = dim3(64, 4, 1)
+
+    ! rhs_p( nxg-1, :, : ) = rhs_p( nxg-2, :, : ) over the full (j,k) extent
+    gr = dim3( ceil_div(nyg-2, 64), ceil_div(nzg-1, 4), 1 )
+    call k_periodic_x_copy<<<gr, tb>>>(rhs_p_d, nxg, nyg, nzg)
+    call debug_check('k_periodic_x_copy')
+
+    ! rhs_p( 2:nxg-1, :, nzp+1+1 ) = rhs_p( 2:nxg-1, :, 2 )
+    kz = nzp + 1 + 1
+    gr = dim3( ceil_div(nxg-2, 64), ceil_div(nyg-2, 4), 1 )
+    call k_periodic_z_copy<<<gr, tb>>>(rhs_p_d, kz, nxg, nyg, nzg)
+    call debug_check('k_periodic_z_copy')
+
+    ! update_ghost_interior_planes_pressure: no-op for nprocs = 1 (dropped)
+
+  end subroutine apply_periodic_z_pressure
+
+  !----------------------------------------------------------------------------
+  ! save_pressure — P save on RK substep 1 (projection.f90:75-85):
+  !   P(2:nxg-1, 2:nyg-1, 2:nzg-1) = rhs_p/(dt*rk2_coef(1,1))
+  ! followed by the six ghost-face copies, executed in the reference's
+  ! order (x faces, then y faces, then z faces) so the corner/edge values
+  ! match the sequential OpenACC kernels region exactly.
+  !
+  ! Reference quirks copied exactly:
+  !   * rk2_coef(1,1) = 1/2 is used regardless of RK2/RK3;
+  !   * the RHS `rhs_p` has one more z-plane (2:nzg) than the LHS section
+  !     (2:nzg-1); Fortran element-order pairing makes this the index-
+  !     aligned copy P(i,j,k) = rhs_p(i,j,k) over k = 2..nzg-1, which is
+  !     what the kernel implements.
+  !----------------------------------------------------------------------------
+  subroutine save_pressure(dt)
+
+    real(dp), intent(in) :: dt
+
+    type(dim3) :: tb, gr
+
+    tb = dim3(64, 4, 1)
+
+    gr = dim3( ceil_div(nxg-2, 64), ceil_div(nyg-2, 4), nzg-2 )
+    call k_save_pressure<<<gr, tb>>>(P_d, rhs_p_d, nxg, nyg, nzg, dt, rk2_coef_1_1)
+    call debug_check('k_save_pressure')
+
+    ! ghost faces: P(1,:,:)=P(2,:,:), P(nxg,:,:)=P(nxg-1,:,:)
+    gr = dim3( ceil_div(nyg, 64), ceil_div(nzg, 4), 1 )
+    call k_pressure_ghost_x<<<gr, tb>>>(P_d, nxg, nyg, nzg)
+    call debug_check('k_pressure_ghost_x')
+
+    ! ghost faces: P(:,1,:)=P(:,2,:), P(:,nyg,:)=P(:,nyg-1,:)
+    gr = dim3( ceil_div(nxg, 64), ceil_div(nzg, 4), 1 )
+    call k_pressure_ghost_y<<<gr, tb>>>(P_d, nxg, nyg, nzg)
+    call debug_check('k_pressure_ghost_y')
+
+    ! ghost faces: P(:,:,1)=P(:,:,2), P(:,:,nzg)=P(:,:,nzg-1)
+    gr = dim3( ceil_div(nxg, 64), ceil_div(nyg, 4), 1 )
+    call k_pressure_ghost_z<<<gr, tb>>>(P_d, nxg, nyg, nzg)
+    call debug_check('k_pressure_ghost_z')
+
+  end subroutine save_pressure
+
+  !----------------------------------------------------------------------------
+  ! project_velocity — u = u* - grad(phi) on interior faces
+  ! (projection.f90:355-386); phi is stored in rhs_p.
+  !----------------------------------------------------------------------------
+  subroutine project_velocity()
+
+    type(dim3) :: tb, gr
+
+    tb = dim3(64, 4, 1)
+
+    gr = dim3( ceil_div(nx-2, 64), ceil_div(nyg-2, 4), nzg-2 )
+    call k_project_u<<<gr, tb>>>(U_d, rhs_p_d, xg_d, nx, nxg, nyg, nzg)
+    call debug_check('k_project_u')
+
+    gr = dim3( ceil_div(nxg-2, 64), ceil_div(ny-2, 4), nzg-2 )
+    call k_project_v<<<gr, tb>>>(V_d, rhs_p_d, yg_d, ny, nxg, nyg, nzg)
+    call debug_check('k_project_v')
+
+    gr = dim3( ceil_div(nxg-2, 64), ceil_div(nyg-2, 4), nz-2 )
+    call k_project_w<<<gr, tb>>>(W_d, rhs_p_d, zg_d, nz, nxg, nyg, nzg)
+    call debug_check('k_project_w')
+
+  end subroutine project_velocity
+
+  !----------------------------------------------------------------------------
+  ! check_divergence — maximum |div(u)| over interior centers
+  ! (projection.f90:391-413), i = 2..nxg-2, j = 2..nyg-1, k = 2..nzg-1.
+  !
+  !   subroutine check_divergence(max_divergence)
+  !     real(dp), intent(out) :: max_divergence
+  !
+  ! The divergence is evaluated into the div_d scratch array by a kernel,
+  ! then reduced with the deterministic max-|.| reduction (reductions.cuf) —
+  ! no atomics, bitwise-reproducible. (The reference's MPI_Reduce is dropped:
+  ! single rank.)
+  !----------------------------------------------------------------------------
+  subroutine check_divergence(max_divergence)
+
+    real(dp), intent(out) :: max_divergence
+
+    type(dim3) :: tb, gr
+
+    tb = dim3(64, 4, 1)
+    gr = dim3( ceil_div(nxg-3, 64), ceil_div(nyg-2, 4), nzg-2 )
+    call k_divergence<<<gr, tb>>>(div_d, U_d, V_d, W_d, x_d, y_d, z_d, &
+                                  nx, ny, nz, nxg, nyg, nzg)
+    call debug_check('k_divergence')
+
+    max_divergence = device_max_abs3(div_d, nxg-3, nyg-2, nzg-2, &
+                                     1, nxg-3, 1, nyg-2, 1, nzg-2)
+
+  end subroutine check_divergence
+
+  !============================================================================
+  !                              DEBUG HELPERS
+  !============================================================================
+
+  !> Debug-build kernel-launch check (design doc: `make DEBUG=1` defines
+  !> -DDEBUG_KERNELS); aborts with the kernel name on failure.
+  subroutine debug_check(kname)
+    character(*), intent(in) :: kname
+#ifdef DEBUG_KERNELS
+    integer :: istat
+    istat = cudaGetLastError()
+    if (istat /= cudaSuccess) then
+       write (*, '(a)') 'poisson_mod: kernel '//kname//' failed: ' &
+                        //trim(cudaGetErrorString(istat))
+       error stop 1
+    end if
+#endif
+  end subroutine debug_check
+
+  !> Debug-build cuFFT status check.
+  subroutine debug_check_cufft(kname, istat)
+    character(*),   intent(in) :: kname
+    integer(c_int), intent(in) :: istat
+#ifdef DEBUG_KERNELS
+    if (istat /= CUFFT_SUCCESS) then
+       write (*, '(a,i0)') 'poisson_mod: '//kname//' failed, status ', istat
+       error stop 1
+    end if
+#endif
+  end subroutine debug_check_cufft
+
+  !============================================================================
+  !                                 KERNELS
+  !
+  ! Thread mapping (design-doc convention): tBlock = dim3(64,4,1); the x
+  ! thread index covers the fastest array dimension, the y index the second,
+  ! and one z block-layer per outermost iteration; every kernel has an
+  ! explicit upper-bound guard. Loop bodies are transcribed VERBATIM from
+  ! projection.f90 (d0 literals -> _dp only).
+  !============================================================================
+
+  !----------------------------------------------------------------------------
+  ! k_pseudo_rhs — Poisson RHS: divergence of the intermediate velocity on
+  ! cell centers (projection.f90:39-47),
+  !   rhs_p(i,j,k) = du/dx + dv/dy + dw/dz
+  ! over i = 2..nxg-1, j = 2..nyg-1, k = 2..nzg-1 (NOT divided by dt).
+  !----------------------------------------------------------------------------
+  attributes(global) subroutine k_pseudo_rhs(rhs_p, U, V, W, x, y, z, &
+                                             nx, ny, nz, nxg, nyg, nzg)
+    integer, value :: nx, ny, nz, nxg, nyg, nzg
+    real(dp), intent(inout) :: rhs_p(2:nxg-1, 2:nyg-1, 2:nzg)
+    real(dp), intent(in)  :: U(nx, nyg, nzg), V(nxg, ny, nzg), W(nxg, nyg, nz)
+    real(dp), intent(in)  :: x(nx), y(ny), z(nz)
+    integer :: i, j, k
+
+    i = 2 + (blockIdx%x-1)*blockDim%x + threadIdx%x - 1
+    j = 2 + (blockIdx%y-1)*blockDim%y + threadIdx%y - 1
+    k = 2 + blockIdx%z - 1
+    if (i > nxg-1 .or. j > nyg-1 .or. k > nzg-1) return
+
+    rhs_p(i,j,k)  = ( U(i,j,k) - U(i-1,j,k) )/( x(i)-x(i-1) ) + &
+                    ( V(i,j,k) - V(i,j-1,k) )/( y(j)-y(j-1) ) + &
+                    ( W(i,j,k) - W(i,j,k-1) )/( z(k)-z(k-1) )
+
+  end subroutine k_pseudo_rhs
+
+  !----------------------------------------------------------------------------
+  ! k_pack_dct — DCT-II symmetric-extension pack (projection.f90:111-119):
+  ! for each y-plane batch b, the real RHS row f[0..N-1] (N = nxp) is placed
+  ! as a complex even extension g[0..N-1] = f, g[2N-1..N] = f[0..N-1], so a
+  ! single complex FFT of length 2N yields the DCT-II after twiddling.
+  ! Note the (j <-> k) transposition: batch b is the y-plane, rhs_p is
+  ! indexed (ii+1, b+1, k+1).
+  !----------------------------------------------------------------------------
+  attributes(global) subroutine k_pack_dct(plane, rhs_p, nx2, nxp, nzp, nm, &
+                                           nxg, nyg, nzg)
+    integer, value :: nx2, nxp, nzp, nm, nxg, nyg, nzg
+    complex(dp), intent(inout) :: plane(nx2, nzp, nm)
+    real(dp),    intent(in)    :: rhs_p(2:nxg-1, 2:nyg-1, 2:nzg)
+    integer :: ii, k, b
+
+    ii = 1 + (blockIdx%x-1)*blockDim%x + threadIdx%x - 1
+    k  = 1 + (blockIdx%y-1)*blockDim%y + threadIdx%y - 1
+    b  = 1 + blockIdx%z - 1
+    if (ii > nxp .or. k > nzp .or. b > nm) return
+
+    plane(ii,         k, b) = cmplx( rhs_p(ii+1, b+1, k+1), 0.0_dp, dp )
+    plane(nx2+1-ii,   k, b) = cmplx( rhs_p(ii+1, b+1, k+1), 0.0_dp, dp )
+
+  end subroutine k_pack_dct
+
+  !----------------------------------------------------------------------------
+  ! k_twiddle_extract — extract DCT-II modes from the 2D FFT result
+  ! (projection.f90:127-134):
+  !   rhs_hat(i, b, k) = plane(i, k, b) * dct_twiddle(i-1)
+  ! over i = 1..mx+1 x-modes, k = 1..mz+1 z-modes, b = 1..nm y-planes
+  ! (transposed (i, b, k) storage so the z-IFFT can run strided later).
+  !----------------------------------------------------------------------------
+  attributes(global) subroutine k_twiddle_extract(rhs_hat, plane, tw, &
+                                                  mxp1, mzp1, nm, nx2, nzp)
+    integer, value :: mxp1, mzp1, nm, nx2, nzp
+    complex(dp), intent(out) :: rhs_hat(mxp1, nm, mzp1)
+    complex(dp), intent(in)  :: plane(nx2, nzp, nm)
+    complex(dp), intent(in)  :: tw(0:mxp1-1)
+    integer :: i, k, b
+
+    i = 1 + (blockIdx%x-1)*blockDim%x + threadIdx%x - 1
+    k = 1 + (blockIdx%y-1)*blockDim%y + threadIdx%y - 1
+    b = 1 + blockIdx%z - 1
+    if (i > mxp1 .or. k > mzp1 .or. b > nm) return
+
+    rhs_hat(i, b, k) = plane(i, k, b) * tw(i-1)
+
+  end subroutine k_twiddle_extract
+
+  !----------------------------------------------------------------------------
+  ! k_thomas — batched Thomas tridiagonal solve in y (projection.f90:137-150):
+  ! one thread per (i,k) mode pair; each thread runs the serial forward-
+  ! elimination / back-substitution recurrence over jj = 1..nm using the
+  ! pre-factorized LU factors (dl = eliminated lower factors, piv = 1/pivot,
+  ! du = upper diagonal, shared by all modes):
+  !   forward:  rhs(jj) -= dl(jj-1)*rhs(jj-1),          jj = 2..nm
+  !   backward: rhs(nm) *= piv(nm);
+  !             rhs(jj)  = (rhs(jj) - du(jj)*rhs(jj+1))*piv(jj), jj = nm-1..1
+  !----------------------------------------------------------------------------
+  attributes(global) subroutine k_thomas(rhs_hat, dl, piv, du, mxp1, mzp1, nm)
+    integer, value :: mxp1, mzp1, nm
+    complex(dp), intent(inout) :: rhs_hat(mxp1, nm, mzp1)
+    complex(dp), intent(in)    :: dl(mxp1, mzp1, nm), piv(mxp1, mzp1, nm)
+    complex(dp), intent(in)    :: du(nm)
+    integer :: i, k, jj
+
+    i = 1 + (blockIdx%x-1)*blockDim%x + threadIdx%x - 1
+    k = 1 + (blockIdx%y-1)*blockDim%y + threadIdx%y - 1
+    if (i > mxp1 .or. k > mzp1) return
+
+    do jj = 2, nm
+       rhs_hat(i, jj, k) = rhs_hat(i, jj, k) &
+          - dl(i, k, jj-1) * rhs_hat(i, jj-1, k)
+    end do
+    rhs_hat(i, nm, k) = rhs_hat(i, nm, k) * piv(i, k, nm)
+    do jj = nm-1, 1, -1
+       rhs_hat(i, jj, k) = (rhs_hat(i, jj, k) &
+          - du(jj) * rhs_hat(i, jj+1, k)) * piv(i, k, jj)
+    end do
+
+  end subroutine k_thomas
+
+  !----------------------------------------------------------------------------
+  ! k_zero_plane — zero the full complex plane before the inverse-x pack
+  ! (projection.f90:162-169); modes not written by the untwiddle/Hermitian
+  ! kernels (column nxp+1) must be zero.
+  !----------------------------------------------------------------------------
+  attributes(global) subroutine k_zero_plane(plane, nx2, nzp, nm)
+    integer, value :: nx2, nzp, nm
+    complex(dp), intent(out) :: plane(nx2, nzp, nm)
+    integer :: ii, k, b
+
+    ii = 1 + (blockIdx%x-1)*blockDim%x + threadIdx%x - 1
+    k  = 1 + (blockIdx%y-1)*blockDim%y + threadIdx%y - 1
+    b  = 1 + blockIdx%z - 1
+    if (ii > nx2 .or. k > nzp .or. b > nm) return
+
+    plane(ii, k, b) = (0.0_dp, 0.0_dp)
+
+  end subroutine k_zero_plane
+
+  !----------------------------------------------------------------------------
+  ! k_untwiddle — place the first nxp solved modes with the inverse (conjugate)
+  ! DCT-II twiddle (projection.f90:171-178):
+  !   plane(ii, k, b) = rhs_hat(ii, b, k) * conjg(dct_twiddle(ii-1))
+  ! (the data is real in z-physical space after the z-IFFT, so the x-spectrum
+  ! is Hermitian and the extension in k_hermitian_ext is valid).
+  !----------------------------------------------------------------------------
+  attributes(global) subroutine k_untwiddle(plane, rhs_hat, tw, &
+                                            nxp, nx2, nzp, nm, mxp1, mzp1)
+    integer, value :: nxp, nx2, nzp, nm, mxp1, mzp1
+    complex(dp), intent(inout) :: plane(nx2, nzp, nm)
+    complex(dp), intent(in)    :: rhs_hat(mxp1, nm, mzp1)
+    complex(dp), intent(in)    :: tw(0:mxp1-1)
+    integer :: ii, k, b
+
+    ii = 1 + (blockIdx%x-1)*blockDim%x + threadIdx%x - 1
+    k  = 1 + (blockIdx%y-1)*blockDim%y + threadIdx%y - 1
+    b  = 1 + blockIdx%z - 1
+    if (ii > nxp .or. k > nzp .or. b > nm) return
+
+    plane(ii, k, b) = rhs_hat(ii, b, k) * conjg(tw(ii-1))
+
+  end subroutine k_untwiddle
+
+  !----------------------------------------------------------------------------
+  ! k_hermitian_ext — Hermitian extension of the x-spectrum
+  ! (projection.f90:180-187):
+  !   plane(2N+2-ii, k, b) = conjg(plane(ii, k, b))  for ii = 2..nxp
+  ! Separate launch after k_untwiddle (read-after-write across kernels, no
+  ! intra-kernel hazard), exactly as the reference's separate acc loops.
+  !----------------------------------------------------------------------------
+  attributes(global) subroutine k_hermitian_ext(plane, nxp, nx2, nzp, nm)
+    integer, value :: nxp, nx2, nzp, nm
+    complex(dp), intent(inout) :: plane(nx2, nzp, nm)
+    integer :: ii, k, b
+
+    ii = 2 + (blockIdx%x-1)*blockDim%x + threadIdx%x - 1
+    k  = 1 + (blockIdx%y-1)*blockDim%y + threadIdx%y - 1
+    b  = 1 + blockIdx%z - 1
+    if (ii > nxp .or. k > nzp .or. b > nm) return
+
+    plane(nx2+2-ii, k, b) = conjg(plane(ii, k, b))
+
+  end subroutine k_hermitian_ext
+
+  !----------------------------------------------------------------------------
+  ! k_extract_out — extract the physical-space solution with the FFT
+  ! normalization (projection.f90:195-202):
+  !   rhs_p(ii+1, b+1, k+1) = Re(plane(ii, k, b)) * 1/(2*nxp*nzp)
+  ! (inverse of the (j <-> k) transposition done by k_pack_dct).
+  !----------------------------------------------------------------------------
+  attributes(global) subroutine k_extract_out(rhs_p, plane, fft_norm, &
+                                              nxp, nx2, nzp, nm, nxg, nyg, nzg)
+    integer,  value :: nxp, nx2, nzp, nm, nxg, nyg, nzg
+    real(dp), value :: fft_norm
+    real(dp),    intent(inout) :: rhs_p(2:nxg-1, 2:nyg-1, 2:nzg)
+    complex(dp), intent(in)    :: plane(nx2, nzp, nm)
+    integer :: ii, k, b
+
+    ii = 1 + (blockIdx%x-1)*blockDim%x + threadIdx%x - 1
+    k  = 1 + (blockIdx%y-1)*blockDim%y + threadIdx%y - 1
+    b  = 1 + blockIdx%z - 1
+    if (ii > nxp .or. k > nzp .or. b > nm) return
+
+    rhs_p(ii+1, b+1, k+1) = real(plane(ii, k, b), dp) * fft_norm
+
+  end subroutine k_extract_out
+
+  !----------------------------------------------------------------------------
+  ! k_periodic_x_copy — duplicate the last interior pressure column
+  ! (projection.f90:296): rhs_p(nxg-1, j, k) = rhs_p(nxg-2, j, k) over the
+  ! full extents j = 2..nyg-1, k = 2..nzg (the ':' sections of the reference).
+  !----------------------------------------------------------------------------
+  attributes(global) subroutine k_periodic_x_copy(rhs_p, nxg, nyg, nzg)
+    integer, value :: nxg, nyg, nzg
+    real(dp), intent(inout) :: rhs_p(2:nxg-1, 2:nyg-1, 2:nzg)
+    integer :: j, k
+
+    j = 2 + (blockIdx%x-1)*blockDim%x + threadIdx%x - 1
+    k = 2 + (blockIdx%y-1)*blockDim%y + threadIdx%y - 1
+    if (j > nyg-1 .or. k > nzg) return
+
+    rhs_p(nxg-1, j, k) = rhs_p(nxg-2, j, k)
+
+  end subroutine k_periodic_x_copy
+
+  !----------------------------------------------------------------------------
+  ! k_periodic_z_copy — periodic image of the first interior z-plane
+  ! (projection.f90:301, nprocs = 1): rhs_p(i, j, kz) = rhs_p(i, j, 2)
+  ! over i = 2..nxg-1, j = 2..nyg-1, with kz = nzp+1+1 (= nzg-1).
+  !----------------------------------------------------------------------------
+  attributes(global) subroutine k_periodic_z_copy(rhs_p, kz, nxg, nyg, nzg)
+    integer, value :: kz, nxg, nyg, nzg
+    real(dp), intent(inout) :: rhs_p(2:nxg-1, 2:nyg-1, 2:nzg)
+    integer :: i, j
+
+    i = 2 + (blockIdx%x-1)*blockDim%x + threadIdx%x - 1
+    j = 2 + (blockIdx%y-1)*blockDim%y + threadIdx%y - 1
+    if (i > nxg-1 .or. j > nyg-1) return
+
+    rhs_p(i, j, kz) = rhs_p(i, j, 2)
+
+  end subroutine k_periodic_z_copy
+
+  !----------------------------------------------------------------------------
+  ! k_save_pressure — pressure save for statistics on RK substep 1
+  ! (projection.f90:77): P(i,j,k) = rhs_p(i,j,k)/(dt*rk2_coef(1,1))
+  ! over i = 2..nxg-1, j = 2..nyg-1, k = 2..nzg-1 (index-aligned; see the
+  ! conformance note in save_pressure).
+  !----------------------------------------------------------------------------
+  attributes(global) subroutine k_save_pressure(P, rhs_p, nxg, nyg, nzg, dt, rk2c)
+    integer,  value :: nxg, nyg, nzg
+    real(dp), value :: dt, rk2c
+    real(dp), intent(inout) :: P(nxg, nyg, nzg)
+    real(dp), intent(in)    :: rhs_p(2:nxg-1, 2:nyg-1, 2:nzg)
+    integer :: i, j, k
+
+    i = 2 + (blockIdx%x-1)*blockDim%x + threadIdx%x - 1
+    j = 2 + (blockIdx%y-1)*blockDim%y + threadIdx%y - 1
+    k = 2 + blockIdx%z - 1
+    if (i > nxg-1 .or. j > nyg-1 .or. k > nzg-1) return
+
+    P(i,j,k) = rhs_p(i,j,k)/(dt*rk2c)
+
+  end subroutine k_save_pressure
+
+  !----------------------------------------------------------------------------
+  ! k_pressure_ghost_x — P(1,:,:) = P(2,:,:), P(nxg,:,:) = P(nxg-1,:,:)
+  ! (projection.f90:78-79); full (j,k) extents. The two assignments touch
+  ! disjoint planes, so one launch is safe.
+  !----------------------------------------------------------------------------
+  attributes(global) subroutine k_pressure_ghost_x(P, nxg, nyg, nzg)
+    integer, value :: nxg, nyg, nzg
+    real(dp), intent(inout) :: P(nxg, nyg, nzg)
+    integer :: j, k
+
+    j = 1 + (blockIdx%x-1)*blockDim%x + threadIdx%x - 1
+    k = 1 + (blockIdx%y-1)*blockDim%y + threadIdx%y - 1
+    if (j > nyg .or. k > nzg) return
+
+    P(  1, j, k) = P(    2, j, k)
+    P(nxg, j, k) = P(nxg-1, j, k)
+
+  end subroutine k_pressure_ghost_x
+
+  !----------------------------------------------------------------------------
+  ! k_pressure_ghost_y — P(:,1,:) = P(:,2,:), P(:,nyg,:) = P(:,nyg-1,:)
+  ! (projection.f90:80-81); must run AFTER k_pressure_ghost_x so the x-ghost
+  ! columns (i = 1, nxg) are propagated, as in the sequential reference.
+  !----------------------------------------------------------------------------
+  attributes(global) subroutine k_pressure_ghost_y(P, nxg, nyg, nzg)
+    integer, value :: nxg, nyg, nzg
+    real(dp), intent(inout) :: P(nxg, nyg, nzg)
+    integer :: i, k
+
+    i = 1 + (blockIdx%x-1)*blockDim%x + threadIdx%x - 1
+    k = 1 + (blockIdx%y-1)*blockDim%y + threadIdx%y - 1
+    if (i > nxg .or. k > nzg) return
+
+    P(i,   1, k) = P(i,     2, k)
+    P(i, nyg, k) = P(i, nyg-1, k)
+
+  end subroutine k_pressure_ghost_y
+
+  !----------------------------------------------------------------------------
+  ! k_pressure_ghost_z — P(:,:,1) = P(:,:,2), P(:,:,nzg) = P(:,:,nzg-1)
+  ! (projection.f90:82-83); must run last (after x- and y-ghost updates).
+  !----------------------------------------------------------------------------
+  attributes(global) subroutine k_pressure_ghost_z(P, nxg, nyg, nzg)
+    integer, value :: nxg, nyg, nzg
+    real(dp), intent(inout) :: P(nxg, nyg, nzg)
+    integer :: i, j
+
+    i = 1 + (blockIdx%x-1)*blockDim%x + threadIdx%x - 1
+    j = 1 + (blockIdx%y-1)*blockDim%y + threadIdx%y - 1
+    if (i > nxg .or. j > nyg) return
+
+    P(i, j,   1) = P(i, j,     2)
+    P(i, j, nzg) = P(i, j, nzg-1)
+
+  end subroutine k_pressure_ghost_z
+
+  !----------------------------------------------------------------------------
+  ! k_project_u — U(i,j,k) -= dphi/dx at x-faces (projection.f90:359-366),
+  ! i = 2..nx-1, j = 2..nyg-1, k = 2..nzg-1.
+  !----------------------------------------------------------------------------
+  attributes(global) subroutine k_project_u(U, rhs_p, xg, nx, nxg, nyg, nzg)
+    integer, value :: nx, nxg, nyg, nzg
+    real(dp), intent(inout) :: U(nx, nyg, nzg)
+    real(dp), intent(in)    :: rhs_p(2:nxg-1, 2:nyg-1, 2:nzg)
+    real(dp), intent(in)    :: xg(nxg)
+    integer :: i, j, k
+
+    i = 2 + (blockIdx%x-1)*blockDim%x + threadIdx%x - 1
+    j = 2 + (blockIdx%y-1)*blockDim%y + threadIdx%y - 1
+    k = 2 + blockIdx%z - 1
+    if (i > nx-1 .or. j > nyg-1 .or. k > nzg-1) return
+
+    U(i,j,k) = U(i,j,k) - (rhs_p(i+1,j,k) - rhs_p(i,j,k))/(xg(i+1) - xg(i))
+
+  end subroutine k_project_u
+
+  !----------------------------------------------------------------------------
+  ! k_project_v — V(i,j,k) -= dphi/dy at y-faces (projection.f90:368-375),
+  ! i = 2..nxg-1, j = 2..ny-1, k = 2..nzg-1.
+  !----------------------------------------------------------------------------
+  attributes(global) subroutine k_project_v(V, rhs_p, yg, ny, nxg, nyg, nzg)
+    integer, value :: ny, nxg, nyg, nzg
+    real(dp), intent(inout) :: V(nxg, ny, nzg)
+    real(dp), intent(in)    :: rhs_p(2:nxg-1, 2:nyg-1, 2:nzg)
+    real(dp), intent(in)    :: yg(nyg)
+    integer :: i, j, k
+
+    i = 2 + (blockIdx%x-1)*blockDim%x + threadIdx%x - 1
+    j = 2 + (blockIdx%y-1)*blockDim%y + threadIdx%y - 1
+    k = 2 + blockIdx%z - 1
+    if (i > nxg-1 .or. j > ny-1 .or. k > nzg-1) return
+
+    V(i,j,k) = V(i,j,k) - (rhs_p(i,j+1,k) - rhs_p(i,j,k))/(yg(j+1) - yg(j))
+
+  end subroutine k_project_v
+
+  !----------------------------------------------------------------------------
+  ! k_project_w — W(i,j,k) -= dphi/dz at z-faces (projection.f90:377-384),
+  ! i = 2..nxg-1, j = 2..nyg-1, k = 2..nz-1.
+  !----------------------------------------------------------------------------
+  attributes(global) subroutine k_project_w(W, rhs_p, zg, nz, nxg, nyg, nzg)
+    integer, value :: nz, nxg, nyg, nzg
+    real(dp), intent(inout) :: W(nxg, nyg, nz)
+    real(dp), intent(in)    :: rhs_p(2:nxg-1, 2:nyg-1, 2:nzg)
+    real(dp), intent(in)    :: zg(nzg)
+    integer :: i, j, k
+
+    i = 2 + (blockIdx%x-1)*blockDim%x + threadIdx%x - 1
+    j = 2 + (blockIdx%y-1)*blockDim%y + threadIdx%y - 1
+    k = 2 + blockIdx%z - 1
+    if (i > nxg-1 .or. j > nyg-1 .or. k > nz-1) return
+
+    W(i,j,k) = W(i,j,k) - (rhs_p(i,j,k+1) - rhs_p(i,j,k))/(zg(k+1) - zg(k))
+
+  end subroutine k_project_w
+
+  !----------------------------------------------------------------------------
+  ! k_divergence — cell-center divergence of (U,V,W) into the scratch array
+  ! (the expression inside Abs() of projection.f90:403-405), over
+  ! i = 2..nxg-2, j = 2..nyg-1, k = 2..nzg-1; the |.| and max are taken by
+  ! the deterministic reduction in check_divergence.
+  !----------------------------------------------------------------------------
+  attributes(global) subroutine k_divergence(div, U, V, W, x, y, z, &
+                                             nx, ny, nz, nxg, nyg, nzg)
+    integer, value :: nx, ny, nz, nxg, nyg, nzg
+    real(dp), intent(out) :: div(2:nxg-2, 2:nyg-1, 2:nzg-1)
+    real(dp), intent(in)  :: U(nx, nyg, nzg), V(nxg, ny, nzg), W(nxg, nyg, nz)
+    real(dp), intent(in)  :: x(nx), y(ny), z(nz)
+    integer :: i, j, k
+
+    i = 2 + (blockIdx%x-1)*blockDim%x + threadIdx%x - 1
+    j = 2 + (blockIdx%y-1)*blockDim%y + threadIdx%y - 1
+    k = 2 + blockIdx%z - 1
+    if (i > nxg-2 .or. j > nyg-1 .or. k > nzg-1) return
+
+    div(i,j,k) = ( U(i,j,k) - U(i-1,j,k) )/( x(i)-x(i-1) ) + &
+                 ( V(i,j,k) - V(i,j-1,k) )/( y(j)-y(j-1) ) + &
+                 ( W(i,j,k) - W(i,j,k-1) )/( z(k)-z(k-1) )
+
+  end subroutine k_divergence
+
+end module poisson_mod

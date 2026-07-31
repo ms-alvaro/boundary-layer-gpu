@@ -1,0 +1,525 @@
+!=======================================================================
+! reductions.cuf — deterministic device reductions (max / sum) for the
+! CUDA Fortran port of the boundary-layer DNS solver.
+!
+! Purpose
+! -------
+! Provides grid-level reductions over a 3-D real(dp) device array
+! section, used by:
+!   * CFL dt            — max-of-ratio  (time_integration.f90:550-558)
+!   * mass-flux BC      — weighted sums (boundary_conditions.f90:240-256)
+!   * divergence check  — max of |A|    (monitor path)
+!
+! Determinism contract (docs/CUDA_PORT_DESIGN.md, "Deterministic
+! reductions"): NO atomics. Fixed-order two-kernel scheme:
+!   kernel 1: each block accumulates a partial over a fixed grid-stride
+!             range (each thread walks its linear indices in strictly
+!             increasing order), then combines thread values with a
+!             fixed-order shared-memory tree (block size is a compile-
+!             time constant, so the tree shape never changes);
+!   kernel 2: a single-block (single-thread) kernel combines the block
+!             partials strictly in index order 1..nblocks.
+! The number of blocks is a pure function of the section size, so the
+! same input gives bitwise-identical output on every run.
+!
+! Reference provenance: this module is new code (the OpenACC reference
+! uses `reduction(...)` clauses, which are not deterministic); the
+! *quantities* reduced are transcribed verbatim by the callers
+! (bc_kernels.cuf, timestep_mod.cuf, io_mod.f90).
+!
+! Scratch storage: one persistent module-level device buffer
+! `scratch_d(0:MAX_BLOCKS)`, allocated on first use. Element 0 receives
+! the final result; elements 1..nblocks hold the per-block partials.
+! All launches go to the default stream, so back-to-back reductions
+! serialize correctly and the host copy of scratch_d(0) synchronizes.
+!=======================================================================
+module reductions
+
+  use cudafor
+  use iso_fortran_env, only: int64
+  use precision_mod,   only: dp
+
+  implicit none
+  private
+
+  public :: device_max_abs3
+  public :: device_max3
+  public :: device_sum3
+  public :: device_wsum3
+  public :: device_max_ratio3
+  public :: reductions_finalize
+
+  ! Fixed launch geometry — MUST be compile-time constants so that the
+  ! reduction order (and therefore the rounding) is identical every run.
+  integer, parameter :: NTHREADS   = 256   ! threads per block (power of 2)
+  integer, parameter :: MAX_BLOCKS = 1024  ! cap on partial count
+
+  ! Persistent device scratch: (0) = final result, (1:MAX_BLOCKS) = partials.
+  real(dp), device, allocatable :: scratch_d(:)
+
+contains
+
+  !---------------------------------------------------------------------
+  ! Host-side helpers
+  !---------------------------------------------------------------------
+
+  !> Allocate the persistent scratch buffer on first use.
+  subroutine ensure_scratch()
+    if (.not. allocated(scratch_d)) allocate (scratch_d(0:MAX_BLOCKS))
+  end subroutine ensure_scratch
+
+  !> Free the scratch buffer (call once at shutdown; optional).
+  subroutine reductions_finalize()
+    if (allocated(scratch_d)) deallocate (scratch_d)
+  end subroutine reductions_finalize
+
+  !> Deterministic block count for a section of ntot elements:
+  !> ceil(ntot/NTHREADS), capped at MAX_BLOCKS. Pure function of ntot.
+  integer function nblocks_for(ntot)
+    integer(int64), intent(in) :: ntot
+    nblocks_for = int(min(int(MAX_BLOCKS, int64), &
+                          (ntot + int(NTHREADS, int64) - 1_int64) &
+                          / int(NTHREADS, int64)))
+  end function nblocks_for
+
+  !> Debug-build kernel-launch check (design doc: `make DEBUG=1` defines
+  !> -DDEBUG_KERNELS); aborts with the kernel name on failure.
+  subroutine debug_check(kname)
+    character(*), intent(in) :: kname
+#ifdef DEBUG_KERNELS
+    integer :: istat
+    istat = cudaGetLastError()
+    if (istat /= cudaSuccess) then
+       write (*, '(a)') 'reductions: kernel '//kname//' failed: ' &
+                        //trim(cudaGetErrorString(istat))
+       error stop 1
+    end if
+#endif
+  end subroutine debug_check
+
+  !---------------------------------------------------------------------
+  ! Stage-1 kernels: one partial per block.
+  !
+  ! Linear index l = 0..ni*nj*nk-1 maps to the section as
+  !   i = ilo + mod(l, ni)         (i fastest -> coalesced loads)
+  !   j = jlo + mod(l/ni, nj)
+  !   k = klo + (l/ni)/nj
+  ! Thread t of block b (1-based) starts at l = (b-1)*NTHREADS + (t-1)
+  ! and strides by gridDim%x*NTHREADS, accumulating in increasing-l
+  ! order. The shared-memory tree then folds the NTHREADS thread values
+  ! pairwise (t <- t + t+s for s = NTHREADS/2, NTHREADS/4, ..., 1),
+  ! which is a fixed combining order. Block b writes scratch_d(b).
+  !
+  ! 64-bit arithmetic is used for the linear index so sections larger
+  ! than 2**31 elements are handled correctly.
+  !---------------------------------------------------------------------
+
+  !> Partial SUM of A over the section.
+  attributes(global) subroutine red_partial_sum(A, n1, n2, n3, &
+                                                ilo, jlo, klo, ni, nj, nk)
+    integer,  value      :: n1, n2, n3, ilo, jlo, klo, ni, nj, nk
+    real(dp), intent(in) :: A(n1, n2, n3)
+    real(dp), shared     :: sdata(NTHREADS)
+    integer        :: t, i, j, k, s
+    integer(int64) :: l, lrest, ntot, stride
+    real(dp)       :: acc
+
+    t      = threadIdx%x
+    ntot   = int(ni, int64)*int(nj, int64)*int(nk, int64)
+    stride = int(gridDim%x, int64)*int(NTHREADS, int64)
+
+    acc = 0.0_dp
+    l   = int(blockIdx%x - 1, int64)*int(NTHREADS, int64) + int(t - 1, int64)
+    do while (l < ntot)
+       i     = ilo + int(mod(l, int(ni, int64)))
+       lrest = l/int(ni, int64)
+       j     = jlo + int(mod(lrest, int(nj, int64)))
+       k     = klo + int(lrest/int(nj, int64))
+       acc   = acc + A(i, j, k)
+       l     = l + stride
+    end do
+
+    sdata(t) = acc
+    call syncthreads()
+    s = NTHREADS/2
+    do while (s >= 1)
+       if (t <= s) sdata(t) = sdata(t) + sdata(t + s)
+       call syncthreads()
+       s = s/2
+    end do
+    if (t == 1) scratch_d(blockIdx%x) = sdata(1)
+  end subroutine red_partial_sum
+
+  !> Partial MAX of A over the section (signed max; identity -huge).
+  attributes(global) subroutine red_partial_max(A, n1, n2, n3, &
+                                                ilo, jlo, klo, ni, nj, nk)
+    integer,  value      :: n1, n2, n3, ilo, jlo, klo, ni, nj, nk
+    real(dp), intent(in) :: A(n1, n2, n3)
+    real(dp), shared     :: sdata(NTHREADS)
+    integer        :: t, i, j, k, s
+    integer(int64) :: l, lrest, ntot, stride
+    real(dp)       :: acc
+
+    t      = threadIdx%x
+    ntot   = int(ni, int64)*int(nj, int64)*int(nk, int64)
+    stride = int(gridDim%x, int64)*int(NTHREADS, int64)
+
+    acc = -huge(0.0_dp)
+    l   = int(blockIdx%x - 1, int64)*int(NTHREADS, int64) + int(t - 1, int64)
+    do while (l < ntot)
+       i     = ilo + int(mod(l, int(ni, int64)))
+       lrest = l/int(ni, int64)
+       j     = jlo + int(mod(lrest, int(nj, int64)))
+       k     = klo + int(lrest/int(nj, int64))
+       acc   = max(acc, A(i, j, k))
+       l     = l + stride
+    end do
+
+    sdata(t) = acc
+    call syncthreads()
+    s = NTHREADS/2
+    do while (s >= 1)
+       if (t <= s) sdata(t) = max(sdata(t), sdata(t + s))
+       call syncthreads()
+       s = s/2
+    end do
+    if (t == 1) scratch_d(blockIdx%x) = sdata(1)
+  end subroutine red_partial_max
+
+  !> Partial MAX of |A| over the section (identity 0 since |A| >= 0).
+  attributes(global) subroutine red_partial_maxabs(A, n1, n2, n3, &
+                                                   ilo, jlo, klo, ni, nj, nk)
+    integer,  value      :: n1, n2, n3, ilo, jlo, klo, ni, nj, nk
+    real(dp), intent(in) :: A(n1, n2, n3)
+    real(dp), shared     :: sdata(NTHREADS)
+    integer        :: t, i, j, k, s
+    integer(int64) :: l, lrest, ntot, stride
+    real(dp)       :: acc
+
+    t      = threadIdx%x
+    ntot   = int(ni, int64)*int(nj, int64)*int(nk, int64)
+    stride = int(gridDim%x, int64)*int(NTHREADS, int64)
+
+    acc = 0.0_dp
+    l   = int(blockIdx%x - 1, int64)*int(NTHREADS, int64) + int(t - 1, int64)
+    do while (l < ntot)
+       i     = ilo + int(mod(l, int(ni, int64)))
+       lrest = l/int(ni, int64)
+       j     = jlo + int(mod(lrest, int(nj, int64)))
+       k     = klo + int(lrest/int(nj, int64))
+       acc   = max(acc, abs(A(i, j, k)))
+       l     = l + stride
+    end do
+
+    sdata(t) = acc
+    call syncthreads()
+    s = NTHREADS/2
+    do while (s >= 1)
+       if (t <= s) sdata(t) = max(sdata(t), sdata(t + s))
+       call syncthreads()
+       s = s/2
+    end do
+    if (t == 1) scratch_d(blockIdx%x) = sdata(1)
+  end subroutine red_partial_maxabs
+
+  !> Partial WEIGHTED SUM: sum of A(i,j,k)*w(m) over the section, where
+  !> m is the section's global index along dimension wdim (1, 2 or 3).
+  !> Used for the mass-flux BC integrals of boundary_conditions.f90:
+  !> 240-256, where the flux through a plane is weighted by the 1-D
+  !> grid spacing (y(j)-y(j-1), resp. x(i)-x(i-1)) — the caller passes
+  !> that spacing vector, precomputed once, as w.
+  attributes(global) subroutine red_partial_wsum(A, n1, n2, n3, &
+                                                 ilo, jlo, klo, ni, nj, nk, &
+                                                 w, nw, wdim)
+    integer,  value      :: n1, n2, n3, ilo, jlo, klo, ni, nj, nk, nw, wdim
+    real(dp), intent(in) :: A(n1, n2, n3)
+    real(dp), intent(in) :: w(nw)
+    real(dp), shared     :: sdata(NTHREADS)
+    integer        :: t, i, j, k, m, s
+    integer(int64) :: l, lrest, ntot, stride
+    real(dp)       :: acc
+
+    t      = threadIdx%x
+    ntot   = int(ni, int64)*int(nj, int64)*int(nk, int64)
+    stride = int(gridDim%x, int64)*int(NTHREADS, int64)
+
+    acc = 0.0_dp
+    l   = int(blockIdx%x - 1, int64)*int(NTHREADS, int64) + int(t - 1, int64)
+    do while (l < ntot)
+       i     = ilo + int(mod(l, int(ni, int64)))
+       lrest = l/int(ni, int64)
+       j     = jlo + int(mod(lrest, int(nj, int64)))
+       k     = klo + int(lrest/int(nj, int64))
+       if (wdim == 1) then
+          m = i
+       else if (wdim == 2) then
+          m = j
+       else
+          m = k
+       end if
+       acc = acc + A(i, j, k)*w(m)
+       l   = l + stride
+    end do
+
+    sdata(t) = acc
+    call syncthreads()
+    s = NTHREADS/2
+    do while (s >= 1)
+       if (t <= s) sdata(t) = sdata(t) + sdata(t + s)
+       call syncthreads()
+       s = s/2
+    end do
+    if (t == 1) scratch_d(blockIdx%x) = sdata(1)
+  end subroutine red_partial_wsum
+
+  !> Partial MAX RATIO: max of w(m)/abs(A(i,j,k)) over the section,
+  !> where m indexes w along dimension wdim. This is the per-array CFL
+  !> building block of time_integration.f90:550-558, e.g.
+  !>    lUmax = Max( lUmax, (xg(i+1)-xg(i))/Abs(U(i,j,k)) )
+  !> with w(i) = xg(i+1)-xg(i) precomputed by the caller (the
+  !> precomputed subtraction is bitwise-identical to the inline one, so
+  !> the ratio matches the reference expression exactly). Zero velocity
+  !> yields +Inf, exactly as in the reference host loop (IEEE).
+  !> Identity is 0 (the reference initializes lUmax = 0d0).
+  attributes(global) subroutine red_partial_maxratio(A, n1, n2, n3, &
+                                                     ilo, jlo, klo, ni, nj, nk, &
+                                                     w, nw, wdim)
+    integer,  value      :: n1, n2, n3, ilo, jlo, klo, ni, nj, nk, nw, wdim
+    real(dp), intent(in) :: A(n1, n2, n3)
+    real(dp), intent(in) :: w(nw)
+    real(dp), shared     :: sdata(NTHREADS)
+    integer        :: t, i, j, k, m, s
+    integer(int64) :: l, lrest, ntot, stride
+    real(dp)       :: acc
+
+    t      = threadIdx%x
+    ntot   = int(ni, int64)*int(nj, int64)*int(nk, int64)
+    stride = int(gridDim%x, int64)*int(NTHREADS, int64)
+
+    acc = 0.0_dp
+    l   = int(blockIdx%x - 1, int64)*int(NTHREADS, int64) + int(t - 1, int64)
+    do while (l < ntot)
+       i     = ilo + int(mod(l, int(ni, int64)))
+       lrest = l/int(ni, int64)
+       j     = jlo + int(mod(lrest, int(nj, int64)))
+       k     = klo + int(lrest/int(nj, int64))
+       if (wdim == 1) then
+          m = i
+       else if (wdim == 2) then
+          m = j
+       else
+          m = k
+       end if
+       acc = max(acc, w(m)/abs(A(i, j, k)))
+       l   = l + stride
+    end do
+
+    sdata(t) = acc
+    call syncthreads()
+    s = NTHREADS/2
+    do while (s >= 1)
+       if (t <= s) sdata(t) = max(sdata(t), sdata(t + s))
+       call syncthreads()
+       s = s/2
+    end do
+    if (t == 1) scratch_d(blockIdx%x) = sdata(1)
+  end subroutine red_partial_maxratio
+
+  !---------------------------------------------------------------------
+  ! Stage-2 kernels: combine the nb block partials strictly in index
+  ! order 1..nb (single block, single thread — nb <= 1024 so the serial
+  ! loop is negligible and the combining order is trivially fixed).
+  ! The result is written to scratch_d(0).
+  !---------------------------------------------------------------------
+
+  !> Final SUM of scratch_d(1:nb), in index order.
+  attributes(global) subroutine red_final_sum(nb)
+    integer, value :: nb
+    integer  :: b
+    real(dp) :: acc
+    acc = 0.0_dp
+    do b = 1, nb
+       acc = acc + scratch_d(b)
+    end do
+    scratch_d(0) = acc
+  end subroutine red_final_sum
+
+  !> Final MAX of scratch_d(1:nb), in index order.
+  attributes(global) subroutine red_final_max(nb)
+    integer, value :: nb
+    integer  :: b
+    real(dp) :: acc
+    acc = scratch_d(1)
+    do b = 2, nb
+       acc = max(acc, scratch_d(b))
+    end do
+    scratch_d(0) = acc
+  end subroutine red_final_max
+
+  !---------------------------------------------------------------------
+  ! Host-callable wrappers.
+  !
+  ! A_d is the device array with allocated dims (n1,n2,n3); the
+  ! reduction runs over the section A_d(ilo:ihi, jlo:jhi, klo:khi)
+  ! (bounds in the array's own 1-based index space). All wrappers are
+  ! synchronous: the trailing scalar device-to-host copy of scratch_d(0)
+  ! completes only after both kernels have finished on the default
+  ! stream. An empty section (any hi < lo) returns the operation's
+  ! identity without launching (0 for sums/max_abs/max_ratio,
+  ! -huge(0._dp) for the signed max).
+  !---------------------------------------------------------------------
+
+  !> max over the section of |A|. Used by the divergence check.
+  function device_max_abs3(A_d, n1, n2, n3, ilo, ihi, jlo, jhi, klo, khi) result(r)
+    integer,  intent(in)         :: n1, n2, n3, ilo, ihi, jlo, jhi, klo, khi
+    real(dp), device, intent(in) :: A_d(n1, n2, n3)
+    real(dp)       :: r
+    integer        :: ni, nj, nk, nb
+    integer(int64) :: ntot
+
+    ni = ihi - ilo + 1
+    nj = jhi - jlo + 1
+    nk = khi - klo + 1
+    if (ni <= 0 .or. nj <= 0 .or. nk <= 0) then
+       r = 0.0_dp
+       return
+    end if
+    call ensure_scratch()
+    ntot = int(ni, int64)*int(nj, int64)*int(nk, int64)
+    nb   = nblocks_for(ntot)
+    call red_partial_maxabs<<<nb, NTHREADS>>>(A_d, n1, n2, n3, &
+                                              ilo, jlo, klo, ni, nj, nk)
+    call debug_check('red_partial_maxabs')
+    call red_final_max<<<1, 1>>>(nb)
+    call debug_check('red_final_max')
+    r = scratch_d(0)
+  end function device_max_abs3
+
+  !> Signed max over the section of A.
+  function device_max3(A_d, n1, n2, n3, ilo, ihi, jlo, jhi, klo, khi) result(r)
+    integer,  intent(in)         :: n1, n2, n3, ilo, ihi, jlo, jhi, klo, khi
+    real(dp), device, intent(in) :: A_d(n1, n2, n3)
+    real(dp)       :: r
+    integer        :: ni, nj, nk, nb
+    integer(int64) :: ntot
+
+    ni = ihi - ilo + 1
+    nj = jhi - jlo + 1
+    nk = khi - klo + 1
+    if (ni <= 0 .or. nj <= 0 .or. nk <= 0) then
+       r = -huge(0.0_dp)
+       return
+    end if
+    call ensure_scratch()
+    ntot = int(ni, int64)*int(nj, int64)*int(nk, int64)
+    nb   = nblocks_for(ntot)
+    call red_partial_max<<<nb, NTHREADS>>>(A_d, n1, n2, n3, &
+                                           ilo, jlo, klo, ni, nj, nk)
+    call debug_check('red_partial_max')
+    call red_final_max<<<1, 1>>>(nb)
+    call debug_check('red_final_max')
+    r = scratch_d(0)
+  end function device_max3
+
+  !> Sum over the section of A.
+  function device_sum3(A_d, n1, n2, n3, ilo, ihi, jlo, jhi, klo, khi) result(r)
+    integer,  intent(in)         :: n1, n2, n3, ilo, ihi, jlo, jhi, klo, khi
+    real(dp), device, intent(in) :: A_d(n1, n2, n3)
+    real(dp)       :: r
+    integer        :: ni, nj, nk, nb
+    integer(int64) :: ntot
+
+    ni = ihi - ilo + 1
+    nj = jhi - jlo + 1
+    nk = khi - klo + 1
+    if (ni <= 0 .or. nj <= 0 .or. nk <= 0) then
+       r = 0.0_dp
+       return
+    end if
+    call ensure_scratch()
+    ntot = int(ni, int64)*int(nj, int64)*int(nk, int64)
+    nb   = nblocks_for(ntot)
+    call red_partial_sum<<<nb, NTHREADS>>>(A_d, n1, n2, n3, &
+                                           ilo, jlo, klo, ni, nj, nk)
+    call debug_check('red_partial_sum')
+    call red_final_sum<<<1, 1>>>(nb)
+    call debug_check('red_final_sum')
+    r = scratch_d(0)
+  end function device_sum3
+
+  !> Weighted sum over the section: sum of A(i,j,k)*w_d(m), with m the
+  !> section point's index along dimension wdim (1->i, 2->j, 3->k).
+  !> Mass-flux BC usage (boundary_conditions.f90:240-256, nprocs=1 so
+  !> kk=2 and the z range is 2:nzg-2):
+  !>   Qx = device_wsum3(U_d, nx,nyg,nzg,  1,   1,  2,nyg-1, 2,nzg-2, dy_d, nyg, 2)
+  !>      - device_wsum3(U_d, nx,nyg,nzg,  nx-1,nx-1, 2,nyg-1, 2,nzg-2, dy_d, nyg, 2)
+  !>   Qy = device_wsum3(V_d, nxg,ny,nzg,  2,nxg-2, 1, 1, 2,nzg-2, dx_d, nxg, 1)
+  !>      - device_wsum3(V_d, nxg,ny,nzg,  2,nxg-2, ny,ny, 2,nzg-2, dx_d, nxg, 1)
+  !> with dy_d(j) = y(j)-y(j-1) and dx_d(i) = x(i)-x(i-1) precomputed
+  !> device vectors (length_y is a trivial host sum over y).
+  function device_wsum3(A_d, n1, n2, n3, ilo, ihi, jlo, jhi, klo, khi, &
+                        w_d, nw, wdim) result(r)
+    integer,  intent(in)         :: n1, n2, n3, ilo, ihi, jlo, jhi, klo, khi
+    integer,  intent(in)         :: nw, wdim
+    real(dp), device, intent(in) :: A_d(n1, n2, n3)
+    real(dp), device, intent(in) :: w_d(nw)
+    real(dp)       :: r
+    integer        :: ni, nj, nk, nb
+    integer(int64) :: ntot
+
+    ni = ihi - ilo + 1
+    nj = jhi - jlo + 1
+    nk = khi - klo + 1
+    if (ni <= 0 .or. nj <= 0 .or. nk <= 0) then
+       r = 0.0_dp
+       return
+    end if
+    call ensure_scratch()
+    ntot = int(ni, int64)*int(nj, int64)*int(nk, int64)
+    nb   = nblocks_for(ntot)
+    call red_partial_wsum<<<nb, NTHREADS>>>(A_d, n1, n2, n3, &
+                                            ilo, jlo, klo, ni, nj, nk, &
+                                            w_d, nw, wdim)
+    call debug_check('red_partial_wsum')
+    call red_final_sum<<<1, 1>>>(nb)
+    call debug_check('red_final_sum')
+    r = scratch_d(0)
+  end function device_wsum3
+
+  !> Max over the section of w_d(m)/|A(i,j,k)|, with m the section
+  !> point's index along dimension wdim. CFL building block; the dt
+  !> composition (three calls + dt_conv/dt_vis min logic of
+  !> time_integration.f90:compute_dt) lives in timestep_mod, e.g.
+  !>   lUmax = device_max_ratio3(U_d, nx,nyg,nzg, 2,nxg-1, 2,nyg-1, &
+  !>                             2,nzg-1, dxg_d, nxg, 1)
+  !> with dxg_d(i) = xg(i+1)-xg(i) (and analogously dyg_d, dzg_d).
+  function device_max_ratio3(A_d, n1, n2, n3, ilo, ihi, jlo, jhi, klo, khi, &
+                             w_d, nw, wdim) result(r)
+    integer,  intent(in)         :: n1, n2, n3, ilo, ihi, jlo, jhi, klo, khi
+    integer,  intent(in)         :: nw, wdim
+    real(dp), device, intent(in) :: A_d(n1, n2, n3)
+    real(dp), device, intent(in) :: w_d(nw)
+    real(dp)       :: r
+    integer        :: ni, nj, nk, nb
+    integer(int64) :: ntot
+
+    ni = ihi - ilo + 1
+    nj = jhi - jlo + 1
+    nk = khi - klo + 1
+    if (ni <= 0 .or. nj <= 0 .or. nk <= 0) then
+       r = 0.0_dp
+       return
+    end if
+    call ensure_scratch()
+    ntot = int(ni, int64)*int(nj, int64)*int(nk, int64)
+    nb   = nblocks_for(ntot)
+    call red_partial_maxratio<<<nb, NTHREADS>>>(A_d, n1, n2, n3, &
+                                                ilo, jlo, klo, ni, nj, nk, &
+                                                w_d, nw, wdim)
+    call debug_check('red_partial_maxratio')
+    call red_final_max<<<1, 1>>>(nb)
+    call debug_check('red_final_max')
+    r = scratch_d(0)
+  end function device_max_ratio3
+
+end module reductions
