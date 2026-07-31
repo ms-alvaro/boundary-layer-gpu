@@ -77,6 +77,7 @@ Program boundary_layer_FD
   !$acc      create(plane_gpu,rhs_hat_gpu) &
   !$acc      copyin(qu_inlet,qv_inlet,qw_inlet,zmode_inlet,tmode_inlet) &
   !$acc      create(Ut_inlet,Vt_inlet,Wt_inlet) &
+  !$acc      copyin(hit_buf_u,hit_buf_v,hit_buf_w) &
   !$acc      copyin(thomas_dl_fact,thomas_d_pivot,thomas_du) &
   !$acc      copyin(dct_twiddle)
 
@@ -109,6 +110,9 @@ Program boundary_layer_FD
 
      ! write snapshot if needed
      Call output_data
+
+     ! write causal-analysis subvolume boxes if enabled (self-gated)
+     Call output_boxes
 
   End Do
 

@@ -242,6 +242,35 @@ Module global
   Real   (Int64), Allocatable, Dimension(:,:,:) :: qu_inlet_r, qv_inlet_r, qw_inlet_r ! temporal
   Real   (Int64), Allocatable, Dimension(:,:,:) :: qu_inlet_i, qv_inlet_i, qw_inlet_i ! temporal
 
+  ! Subvolume ("box") output for causal-analysis data campaigns: up to 8 boxes
+  ! of u,v,w saved as float32 every boxout_every steps (absolute-step gated so
+  ! the cadence is continuous across chain restarts). Single-rank only.
+  Integer(Int32) :: boxout_every         ! steps between box dumps (0 = off)
+  Integer(Int32) :: boxout_start         ! absolute step to begin output
+  Integer(Int32) :: n_boxout             ! number of boxes (<= 8)
+  Character(200) :: dir_boxout           ! output directory (must exist)
+  Integer(Int32) :: boxout_i0(8), boxout_i1(8)   ! x-index window (1-based, incl.)
+  Integer(Int32) :: boxout_is(8)                 ! x-index stride
+  Integer(Int32) :: boxout_jmax(8)               ! y-index cap (1..jmax)
+
+  ! HIT plane inflow (inflow_flag=6): time-resolved y-z planes from a
+  ! precursor HIT simulation, preprocessed by transition_hit_v1/preprocess_planes.py
+  Character(200) :: file_hit_planes      ! binary planes file (format v2)
+  Character(200) :: file_ygrid           ! optional y-grid file (blended-sinh)
+  Integer(Int32) :: n_planes_hit         ! total planes in file
+  Integer(Int32) :: ny_hit_f, nz_hit_f   ! plane grid (file): y points, native z
+  Integer(Int32) :: N_buffer_hit         ! planes held on GPU
+  Integer(Int32) :: ibuf_start_hit       ! 1-based global index of buffer start
+  Integer(Int64) :: hit_data_offset      ! file offset where plane data starts
+  Real   (Int64) :: dt_plane_hit         ! BL time between planes
+  Real   (Int64) :: Lz_box_hit           ! z period of planes (must equal Lz)
+  Real   (Int64) :: y_blend_hit, A_vel_hit, Tu_hit
+  Real   (Int64), Allocatable, Dimension(:)     :: y_hit_f          ! file y grid
+  ! GPU-resident buffers, already interpolated to the staggered BL grids
+  Real   (Int64), Allocatable, Dimension(:,:,:) :: hit_buf_u  ! (nyg,nzg,N_buffer)
+  Real   (Int64), Allocatable, Dimension(:,:,:) :: hit_buf_v  ! (ny, nzg,N_buffer)
+  Real   (Int64), Allocatable, Dimension(:,:,:) :: hit_buf_w  ! (nyg,nz, N_buffer)
+
   ! statistics for z modes
   Integer(Int32) :: i_stat, j_stat, Delta_i_stat, nstats_zmodes
   Integer(Int32) :: nxu_reduced, nyu_reduced, nzu_reduced, nzu_modes, nzu_first_modes

@@ -116,9 +116,19 @@ Contains
     Call Mpi_bcast (    Lz_rand,1,MPI_real8,0,MPI_COMM_WORLD,ierr )
     Call Mpi_bcast ( alpha_rand,1,MPI_real8,0,MPI_COMM_WORLD,ierr )
 
+    ! subvolume (box) output
+    Call Mpi_bcast ( boxout_every,1,MPI_integer,0,MPI_COMM_WORLD,ierr )
+    Call Mpi_bcast ( boxout_start,1,MPI_integer,0,MPI_COMM_WORLD,ierr )
+    Call Mpi_bcast (     n_boxout,1,MPI_integer,0,MPI_COMM_WORLD,ierr )
+    Call Mpi_bcast (   dir_boxout,200,MPI_character,0,MPI_COMM_WORLD,ierr )
+    Call Mpi_bcast (    boxout_i0,8,MPI_integer,0,MPI_COMM_WORLD,ierr )
+    Call Mpi_bcast (    boxout_i1,8,MPI_integer,0,MPI_COMM_WORLD,ierr )
+    Call Mpi_bcast (    boxout_is,8,MPI_integer,0,MPI_COMM_WORLD,ierr )
+    Call Mpi_bcast (  boxout_jmax,8,MPI_integer,0,MPI_COMM_WORLD,ierr )
+
     ! small check
     If ( i_rescale>nx_global ) Stop 'Error! i_rescale>nx_global'
-    
+
   End Subroutine read_input_parameters
 
   !------------------------------------------------!
@@ -161,17 +171,23 @@ Contains
 
     ! ymesh
     ! Note: delta99/x0 = 4.91/sqrt(Rex0) = 0.0155 for Rex0 = 1e5
-    Do i=1,ny_global
-       y_global(i) = Real(i-1,8)
-    End Do
-    y_global = y_global - y_global(1)
-    y_global = y_global/Maxval(y_global)
-       alpha = alpha_rand
+    If ( Len_Trim(file_ygrid) > 0 ) Then
+       ! read custom wall-normal grid from file (e.g. blended-sinh),
+       ! one value per line, lines starting with '#' skipped
+       Call read_ygrid_from_file
+    Else
        Do i=1,ny_global
-          y_global(i) = dsinh(alpha*y_global(i))/dsinh(alpha)
+          y_global(i) = Real(i-1,8)
        End Do
-    y_global = y_global - y_global(1)
-    y_global = y_global/Maxval(y_global)*Ly_rand
+       y_global = y_global - y_global(1)
+       y_global = y_global/Maxval(y_global)
+          alpha = alpha_rand
+          Do i=1,ny_global
+             y_global(i) = dsinh(alpha*y_global(i))/dsinh(alpha)
+          End Do
+       y_global = y_global - y_global(1)
+       y_global = y_global/Maxval(y_global)*Ly_rand
+    End If
 
     ! ---- Compute center grids (yg, xg) needed for IC ----
     ! xg_init: center points + ghost for U (at x-faces, y-centers)
@@ -278,6 +294,44 @@ Contains
  
   End Subroutine init_flow
 
+  !-------------------------------------------------------!
+  ! Read custom wall-normal grid (y faces) from ASCII file !
+  ! One value per line; lines starting with '#' skipped.   !
+  ! Used when ygrid_file is set (e.g. blended-sinh grid    !
+  ! for HIT freestream resolution, inflow_flag=6).         !
+  !-------------------------------------------------------!
+  Subroutine read_ygrid_from_file
+
+    Integer(Int32)     :: j, ios
+    Character(len=256) :: line
+
+    If (myid==0) Write(*,*) '   Reading y-grid from: ', Trim(file_ygrid)
+
+    Open(46, file=Trim(file_ygrid), form='formatted', action='read', status='old')
+    j = 0
+    Do While ( j < ny_global )
+       Read(46,'(a)',iostat=ios) line
+       If ( ios /= 0 ) Exit
+       line = Adjustl(line)
+       If ( Len_Trim(line)==0 .or. line(1:1)=='#' ) Cycle
+       j = j + 1
+       Read(line,*) y_global(j)
+    End Do
+    Close(46)
+
+    If ( j /= ny_global ) Then
+       Write(*,*) 'ERROR: ygrid_file has ', j, ' values, need ny_global=', ny_global
+       Stop 'ygrid_file size mismatch'
+    End If
+
+    If (myid==0) Then
+       Write(*,*) '   y-grid: [', y_global(1), ',', y_global(ny_global), ']'
+       Write(*,*) '   dy_wall = ', y_global(2)-y_global(1), &
+                  ' dy_top = ', y_global(ny_global)-y_global(ny_global-1)
+    End If
+
+  End Subroutine read_ygrid_from_file
+
   !--------------------------------------------!
   !    Read binary snapshot: mesh, U,V and W   !
   !                                            !
@@ -295,6 +349,12 @@ Contains
     Character(200) :: err_msg
     logical        :: iostat_res
     
+    ! The read below fills only the stored planes (1:nzge-1); the last z-ghost
+    ! plane is set later by the BCs. Zero the arrays first so the ghost planes
+    ! are deterministic — otherwise the NaN sanity check below trips on
+    ! allocator garbage (bit NaN-patterned heap reuse; seen at ny=341).
+    U = 0d0; V = 0d0; W = 0d0
+
     ! processor 0 Reads the all the data
     If ( myid==0 ) Then
 
@@ -350,8 +410,10 @@ Contains
        ! get header position and size
        Inquire(1,pos=pos_header)
        pos_header = pos_header - 1
-       nsize_U    = nx_global*nyg_global*nzg_global*8_int64
-       nsize_V    = nxg_global*ny_global*nzg_global*8_int64
+       ! snapshot stores (n3-1) z-planes per field (writer does U(:,:,1:nzg-1) etc.),
+       ! so the on-disk block size uses (nzg_global-1), not nzg_global.
+       nsize_U    = nx_global*nyg_global*(nzg_global-1)*8_int64
+       nsize_V    = nxg_global*ny_global*(nzg_global-1)*8_int64
 
     End If
 
@@ -361,7 +423,11 @@ Contains
        Read(1) nn 
        ! read data for processor 0
        nzge = kg2_global(myid) - kg1_global(myid) + 1
-       Read(1) U(:,:,1:nzge)
+       ! plane-by-plane: a single >2GiB transfer overflows int32 byte counts in
+       ! the runtime (silent short read; first seen at ny=341, slab 2.17GB)
+       Do ndum = 1, nzge-1
+          Read(1) U(:,:,ndum)    ! writer stored nzg-1 planes (last z = ghost, set by BC)
+       End Do
        ! data for processor n>0    
        Do iproc = 1, nprocs-1
           nzge = kg2_global(iproc) - kg1_global(iproc) + 1 ! local size in z for processor iproc
@@ -381,13 +447,14 @@ Contains
 
     ! V
     If ( myid==0 ) Then
-       ! go to correct position. I dont know, if I dont do this it gets lost
-       call fseek(1,pos_header+3*4+nsize_U,seek_set)
-       ! read dummy
-       Read(1) nn
+       ! absolute position via stream POS= (Int64-safe; fseek offset overflows
+       ! int32 once nsize_U > 2^31, i.e. ny>=~300 at this nx/nz)
+       Read(1, POS=pos_header+3_int64*4_int64+nsize_U+1_int64) nn
        ! read data for processor 0
        nzge = kg2_global(myid) - kg1_global(myid) + 1
-       Read(1) V(:,:,1:nzge)
+       Do ndum = 1, nzge-1
+          Read(1) V(:,:,ndum)    ! writer stored nzg-1 planes
+       End Do
        ! data for processor n>0    
        Do iproc = 1, nprocs-1
           nzge = kg2_global(iproc) - kg1_global(iproc) + 1 ! local size in z for processor iproc
@@ -407,13 +474,13 @@ Contains
 
     ! W
     If ( myid==0 ) Then
-       ! go to correct position. I dont know, if I dont do this it gets lost
-       call fseek(1,pos_header+3*4+nsize_U+3*4+nsize_V,seek_set)
-       ! read dummy
-       Read(1) nn
+       ! absolute position via stream POS= (Int64-safe)
+       Read(1, POS=pos_header+3_int64*4_int64+nsize_U+3_int64*4_int64+nsize_V+1_int64) nn
        ! read data for processor 0
        nzge = k2_global(myid) - k1_global(myid) + 1
-       Read(1) W(:,:,1:nzge)
+       Do ndum = 1, nzge-1
+          Read(1) W(:,:,ndum)    ! writer stored nz-1 planes
+       End Do
        ! data for processor n>0    
        Do iproc = 1, nprocs-1
           nze = k2_global(iproc) - k1_global(iproc) + 1 ! local size in z for processor iproc
@@ -651,16 +718,13 @@ Contains
 
           fname_symlnk = Trim(Adjustl(fileout))//'.'//'restart'
 
-          ! Check if symlink exists
-          inquire(file=fname_symlnk, exist=exists)
-          
-          if (exists) then
-              ! Open the file for writing
-              !command = trim(adjustl('rm '//trim(adjustl(filename))
-              call system( 'rm '//fname_symlnk )
-          end if
-
-          string_link = 'ln -s '//Trim(Adjustl(fname))//' '//Trim(fname_symlnk)
+          ! Point <fileout>.restart at the LATEST snapshot. The symlink lives in
+          ! the same directory as the snapshot, so the target must be the snapshot
+          ! BASENAME (not the cwd-relative path, which dangles from that dir). Use
+          ! -sf so it overwrites and always tracks the newest file.
+          string_link = 'ln -sf '// &
+               Trim(Adjustl(fname(index(fname,'/',back=.true.)+1:)))// &
+               ' '//Trim(Adjustl(fname_symlnk))
           call system( string_link )
 
        End If
@@ -678,6 +742,91 @@ Contains
     End If
        
   End Subroutine output_data
+
+  !-------------------------------------------------------------------!
+  ! Subvolume ("box") output for causal-analysis data campaigns.      !
+  ! Every boxout_every steps (gated on the ABSOLUTE step so cadence   !
+  ! survives chain restarts), writes u,v,w as float32 on up to 8      !
+  ! index-window boxes to per-launch stream files:                    !
+  !     <dir_boxout>/box<b>_<first-abs-step>.bin                      !
+  ! File: int32 header (magic,version,id,i0,i1,is,jmax,npx,npy,npz,   !
+  ! every,ncomp) + f8 x_global(sel), y_global(1:jmax), z_global(1:npz)!
+  ! then per record: f8 t, int32 absstep, r4 u,v,w (npx,jmax,npz).    !
+  ! Components stay on their native staggered grids over the same     !
+  ! index window (U: x-faces/y-faces file grid docs in campaign md).  !
+  ! Single-rank only (domain decomposition unsupported).              !
+  !-------------------------------------------------------------------!
+  Subroutine output_boxes
+
+    Integer(Int32), Parameter :: NKB = 256          ! z planes saved (one period)
+    Integer(Int32) :: b, i, j, k, ii, absstep, npx, jm, iunit
+    Character(300) :: fname
+    Character(8)   :: ext
+    Logical, Save  :: box_open(8) = .false.
+    Logical, Save  :: checked = .false.
+    Real(4), Allocatable, Save :: rbuf(:,:,:,:)
+
+    If ( boxout_every<=0 .Or. n_boxout<=0 ) Return
+    absstep = istep + nstep_init
+    If ( absstep < boxout_start ) Return
+    If ( Mod(absstep, boxout_every) /= 0 ) Return
+
+    If ( .Not. checked ) Then
+       If ( nprocs /= 1 ) Stop 'ERROR: boxout requires a single rank'
+       ii = 0; j = 0
+       Do b = 1, n_boxout
+          If ( boxout_i1(b)>nx .Or. boxout_jmax(b)>ny .Or. NKB>nz ) &
+               Stop 'ERROR: boxout window exceeds grid'
+          If ( boxout_is(b)<1 .Or. boxout_i0(b)<1 ) Stop 'ERROR: bad boxout spec'
+          ii = Max( ii, (boxout_i1(b)-boxout_i0(b))/boxout_is(b) + 1 )
+          j  = Max( j, boxout_jmax(b) )
+       End Do
+       Allocate( rbuf(ii, j, NKB, 3) )   ! sized once to the largest box
+       checked = .true.
+    End If
+
+    ! fresh fields on the host (U,V,W only; P/nu_t not needed)
+    !$acc update self(U,V,W)
+
+    Do b = 1, n_boxout
+       npx = (boxout_i1(b) - boxout_i0(b))/boxout_is(b) + 1
+       jm  = boxout_jmax(b)
+       iunit = 70 + b
+
+       If ( .Not. box_open(b) ) Then
+          Write(ext,'(I0.8)') absstep
+          fname = Trim(dir_boxout)//'/box'//Char(48+b)//'_'//ext//'.bin'
+          Open(iunit, file=Trim(fname), access='stream', form='unformatted', &
+               action='write', status='replace')
+          Write(iunit) 20260709, 1, b, boxout_i0(b), boxout_i1(b), &
+                       boxout_is(b), jm, npx, jm, NKB, boxout_every, 3
+          Write(iunit) x_global(boxout_i0(b):boxout_i1(b):boxout_is(b))
+          Write(iunit) y_global(1:jm)
+          Write(iunit) z_global(1:NKB)
+          box_open(b) = .true.
+          If (myid==0) Write(*,'(a,i2,a,a)') '   boxout: opened box ', b, ' -> ', Trim(fname)
+       End If
+
+       Do k = 1, NKB
+          Do j = 1, jm
+             ii = 0
+             Do i = boxout_i0(b), boxout_i1(b), boxout_is(b)
+                ii = ii + 1
+                rbuf(ii,j,k,1) = Real( U(i,j,k), 4 )
+                rbuf(ii,j,k,2) = Real( V(i,j,k), 4 )
+                rbuf(ii,j,k,3) = Real( W(i,j,k), 4 )
+             End Do
+          End Do
+       End Do
+
+       Write(iunit) t, absstep
+       Write(iunit) rbuf(1:npx,1:jm,1:NKB,1)
+       Write(iunit) rbuf(1:npx,1:jm,1:NKB,2)
+       Write(iunit) rbuf(1:npx,1:jm,1:NKB,3)
+       Flush(iunit)
+    End Do
+
+  End Subroutine output_boxes
 
   !----------------------------------------------!
   !   Write some basic statistics in a txt file  !
