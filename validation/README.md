@@ -54,9 +54,16 @@ validation/
 | openacc-ref (commit 0537a6c) | bench 814x125x66 | 15.53 | 2.31 |
 | cuda-v1 (Phase 2 port) | laminar 302x64x8 | 1.13 | 7.3 |
 | cuda-v1 (Phase 2 port) | bench 814x125x66 | 15.55 | 2.32 |
+| cuda-v4 (Phase 3: fusions + async reductions) | laminar 302x64x8 | 0.73 | 4.7 |
+| cuda-v4 (Phase 3: fusions + async reductions) | bench 814x125x66 | 13.8-14.1 | 2.05-2.10 |
 
 cuda-v1 vs openacc-ref: max relative field diff 4.5e-12 after 2000
-laminar steps; both builds bitwise run-to-run deterministic.
+laminar steps; both builds bitwise run-to-run deterministic. All Phase 3
+optimizations so far (RHS fusion, Poisson pack fusions, save+advance
+fusion, device-resident mass-flux reduction) are bitwise-identical to
+cuda-v1 by construction and verified so by `compare --tol 1e-15`.
+Bench numbers vary +-0.3 ms run-to-run (GPU clocks); quote medians of
+several runs when comparing.
 
 (Laminar-grid timing is kernel-launch-latency dominated; the bench number is
 the one that predicts production performance.)
