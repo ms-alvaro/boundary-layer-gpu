@@ -1,5 +1,27 @@
 # Multi-GPU design (Phase 5 proposal — not yet implemented)
 
+Status update 3: **P5.3 + P5.4 implemented and validated** (2026-07-31):
+- **Statistics**: distributed via partial z-sums + array allreduces (the
+  overlapping-slab interiors tile the global z exactly, so the reduced
+  statistics are numerically IDENTICAL to single-rank — verified 0.00
+  difference on the .stats.txt values).
+- **Box output**: per-rank z-window extraction + float32 plane gather to
+  rank 0; identical headers/grids, payloads within one float32 ulp.
+- **Restart**: fully parallel windowed reads — every rank POS-seeks its own
+  z-slab in the global snapshot (no MPI in the reader); the writer's
+  gathered global snapshots make restart files interchangeable between any
+  rank counts. A post-load z-ghost sync (the legacy 'force periodicity'
+  fixup) makes single-rank restart continuation BITWISE-exact vs the
+  straight-through run; multi-rank matches at reduction roundoff (7e-15).
+- **Scaling (P5.4)**, transition grid 6.7M cells, PCIe A100s:
+  P=1: 10.0, P=2: 15.0, P=4: 18.7 ms/step — strong scaling is NEGATIVE at
+  this size on PCIe (as flagged below: transposes + syncs dominate small
+  grids without NVLink). Multi-GPU on tifa is a CAPACITY feature: the
+  270M-cell fst_tbl_ctr-scale configuration (~65 GB of state, impossible
+  on one 40 GB card) runs on 4 ranks — see validation/README.md.
+- Bug found by the 2-rank HIT validation: the plane-library z-period check
+  used the LOCAL nz (half the period at P=2); fixed to nz_global.
+
 Status update 2: **P5.2 implemented and validated** (2026-07-31): the
 distributed transpose Poisson is in (no gather; every rank x-FFTs its own
 z-slab, all-to-alls the REAL DCT coefficients — half the bytes — to x-mode
