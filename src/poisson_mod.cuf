@@ -62,7 +62,7 @@ module poisson_mod
   use field_mod,     only: U_d, V_d, W_d, P_d, rhs_p_d
   use reductions,    only: device_max_abs3
   use mpi_mod,       only: nprocs, myid, is_root, gather_dev, scatter_dev, &
-                           pressure_exchange_z, allreduce_max
+                           alltoall_dev, pressure_exchange_z, allreduce_max
   use param_mod,     only: nz_global
 
   implicit none
@@ -114,6 +114,23 @@ module poisson_mod
   ! P5.1 gathered-Poisson work buffers (see poisson_init)
   real(dp), device, allocatable :: divc_d(:,:,:)     ! (nxp, ns, nm) all ranks
   real(dp), device, allocatable :: gath_d(:,:,:,:)   ! (nxp, ns, nm, P) root
+
+  ! P5.2 distributed-Poisson state (docs/MULTI_GPU_DESIGN.md pipeline):
+  ! local x-FFT on owned z-planes -> all-to-all to x-mode slabs (REAL DCT
+  ! coefficients: half the transpose bytes) -> local z-FFT + Thomas on the
+  ! x-chunk -> all-to-all back -> local x-IFFT. Every rank owns
+  ! nxq = nxp/P consecutive x-modes (q0 = myid*nxq global offset).
+  integer :: nxq = 0, q0 = 0
+  logical :: use_gather_fallback = .false.          ! BL_POISSON_GATHER=1
+  complex(dp), device, allocatable :: plane_loc_d(:,:,:)   ! (nxp, ns, nm)
+  real(dp),    device, allocatable :: dreal_d(:,:,:)       ! (nxp, ns, nm)
+  real(dp),    device, allocatable :: sbuf_d(:,:,:,:)      ! (nxq, ns, nm, P)
+  real(dp),    device, allocatable :: rbuf_d(:,:,:,:)      ! (nxq, ns, nm, P)
+  complex(dp), device, allocatable :: rhs_hat_loc_d(:,:,:) ! (nxq, nm, nzp)
+  complex(dp), device, allocatable :: thomas_dl_loc_d(:,:,:)  ! (nxq, mz+1, nm)
+  complex(dp), device, allocatable :: thomas_piv_loc_d(:,:,:) ! (nxq, mz+1, nm)
+  integer(c_int) :: cufft_plan_x_loc = 0   ! length nxp, batch ns*nm
+  integer(c_int) :: cufft_plan_z_loc = 0   ! length nzp, stride nxq*nm
 
 
   ! cuFFT plan handles (cufft_solver.f90)
@@ -222,9 +239,8 @@ contains
     if (is_root()) call cufft_init_plans(nxp, nzp, nm)
 
     root_setup: if (is_root()) then
-    ! Everything inside this block exists only on rank 0 (or the single
-    ! rank): FFT work arrays, twiddles, operators, Thomas factors. Other
-    ! ranks only feed/receive the compact divergence/solution chunks.
+    ! Root only (or the single rank): full-size FFT work arrays + plans —
+    ! used by the single-rank solve and the P5.1 gather fallback.
 
     !------------- device work arrays (initialization.f90:314-315; the
     ! half-length pipeline needs only an nxp-long complex line per batch) ----
@@ -233,13 +249,19 @@ contains
     plane_d   = (0.0_dp, 0.0_dp)
     rhs_hat_d = (0.0_dp, 0.0_dp)
 
+    end if root_setup
+
+    ! ---- host operator setup: EVERY rank (identical values; the P5.2
+    ! distributed solve needs twiddles + its Thomas-factor x-slice locally) --
+
     !------------- DCT-II twiddle factors (initialization.f90:317-320) --------
     ! dct_twiddle(i) = exp(-i*pi*i/(2*nxp)) for i = 0..mx
     allocate ( dct_twiddle(0:mx) )
     do i = 0, mx
        dct_twiddle(i) = exp( cmplx( 0.0_dp, -pi*real(i,dp)/(2.0_dp*real(nxp,dp)), dp ) )
     end do
-    write(*,*) 'cuFFT half-length real-DCT:', nxp, 'x', nzp, ',', nyg-2, 'batches'
+    if (is_root()) &
+       write(*,*) 'cuFFT half-length real-DCT:', nxp, 'x', nzp, ',', nyg-2, 'batches'
 
     !------------- modified wavenumbers (initialization.f90:329-344) ----------
     allocate ( kxx(0:mx), kzz(0:mz) )
@@ -346,19 +368,22 @@ contains
           end do
        end do
     end do
-    write(*,*) 'Thomas LU precomputed:', nm, 'x', mx+1, 'x', mz+1
+    if (is_root()) write(*,*) 'Thomas LU precomputed:', nm, 'x', mx+1, 'x', mz+1
 
     !--------------------------- device operator copies -----------------------
+    ! twiddles + Thomas upper diagonal: every rank; FULL factor arrays:
+    ! root only (single-rank solve + gather fallback). The distributed
+    ! solve uses per-rank x-slices (allocated below).
     allocate ( dct_twiddle_d(0:mx) )
-    allocate ( thomas_dl_fact_d(mx+1, mz+1, nm) )
-    allocate ( thomas_d_pivot_d(mx+1, mz+1, nm) )
     allocate ( thomas_du_d(nm) )
-    dct_twiddle_d    = dct_twiddle
-    thomas_dl_fact_d = thomas_dl_fact
-    thomas_d_pivot_d = thomas_d_pivot
-    thomas_du_d      = thomas_du
-
-    end if root_setup
+    dct_twiddle_d = dct_twiddle
+    thomas_du_d   = thomas_du
+    if (is_root()) then
+       allocate ( thomas_dl_fact_d(mx+1, mz+1, nm) )
+       allocate ( thomas_d_pivot_d(mx+1, mz+1, nm) )
+       thomas_dl_fact_d = thomas_dl_fact
+       thomas_d_pivot_d = thomas_d_pivot
+    end if
 
     !--------------------------- divergence scratch ---------------------------
     ! interior-center divergence, i = 2..nxg-2 as in the reference check
@@ -378,6 +403,59 @@ contains
           allocate ( gath_d(1, 1, 1, 1) )   ! dummy (root-significant arg)
        end if
        gath_d = 0.0_dp
+
+       !------------------ P5.2 distributed-solve state ----------------------
+       block
+         character(8) :: envval
+         integer :: envlen, envstat
+         integer(c_int) :: istat_p, n1p(1), ne1p(1)
+         call get_environment_variable('BL_POISSON_GATHER', envval, envlen, envstat)
+         use_gather_fallback = (envstat == 0 .and. envlen >= 1 .and. envval(1:1) == '1')
+       if (.not. use_gather_fallback) then
+         if (mod(nxp, nprocs) /= 0) then
+            if (is_root()) write(*,*) 'ERROR: nxp =', nxp, &
+               ' not divisible by nprocs =', nprocs, &
+               ' (choose nx so nx-2 divides, or set BL_POISSON_GATHER=1)'
+            stop 'P5.2: nxp must divide by nprocs'
+         end if
+         nxq = nxp/nprocs
+         q0  = myid*nxq
+
+         allocate ( plane_loc_d(nxp, nslices_z, nm) )
+         allocate ( dreal_d    (nxp, nslices_z, nm) )
+         allocate ( sbuf_d(nxq, nslices_z, nm, nprocs) )
+         allocate ( rbuf_d(nxq, nslices_z, nm, nprocs) )
+         allocate ( rhs_hat_loc_d(nxq, nm, nzp) )
+         plane_loc_d   = (0.0_dp, 0.0_dp)
+         dreal_d       = 0.0_dp
+         sbuf_d        = 0.0_dp
+         rbuf_d        = 0.0_dp
+         rhs_hat_loc_d = (0.0_dp, 0.0_dp)
+
+         ! this rank's x-slice of the Thomas factors (host slice -> device)
+         allocate ( thomas_dl_loc_d (nxq, mz+1, nm) )
+         allocate ( thomas_piv_loc_d(nxq, mz+1, nm) )
+         thomas_dl_loc_d  = thomas_dl_fact (q0+1:q0+nxq, :, :)
+         thomas_piv_loc_d = thomas_d_pivot(q0+1:q0+nxq, :, :)
+
+         ! local plans: x length nxp over the owned ns*nm lines; z strided
+         ! over the full nzp with the x-chunk layout (nxq, nm, nzp)
+         n1p(1) = nxp; ne1p(1) = nxp
+         istat_p = cufftPlanMany(cufft_plan_x_loc, 1, n1p, &
+              ne1p, 1, nxp, ne1p, 1, nxp, CUFFT_Z2Z, nslices_z*nm)
+         if (istat_p /= CUFFT_SUCCESS) then
+            write(*,*) 'cufftPlanMany x_loc failed:', istat_p; stop
+         end if
+         n1p(1) = nzp; ne1p(1) = nzp
+         istat_p = cufftPlanMany(cufft_plan_z_loc, 1, n1p, &
+              ne1p, nxq*nm, 1, ne1p, nxq*nm, 1, CUFFT_Z2Z, nxq*nm)
+         if (istat_p /= CUFFT_SUCCESS) then
+            write(*,*) 'cufftPlanMany z_loc failed:', istat_p; stop
+         end if
+         if (is_root()) write(*,*) 'P5.2 distributed Poisson: nxq =', nxq, &
+                                   ' modes/rank'
+       end if
+       end block
     end if
 
   end subroutine poisson_init
@@ -483,8 +561,10 @@ contains
 
     if (nprocs == 1) then
        call solve_poisson_gpu()
-    else
+    else if (use_gather_fallback) then
        call solve_poisson_gathered()
+    else
+       call solve_poisson_distributed()
     end if
 
     ! periodic boundary conditions in z
@@ -651,6 +731,89 @@ contains
     call debug_check('k_unpack_phi')
 
   end subroutine solve_poisson_gathered
+
+  !----------------------------------------------------------------------------
+  ! solve_poisson_distributed — P5.2: no gather. Per rank:
+  !   1. div + Makhoul pack on the ns owned z-planes (k_div_pack, local nzp=ns)
+  !   2. local x-FFT (length nxp, batch ns*nm)
+  !   3. DCT extract -> REAL coefficients dreal(nxp, ns, nm)
+  !   4. all-to-all transpose to x-mode slabs: rhs_hat_loc(nxq, nm, nzp)
+  !   5. local z-FFT + Thomas (this rank's factor slice) + z-IFFT
+  !   6. all-to-all back -> dreal (full x, owned z)
+  !   7. build V' + local x-IFFT + unpack into rhs_p planes 2..ns+1
+  ! The mode array equals the single-rank one exactly (same formulas; the
+  ! transposes only move data), so results match to FFT-batching roundoff.
+  !----------------------------------------------------------------------------
+  subroutine solve_poisson_distributed()
+
+    type(dim3)     :: tb, gr
+    integer(c_int) :: istat
+    real(dp)       :: fft_norm
+
+    tb = dim3(64, 4, 1)
+    fft_norm = 1.0_dp / real(nxp*nzp, dp)
+
+    ! 1. divergence + even/odd pack on owned planes (reuse k_div_pack with
+    !    the LOCAL plane count as its z extent: local k -> plane k+1)
+    gr = dim3( ceil_div(nxp, 64), ceil_div(nslices_z, 4), nm )
+    call k_div_pack<<<gr, tb>>>(plane_loc_d, U_d, V_d, W_d, x_d, y_d, z_d, &
+                                nxp, nslices_z, nm, nx, ny, nz, nxg, nyg, nzg)
+    call debug_check('k_div_pack (loc)')
+
+    ! 2. local x-FFT
+    istat = cufftExecZ2Z(cufft_plan_x_loc, plane_loc_d, plane_loc_d, CUFFT_FORWARD)
+    call debug_check_cufft('cufftExecZ2Z(x_loc fwd)', istat)
+
+    ! 3. real DCT coefficients
+    call k_extract_dreal<<<gr, tb>>>(dreal_d, plane_loc_d, dct_twiddle_d, &
+                                     nxp, nslices_z, nm)
+    call debug_check('k_extract_dreal')
+
+    ! 4. transpose: pack by destination x-chunk, all-to-all, unpack to
+    !    (nxq, nm, nzp) with global z rows r*ns+kk
+    gr = dim3( ceil_div(nxq, 64), ceil_div(nslices_z, 4), nm )
+    call k_a2a_pack_fwd<<<gr, tb>>>(sbuf_d, dreal_d, nxq, nslices_z, nm, nprocs)
+    call debug_check('k_a2a_pack_fwd')
+    call alltoall_dev(sbuf_d, nxq*nslices_z*nm, rbuf_d)
+    call k_a2a_unpack_fwd<<<gr, tb>>>(rhs_hat_loc_d, rbuf_d, nxq, nslices_z, &
+                                      nm, nprocs, nzp)
+    call debug_check('k_a2a_unpack_fwd')
+
+    ! 5. z-FFT -> Thomas (x-chunk slice) -> z-IFFT
+    istat = cufftExecZ2Z(cufft_plan_z_loc, rhs_hat_loc_d, rhs_hat_loc_d, CUFFT_FORWARD)
+    call debug_check_cufft('cufftExecZ2Z(z_loc fwd)', istat)
+
+    gr = dim3( ceil_div(nxq, 64), ceil_div(mz+1, 4), 1 )
+    call k_thomas<<<gr, tb>>>(rhs_hat_loc_d, thomas_dl_loc_d, thomas_piv_loc_d, &
+                              thomas_du_d, nxq, mz+1, nm)
+    call debug_check('k_thomas (loc)')
+
+    istat = cufftExecZ2Z(cufft_plan_z_loc, rhs_hat_loc_d, rhs_hat_loc_d, CUFFT_INVERSE)
+    call debug_check_cufft('cufftExecZ2Z(z_loc inv)', istat)
+
+    ! 6. transpose back
+    gr = dim3( ceil_div(nxq, 64), ceil_div(nslices_z, 4), nm )
+    call k_a2a_pack_inv<<<gr, tb>>>(sbuf_d, rhs_hat_loc_d, nxq, nslices_z, &
+                                    nm, nprocs, nzp)
+    call debug_check('k_a2a_pack_inv')
+    call alltoall_dev(sbuf_d, nxq*nslices_z*nm, rbuf_d)
+    call k_a2a_unpack_inv<<<gr, tb>>>(dreal_d, rbuf_d, nxq, nslices_z, nm, nprocs)
+    call debug_check('k_a2a_unpack_inv')
+
+    ! 7. V' + x-IFFT + unpack into rhs_p (planes 2..ns+1)
+    gr = dim3( ceil_div(nxp, 64), ceil_div(nslices_z, 4), nm )
+    call k_build_vprime_loc<<<gr, tb>>>(plane_loc_d, dreal_d, dct_twiddle_d, &
+                                        nxp, nslices_z, nm)
+    call debug_check('k_build_vprime_loc')
+
+    istat = cufftExecZ2Z(cufft_plan_x_loc, plane_loc_d, plane_loc_d, CUFFT_INVERSE)
+    call debug_check_cufft('cufftExecZ2Z(x_loc inv)', istat)
+
+    call k_extract_out<<<gr, tb>>>(rhs_p_d, plane_loc_d, fft_norm, &
+                                   nxp, nslices_z, nm, nxg, nyg, nzg)
+    call debug_check('k_extract_out (loc)')
+
+  end subroutine solve_poisson_distributed
 
   !----------------------------------------------------------------------------
   ! apply_periodic_z_pressure — periodic fix-up of the solved rhs_p
@@ -986,6 +1149,117 @@ contains
     rhs_p(ix+1, b+1, kk+1) = phic(ix, kk, b)
 
   end subroutine k_unpack_phi
+
+  !----------------------------------------------------------------------------
+  ! P5.2 kernels — distributed-solve data movement (pure copies/format
+  ! conversions; all arithmetic lives in the shared kernels above).
+  !----------------------------------------------------------------------------
+
+  !> dreal(i,k,b) = 2*Re( tw(i-1) * plane(i,k,b) ) — real DCT coefficients
+  !> of the owned z-planes (same formula as k_extract_dct, kept real and
+  !> untransposed so the transpose moves half the bytes).
+  attributes(global) subroutine k_extract_dreal(dreal, plane, tw, nxp, ns, nm)
+    integer, value :: nxp, ns, nm
+    real(dp),    intent(out) :: dreal(nxp, ns, nm)
+    complex(dp), intent(in)  :: plane(nxp, ns, nm)
+    complex(dp), intent(in)  :: tw(0:nxp-1)
+    integer :: i, k, b
+    i = 1 + (blockIdx%x-1)*blockDim%x + threadIdx%x - 1
+    k = 1 + (blockIdx%y-1)*blockDim%y + threadIdx%y - 1
+    b = 1 + blockIdx%z - 1
+    if (i > nxp .or. k > ns .or. b > nm) return
+    dreal(i, k, b) = 2.0_dp*real(tw(i-1)*plane(i, k, b), dp)
+  end subroutine k_extract_dreal
+
+  !> forward transpose pack: block q holds this rank's z-planes of x-mode
+  !> chunk q: sbuf(i,kk,b,q) = dreal((q-1)*nxq+i, kk, b)
+  attributes(global) subroutine k_a2a_pack_fwd(sbuf, dreal, nxq, ns, nm, P)
+    integer, value :: nxq, ns, nm, P
+    real(dp), intent(out) :: sbuf(nxq, ns, nm, P)
+    real(dp), intent(in)  :: dreal(nxq*P, ns, nm)
+    integer :: i, k, b, q
+    i = 1 + (blockIdx%x-1)*blockDim%x + threadIdx%x - 1
+    k = 1 + (blockIdx%y-1)*blockDim%y + threadIdx%y - 1
+    b = 1 + blockIdx%z - 1
+    if (i > nxq .or. k > ns .or. b > nm) return
+    do q = 1, P
+       sbuf(i, k, b, q) = dreal((q-1)*nxq + i, k, b)
+    end do
+  end subroutine k_a2a_pack_fwd
+
+  !> forward transpose unpack: source-rank block r carries global z rows
+  !> (r-1)*ns+kk of my x-chunk: rhs_hat(i, b, (r-1)*ns+kk) = rbuf(i,kk,b,r)
+  attributes(global) subroutine k_a2a_unpack_fwd(rhs_hat, rbuf, nxq, ns, nm, &
+                                                 P, nzp)
+    integer, value :: nxq, ns, nm, P, nzp
+    complex(dp), intent(out) :: rhs_hat(nxq, nm, nzp)
+    real(dp),    intent(in)  :: rbuf(nxq, ns, nm, P)
+    integer :: i, k, b, r
+    i = 1 + (blockIdx%x-1)*blockDim%x + threadIdx%x - 1
+    k = 1 + (blockIdx%y-1)*blockDim%y + threadIdx%y - 1
+    b = 1 + blockIdx%z - 1
+    if (i > nxq .or. k > ns .or. b > nm) return
+    do r = 1, P
+       rhs_hat(i, b, (r-1)*ns + k) = cmplx( rbuf(i, k, b, r), 0.0_dp, dp )
+    end do
+  end subroutine k_a2a_unpack_fwd
+
+  !> inverse transpose pack: destination-rank block r takes its z rows of my
+  !> x-chunk: sbuf(i,kk,b,r) = Re( rhs_hat(i, b, (r-1)*ns+kk) )
+  attributes(global) subroutine k_a2a_pack_inv(sbuf, rhs_hat, nxq, ns, nm, &
+                                               P, nzp)
+    integer, value :: nxq, ns, nm, P, nzp
+    real(dp),    intent(out) :: sbuf(nxq, ns, nm, P)
+    complex(dp), intent(in)  :: rhs_hat(nxq, nm, nzp)
+    integer :: i, k, b, r
+    i = 1 + (blockIdx%x-1)*blockDim%x + threadIdx%x - 1
+    k = 1 + (blockIdx%y-1)*blockDim%y + threadIdx%y - 1
+    b = 1 + blockIdx%z - 1
+    if (i > nxq .or. k > ns .or. b > nm) return
+    do r = 1, P
+       sbuf(i, k, b, r) = real( rhs_hat(i, b, (r-1)*ns + k), dp )
+    end do
+  end subroutine k_a2a_pack_inv
+
+  !> inverse transpose unpack: source block q returns x-mode chunk q of my
+  !> z-planes: dreal((q-1)*nxq+i, kk, b) = rbuf(i,kk,b,q)
+  attributes(global) subroutine k_a2a_unpack_inv(dreal, rbuf, nxq, ns, nm, P)
+    integer, value :: nxq, ns, nm, P
+    real(dp), intent(out) :: dreal(nxq*P, ns, nm)
+    real(dp), intent(in)  :: rbuf(nxq, ns, nm, P)
+    integer :: i, k, b, q
+    i = 1 + (blockIdx%x-1)*blockDim%x + threadIdx%x - 1
+    k = 1 + (blockIdx%y-1)*blockDim%y + threadIdx%y - 1
+    b = 1 + blockIdx%z - 1
+    if (i > nxq .or. k > ns .or. b > nm) return
+    do q = 1, P
+       dreal((q-1)*nxq + i, k, b) = rbuf(i, k, b, q)
+    end do
+  end subroutine k_a2a_unpack_inv
+
+  !> V' from the REAL solution coefficients (same formula as k_build_vprime,
+  !> reading the untransposed real layout): D_k at slot ii, D_{N-k} at
+  !> nxp+2-ii (zero for ii = 1).
+  attributes(global) subroutine k_build_vprime_loc(plane, dreal, tw, &
+                                                   nxp, ns, nm)
+    integer, value :: nxp, ns, nm
+    complex(dp), intent(out) :: plane(nxp, ns, nm)
+    real(dp),    intent(in)  :: dreal(nxp, ns, nm)
+    complex(dp), intent(in)  :: tw(0:nxp-1)
+    integer  :: ii, k, b
+    real(dp) :: dk, dnk
+    ii = 1 + (blockIdx%x-1)*blockDim%x + threadIdx%x - 1
+    k  = 1 + (blockIdx%y-1)*blockDim%y + threadIdx%y - 1
+    b  = 1 + blockIdx%z - 1
+    if (ii > nxp .or. k > ns .or. b > nm) return
+    dk = dreal(ii, k, b)
+    if (ii == 1) then
+       dnk = 0.0_dp
+    else
+       dnk = dreal(nxp+2-ii, k, b)
+    end if
+    plane(ii, k, b) = 0.5_dp * conjg(tw(ii-1)) * cmplx( dk, -dnk, dp )
+  end subroutine k_build_vprime_loc
 
   !----------------------------------------------------------------------------
   ! k_extract_dct — DCT-II coefficients from the half-length x-FFT:

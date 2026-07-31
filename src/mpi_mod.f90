@@ -42,6 +42,7 @@ module mpi_mod
   public :: halo_exchange_z, periodic_exchange_z
   public :: allreduce_sum, allreduce_max
   public :: gather_dev, scatter_dev
+  public :: alltoall_dev
   public :: pressure_exchange_z
   public :: gather_slabs_host
   public :: barrier
@@ -200,6 +201,21 @@ contains
     call MPI_Scatter(send_d, count, MPI_REAL8, recv_d, count, MPI_REAL8, &
                      0, MPI_COMM_WORLD, ierr)
   end subroutine scatter_dev
+
+  !---------------------------------------------------------------------------
+  ! alltoall_dev — device-buffer MPI_Alltoall with fixed per-rank block size
+  ! (the P5.2 Poisson transposes). Blocks are packed by destination rank in
+  ! the send buffer and land ordered by source rank in the receive buffer.
+  !---------------------------------------------------------------------------
+  subroutine alltoall_dev(send_d, count, recv_d)
+    integer, intent(in) :: count
+    real(dp), device, intent(in)    :: send_d(count*nprocs)
+    real(dp), device, intent(inout) :: recv_d(count*nprocs)
+    integer :: istat
+    istat = cudaDeviceSynchronize()   ! see halo_exchange_z
+    call MPI_Alltoall(send_d, count, MPI_REAL8, recv_d, count, MPI_REAL8, &
+                      MPI_COMM_WORLD, ierr)
+  end subroutine alltoall_dev
 
   !---------------------------------------------------------------------------
   ! pressure_exchange_z — ghost planes of the pseudo-pressure after the
