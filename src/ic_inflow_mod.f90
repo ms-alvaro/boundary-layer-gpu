@@ -308,7 +308,7 @@ contains
     Rex0 = 1.0_dp*x(1)/nu
 
     if ( inflow_boundary_flag==1 .or. inflow_boundary_flag==3 .or. &
-         inflow_boundary_flag==4 ) then
+         inflow_boundary_flag==4 .or. inflow_boundary_flag==6 ) then
 
        ! Generate own Blasius
        write(*,*) 'Generating own Blasius for inlet'

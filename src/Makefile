@@ -28,6 +28,7 @@ SRC = precision_mod.f90 \
       field_mod.f90     \
       reductions.cuf    \
       ic_inflow_mod.f90 \
+      hit_inflow_mod.cuf \
       rhs_kernels.cuf   \
       bc_kernels.cuf    \
       poisson_mod.cuf   \
@@ -52,6 +53,28 @@ io_mod.o: io_mod.f90
 
 %.o: %.cuf
 	$(FC) $(FFLAGS) -c $< -o $@
+
+# Module dependencies (each .o is the proxy for its .mod). Without these,
+# editing a module rebuilt only its own object and left downstream objects
+# referencing a stale module layout — which manifested as corrupted module
+# variables at runtime (LES_model guard tripping on LES=0 input).
+param_mod.o:      precision_mod.o
+grid_mod.o:       precision_mod.o param_mod.o
+field_mod.o:      precision_mod.o param_mod.o grid_mod.o
+reductions.o:     precision_mod.o
+ic_inflow_mod.o:  precision_mod.o param_mod.o grid_mod.o field_mod.o
+hit_inflow_mod.o: precision_mod.o param_mod.o grid_mod.o ic_inflow_mod.o
+rhs_kernels.o:    precision_mod.o param_mod.o grid_mod.o field_mod.o
+bc_kernels.o:     precision_mod.o param_mod.o grid_mod.o field_mod.o \
+                  ic_inflow_mod.o hit_inflow_mod.o reductions.o
+poisson_mod.o:    precision_mod.o grid_mod.o field_mod.o reductions.o
+timestep_mod.o:   precision_mod.o param_mod.o grid_mod.o field_mod.o \
+                  reductions.o rhs_kernels.o bc_kernels.o poisson_mod.o
+io_mod.o:         precision_mod.o param_mod.o grid_mod.o field_mod.o \
+                  timestep_mod.o poisson_mod.o
+main.o:           param_mod.o grid_mod.o field_mod.o ic_inflow_mod.o \
+                  hit_inflow_mod.o poisson_mod.o timestep_mod.o \
+                  bc_kernels.o reductions.o io_mod.o
 
 clean:
 	rm -f $(OBJ) *.mod $(EXE)
