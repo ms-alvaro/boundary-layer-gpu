@@ -1,161 +1,131 @@
 # Boundary layer GPU solver
 
-Incompressible boundary layer DNS solver accelerated with NVIDIA GPUs.
-2nd-order finite differences on a staggered mesh, explicit RK2/RK3 time
-integration, fractional-step pressure projection. The pressure Poisson
-equation is solved via cosine transform in x (Neumann BC), Fourier
-transform in z (periodic), and tridiagonal Thomas solve in y — all on
-the GPU using cuFFT and OpenACC.
+Incompressible boundary-layer DNS solver written natively in **CUDA
+Fortran** for NVIDIA GPUs. 2nd-order finite differences on a staggered
+mesh, explicit RK2/RK3 time integration, fractional-step pressure
+projection. The pressure Poisson equation is solved via cosine transform
+in x (Neumann BC), Fourier transform in z (periodic), and tridiagonal
+Thomas solve in y — all on the GPU using cuFFT. The full timestep is
+GPU-resident: the host is touched only for gated statistics, monitoring,
+and snapshot I/O.
 
-Written by Adrian Lozano-Duran (CPU/MPI version) and Alvaro Martinez
-Sanchez (GPU port).
+Original CPU/MPI solver by Adrian Lozano-Duran (Computational Turbulence
+Group, MIT); OpenACC port and CUDA Fortran rewrite by Alvaro Martinez
+Sanchez.
 
-## Performance
+## Repository layout
 
-**22x faster than 16 CPU cores** on a single NVIDIA A100.
+```
+src/          CUDA Fortran solver (the active code) -> boundary_layer_cuda
+legacy/       OpenACC + MPI reference implementation -> boundary_layer_gpu
+validation/   automated harness: physics pass/fail, field-level diffs, timing
+docs/         design documents (docs/CUDA_PORT_DESIGN.md)
+laminar_test/     Blasius validation case
+transition_test/  TS-mode transition case
+tests/            turbulent Lund-inflow case (needs external restart file)
+```
 
-| Metric | Value |
-|---|---|
-| Time per cell per step | 2.09 ns |
-| Speedup vs 16 CPU cores | 22x |
-| Speedup vs 1 CPU core | 359x |
-| Test grid | 814 x 257 x 193 (40.4M cells) |
-| GPU | A100 80 GB SXM |
+## Performance (A100-PCIE-40GB, nvhpc 24.3)
+
+| build | laminar 302x64x8 | bench 814x125x66 |
+|---|---|---|
+| legacy OpenACC     | 2.35 ms/step | 2.31 ns/cell/step |
+| **CUDA (src/)**    | **1.13 ms/step (2.1x)** | 2.32 ns/cell/step |
+
+The CUDA build reproduces the OpenACC reference to max relative field
+difference 4.5e-12 after 2000 laminar steps and is bitwise run-to-run
+deterministic (no atomics; fixed-order reductions). Large-grid kernels
+are bandwidth-bound and currently at parity — kernel fusion and a
+real-input DCT are the next optimization phase.
+
+Legacy reference numbers: 22x vs 16 CPU cores, 2.09 ns/cell/step at
+814x257x193 on an A100-80GB-SXM.
 
 ## Prerequisites
 
-- **NVIDIA HPC SDK** 24.3+ (`nvfortran`, `mpifort`)
-- **NVIDIA GPU** with compute capability 8.0+ (A100, H100, etc.)
-- **FFTW 3.3+** compiled with the NVHPC Fortran compiler (for the
-  MPI-parallel FFTW fallback in the pressure solver)
-- **CUDA toolkit** (included with HPC SDK)
-- **LAPACK** (included with HPC SDK)
+- NVIDIA HPC SDK 24.3+ (`nvfortran`) and a GPU with compute capability
+  8.0+ (the Makefile targets `cc80`; adjust `GPU` for H100/H200).
+- That's all for the CUDA solver (cuFFT ships with the SDK). The legacy
+  build additionally needs MPI + FFTW built with nvfortran + LAPACK.
 
-## Compilation
-
-1. Set environment variables:
+## Build and run
 
 ```bash
-export NVHPC_ROOT=/opt/nvidia/hpc_sdk/Linux_x86_64/24.3  # adjust to your installation
-export FFTW_DIR=/path/to/fftw-3.3.10-nvhpc                # FFTW built with nvfortran
+cd src && make          # -> ./boundary_layer_cuda at the repo root
+./boundary_layer_cuda -i laminar_test/laminar.turbb   # no mpirun needed
 ```
 
-2. Compile:
+`make DEBUG=1` builds -O0 with bounds checks and per-kernel launch-error
+checking.
+
+Legacy reference build (used as the comparison baseline by the harness):
 
 ```bash
-make clean && make
+export NVHPC_ROOT=/opt/nvidia/hpc_sdk/Linux_x86_64/24.3
+export PATH=$NVHPC_ROOT/compilers/bin:$NVHPC_ROOT/comm_libs/mpi/bin:$PATH
+export FFTW_DIR=$HOME/opt/fftw-3.3.10-nvhpc
+cd legacy && make       # -> legacy/boundary_layer_gpu
 ```
 
-This produces the `boundary_layer_gpu` executable.
+## Validation
 
-For debugging:
+Every solver change is gated on the harness (see `validation/README.md`):
 
 ```bash
-make clean && make debug
+python3 validation/validate.py laminar --exe ./boundary_layer_cuda --label my-change
+python3 validation/validate.py compare --a openacc-ref --b my-change
+python3 validation/validate.py bench   --exe ./boundary_layer_cuda --label my-change
 ```
 
-> **Note:** `statistics.f90` is compiled at `-O0` due to an internal
-> compiler error in nvfortran 24.3. This has no measurable performance
-> impact since statistics are computed infrequently.
-
-### Building FFTW with NVHPC
-
-If your system does not have FFTW compiled with nvfortran:
-
-```bash
-export FC=$NVHPC_ROOT/compilers/bin/nvfortran
-export CC=$NVHPC_ROOT/compilers/bin/nvc
-./configure --prefix=$HOME/opt/fftw-3.3.10-nvhpc --enable-mpi FC=$FC CC=$CC
-make -j && make install
-```
-
-### CPU-only build
-
-A CPU Makefile (`Makefile.cpu`) is included for reference. It uses
-`mpifort` (gfortran) with FFTW and LAPACK:
-
-```bash
-make -f Makefile.cpu FFTW_DIR=/path/to/fftw LAPACK_DIR=/path/to/lapack
-```
-
-## Running
-
-```bash
-mpirun -np 1 ./boundary_layer_gpu -i <input_file>.turbb
-```
-
-Currently single-GPU only (MPI decomposition is in z, but the GPU solver
-runs on rank 0).
+The classic plot-based check is still available:
+`cd laminar_test && python3 postprocess.py` after a run.
 
 ## Test cases
 
-### Laminar Blasius (`laminar_test/`)
-
-Laminar flat-plate boundary layer validation. Compares skin friction and
-velocity profiles against the Blasius similarity solution.
-
-```bash
-cd laminar_test
-python3 generate_blasius.py    # generate blasius_solution.dat
-mpirun -np 1 ../boundary_layer_gpu -i laminar.turbb
-python3 postprocess.py         # validation plots
-```
-
-### TS-mode transition (`transition_test/`)
-
-Boundary layer transition triggered by Tollmien-Schlichting modes at the
-inflow (inflow_flag=1).
-
-```bash
-cd transition_test
-python3 generate_temporal_modes_local.py  # generate TS mode file
-mpirun -np 1 ../boundary_layer_gpu -i transition.turbb
-python3 plot_snapshot.py data/BL_transition.NNNNN
-```
+- **`laminar_test/`** — laminar flat-plate Blasius validation (Cf and
+  velocity profiles vs the similarity solution). Runs in seconds.
+- **`transition_test/`** — transition triggered by Tollmien-Schlichting
+  modes at the inflow; `generate_temporal_modes_local.py` builds the
+  mode file, `plot_ic_inflow.py` previews IC + inflow before launching.
 
 ## Input parameters
 
-See `input_parameters.turbb` for a documented template. Key parameters:
+See `legacy/input_parameters.turbb` for a documented template. Key ones:
 
 | Parameter | Description |
 |---|---|
 | `nxyz` | Grid points (nx, ny, nz) |
 | `boxsize` | Domain size (Lx, Ly, Lz, alpha_stretch) |
-| `CFL` | CFL number (positive) or fixed dt (negative) |
+| `CFL` | CFL number (positive) or fixed dt (negative value = -dt) |
 | `nu` | Kinematic viscosity |
-| `RKscheme` | Time integration: 1=Euler, 2=RK2, 3=RK3 |
-| `LES` | SGS model: 0=DNS, 1=Smagorinsky, 2=DSM |
-| `WM` | Wall model: 0=none, 1-9=various |
-| `inflow_flag` | Inflow BC: 1=Blasius, 3=Lund, 4=Blasius+noise, 6=Blasius+HIT |
-| `nsteps` | Total time steps |
-| `nsave` | Save snapshot every N steps |
+| `RKscheme` | Time integration: 2=RK2, 3=RK3 (Euler is legacy-only) |
+| `inflow_flag` | Inflow BC (CUDA solver: 1 = Blasius + temporal modes) |
+| `nsteps` / `nsave` / `nstats` / `nmonitor` | Run control / output cadence |
 
-## Code structure
+The CUDA solver covers the DNS path: RK2/RK3, `inflow_flag=1`,
+Dirichlet top, no-slip wall, single GPU. LES, wall models, Lund
+recycling inflow, and other top BCs currently run only in `legacy/`
+(they are the next porting phases) — the solver stops with a clear
+message if one is requested.
+
+## Code structure (src/)
 
 | File | Description |
 |---|---|
-| `main.f90` | Main program, OpenACC data region |
-| `global.f90` | Global variable declarations |
-| `initialization.f90` | Grid setup, Thomas LU precomputation, cuFFT plans |
-| `equations.f90` | RHS computation (inlined convective + viscous terms) |
-| `time_integration.f90` | RK2/RK3 stepping with OpenACC loops |
-| `projection.f90` | GPU pressure solver (cuFFT + Thomas) |
-| `cufft_solver.f90` | cuFFT plan creation (`cufftPlanMany`) |
-| `pressure.f90` | Pressure Poisson equation setup |
-| `boundary_conditions.f90` | Inflow/outflow/wall BCs (GPU-resident) |
-| `rescaled_inlet_bc.f90` | Lund's rescaling for turbulent inflow |
-| `statistics.f90` | Time-averaged flow statistics |
-| `monitor.f90` | Runtime diagnostics (Cf, max U, divergence) |
-| `input_output.f90` | Snapshot read/write |
-| `params.f90` | Input parameter parsing |
-| `fftz.f90` | FFT wrappers |
-| `interpolation.f90` | Grid interpolation utilities |
-| `subgrid.f90` | LES subgrid-scale models |
-| `wallmodel.f90` | Wall stress models |
-| `miscel.f90` | Miscellaneous utilities |
-| `Newton_solver.f90` | Newton solver (for wall models) |
-| `finalization.f90` | Cleanup |
-| `mpi.f90` | MPI initialization |
+| `main.f90` | Driver: setup sequence + time loop |
+| `param_mod.f90` | Input-file parsing, run parameters |
+| `grid_mod.f90` | Grid generation, metrics, device copies |
+| `field_mod.f90` | Device state arrays + host mirrors |
+| `ic_inflow_mod.f90` | Blasius IC, inlet/top profiles, inflow-mode tables |
+| `rhs_kernels.cuf` | Momentum RHS kernels (convective + viscous) |
+| `bc_kernels.cuf` | Boundary-condition kernels + mass conservation |
+| `poisson_mod.cuf` | cuFFT plans, DCT/FFT/Thomas Poisson solve, projection |
+| `timestep_mod.cuf` | RK2/RK3 drivers, advance kernels, CFL dt |
+| `reductions.cuf` | Deterministic (fixed-order, atomic-free) reductions |
+| `io_mod.f90` | Snapshots, statistics, monitor, restart |
+| `precision_mod.f90` | Working precision, small helpers |
+
+Design rationale and porting conventions: `docs/CUDA_PORT_DESIGN.md`.
 
 ## License
 
