@@ -27,16 +27,18 @@ tests/            turbulent Lund-inflow case (needs external restart file)
 
 ## Performance (A100-PCIE-40GB, nvhpc 24.3)
 
-| build | laminar 302x64x8 | bench 814x125x66 |
+| build | laminar 302x64x8 | transition grid 814x125x66 (production cadence) |
 |---|---|---|
-| legacy OpenACC     | 2.35 ms/step | 2.31 ns/cell/step |
-| **CUDA (src/)**    | **1.13 ms/step (2.1x)** | 2.32 ns/cell/step |
+| legacy OpenACC     | 2.35 ms/step | 13.2 ms/step |
+| **CUDA (src/)**    | **0.83 ms/step (2.8x)** | **10.0 ms/step (1.32x)** |
 
 The CUDA build reproduces the OpenACC reference to max relative field
-difference 4.5e-12 after 2000 laminar steps and is bitwise run-to-run
-deterministic (no atomics; fixed-order reductions). Large-grid kernels
-are bandwidth-bound and currently at parity — kernel fusion and a
-real-input DCT are the next optimization phase.
+difference ~4e-12 after 2000 laminar steps (and 2e-14 over 5000
+transition steps with active TS-mode inflow) and is bitwise run-to-run
+deterministic (no atomics; fixed-order reductions). Optimizations so
+far: fused RHS/pack kernels, save+advance fusion, fully device-resident
+mass-conservation reduction (no per-step synchronization), half-length
+real-DCT Poisson pipeline.
 
 Legacy reference numbers: 22x vs 16 CPU cores, 2.09 ns/cell/step at
 814x257x193 on an A100-80GB-SXM.
