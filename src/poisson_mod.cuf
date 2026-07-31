@@ -107,13 +107,14 @@ module poisson_mod
   ! the reference check (projection.f90:400-408); reduced by device_max_abs3.
   real(dp), device, allocatable :: div_d(:,:,:)
 
-  ! nx2 = 2*nxp, length of the symmetric extension
-  integer :: nx2
 
   ! cuFFT plan handles (cufft_solver.f90)
-  integer(c_int) :: cufft_plan_2d = 0   ! 2D C2C forward (2*nxp x nzp, nm batches)
-  integer(c_int) :: cufft_plan_zi = 0   ! 1D C2C inverse z (on rhs_hat_d)
-  integer(c_int) :: cufft_plan_xi = 0   ! 1D C2C inverse x (on plane_d)
+  ! Two Z2Z plans, each executed in BOTH directions (a cuFFT plan encodes
+  ! geometry only; the direction is an argument of cufftExecZ2Z):
+  integer(c_int) :: cufft_plan_x = 0    ! 1D C2C length nxp, contiguous,
+                                        ! batch nzp*nm (on plane_d)
+  integer(c_int) :: cufft_plan_z = 0    ! 1D C2C length nzp, stride nxp*nm,
+                                        ! batch nxp*nm (on rhs_hat_d)
   logical        :: plans_created = .false.
 
   ! RK tableau entry used by the reference P save (initialization.f90:511:
@@ -195,8 +196,11 @@ contains
     mz  = nzp - 1
     ! number of y-center planes (batch count / Thomas system length)
     nm  = nyg - 2
-    ! extension length for the half-size DCT trick
-    nx2 = 2*nxp
+
+    ! The half-length (Makhoul) DCT pack assumes an even transform length
+    ! (true for every grid the reference accepts: nxp = nx - 2, nx even).
+    if ( mod(nxp, 2) /= 0 ) &
+       stop ' ERROR: nxp must be even for the half-length DCT pack'
 
     if ( nxp < 1 .or. nzp < 1 .or. nm < 1 ) &
        stop ' ERROR: poisson_init called with invalid grid sizes'
@@ -206,8 +210,9 @@ contains
     !------------- cuFFT plans (cufft_solver.f90:cufft_init_plans) ------------
     call cufft_init_plans(nxp, nzp, nm)
 
-    !------------- device work arrays (initialization.f90:314-315) ------------
-    allocate ( plane_d  (2*nxp, nzp, nyg-2) )
+    !------------- device work arrays (initialization.f90:314-315; the
+    ! half-length pipeline needs only an nxp-long complex line per batch) ----
+    allocate ( plane_d  (nxp, nzp, nyg-2) )
     allocate ( rhs_hat_d(mx+1,  nyg-2, mz+1) )
     plane_d   = (0.0_dp, 0.0_dp)
     rhs_hat_d = (0.0_dp, 0.0_dp)
@@ -218,7 +223,7 @@ contains
     do i = 0, mx
        dct_twiddle(i) = exp( cmplx( 0.0_dp, -pi*real(i,dp)/(2.0_dp*real(nxp,dp)), dp ) )
     end do
-    write(*,*) 'cuFFT half-size DCT:', 2*nxp, 'x', nzp, ',', nyg-2, 'batches'
+    write(*,*) 'cuFFT half-length real-DCT:', nxp, 'x', nzp, ',', nyg-2, 'batches'
 
     !------------- modified wavenumbers (initialization.f90:329-344) ----------
     allocate ( kxx(0:mx), kzz(0:mz) )
@@ -345,53 +350,35 @@ contains
   end subroutine poisson_init
 
   !----------------------------------------------------------------------------
-  ! cufft_init_plans — create the three Z2Z plans (cufft_solver.f90:26-62),
-  ! identical plan parameters:
-  !   plan_2d: 2D C2C, logical size (nzp, 2*nxp) [C order], contiguous
-  !            batches of plane_d(2*nxp, nzp, nm)         -> forward
-  !   plan_zi: 1D C2C length nzp, stride nxp*nm, dist 1,
-  !            batch nxp*nm, on rhs_hat_d(nxp, nm, nzp)   -> inverse z
-  !   plan_xi: 1D C2C length 2*nxp, stride 1, dist 2*nxp,
-  !            batch nzp*nm, on plane_d                   -> inverse x
+  ! cufft_init_plans — create the two Z2Z plans of the half-length DCT
+  ! pipeline (each is executed FORWARD and INVERSE):
+  !   plan_x: 1D C2C length nxp, stride 1, dist nxp,
+  !           batch nzp*nm, on plane_d(nxp, nzp, nm)
+  !   plan_z: 1D C2C length nzp, stride nxp*nm, dist 1,
+  !           batch nxp*nm, on rhs_hat_d(nxp, nm, nzp)
   !----------------------------------------------------------------------------
   subroutine cufft_init_plans(nxp_in, nzp_in, nm_in)
 
     integer, intent(in) :: nxp_in, nzp_in, nm_in
+    integer(c_int) :: istat
+    integer(c_int) :: n1(1), ne1(1)
 
-    integer(c_int) :: istat, n2(2), ne(2), n1(1), ne1(1)
-    integer(c_int) :: nx2_l
-
-    nx2_l = 2 * nxp_in
-
-    ! Plan 1: 2D C2C forward — plane_d(2*nxp, nzp, nm)
-    n2(1) = nzp_in;  n2(2) = nx2_l
-    ne(1) = nzp_in;  ne(2) = nx2_l
-    istat = cufftPlanMany(cufft_plan_2d, 2, n2, &
-         ne, 1, nx2_l*nzp_in, ne, 1, nx2_l*nzp_in, CUFFT_Z2Z, nm_in)
+    ! Plan x: 1D C2C length nxp, contiguous lines of plane_d(nxp, nzp, nm)
+    n1(1) = nxp_in; ne1(1) = nxp_in
+    istat = cufftPlanMany(cufft_plan_x, 1, n1, &
+         ne1, 1, nxp_in, ne1, 1, nxp_in, CUFFT_Z2Z, nzp_in*nm_in)
     if (istat /= CUFFT_SUCCESS) then
-       write(*,*) 'cufftPlanMany 2D failed:', istat; stop
+       write(*,*) 'cufftPlanMany x failed:', istat; stop
     end if
 
-    ! Plan 2: 1D C2C inverse z — rhs_hat_d(nxp, nm, nzp)
-    ! stride = nxp*nm (between consecutive z-values)
-    ! dist = 1, batch = nxp*nm
+    ! Plan z: 1D C2C length nzp — rhs_hat_d(nxp, nm, nzp)
+    ! stride = nxp*nm (between consecutive z-values), dist = 1
     n1(1) = nzp_in; ne1(1) = nzp_in
-    istat = cufftPlanMany(cufft_plan_zi, 1, n1, &
+    istat = cufftPlanMany(cufft_plan_z, 1, n1, &
          ne1, nxp_in*nm_in, 1, ne1, nxp_in*nm_in, 1, CUFFT_Z2Z, nxp_in*nm_in)
     if (istat /= CUFFT_SUCCESS) then
-       write(*,*) 'cufftPlanMany zi failed:', istat; stop
+       write(*,*) 'cufftPlanMany z failed:', istat; stop
     end if
-
-    ! Plan 3: 1D C2C inverse x — plane_d(2*nxp, nzp, nm)
-    ! stride = 1, dist = 2*nxp, batch = nzp*nm
-    n1(1) = nx2_l; ne1(1) = nx2_l
-    istat = cufftPlanMany(cufft_plan_xi, 1, n1, &
-         ne1, 1, nx2_l, ne1, 1, nx2_l, CUFFT_Z2Z, nzp_in*nm_in)
-    if (istat /= CUFFT_SUCCESS) then
-       write(*,*) 'cufftPlanMany xi failed:', istat; stop
-    end if
-
-    plans_created = .true.
 
   end subroutine cufft_init_plans
 
@@ -404,9 +391,8 @@ contains
     integer(c_int) :: istat
 
     if (plans_created) then
-       istat = cufftDestroy(cufft_plan_2d)
-       istat = cufftDestroy(cufft_plan_zi)
-       istat = cufftDestroy(cufft_plan_xi)
+       istat = cufftDestroy(cufft_plan_x)
+       istat = cufftDestroy(cufft_plan_z)
        plans_created = .false.
     end if
 
@@ -490,27 +476,32 @@ contains
     integer(c_int) :: istat
     real(dp)       :: fft_norm
 
-    fft_norm = 1.0_dp / real(2*nxp*nzp, dp)
+    fft_norm = 1.0_dp / real(nxp*nzp, dp)
     tb = dim3(64, 4, 1)
 
-    ! ======== FORWARD: div + symmetric pack -> 2D FFT -> twiddle extract ====
+    ! ==== FORWARD: div + even/odd pack -> x-FFT -> DCT extract -> z-FFT ====
 
-    ! div(u*) at the cell center (projection.f90:34-49, in-register) packed
-    ! directly as the DCT-II even extension: g[0..N-1]=f, g[2N-1..N]=f
+    ! div(u*) at cell centers (projection.f90:34-49, in-register), packed in
+    ! the Makhoul even/odd order: v[n] = f[2n], v[N-1-n] = f[2n+1] (N = nxp)
     gr = dim3( ceil_div(nxp, 64), ceil_div(nzp, 4), nm )
     call k_div_pack<<<gr, tb>>>(plane_d, U_d, V_d, W_d, x_d, y_d, z_d, &
-                                nx2, nxp, nzp, nm, nx, ny, nz, nxg, nyg, nzg)
+                                nxp, nzp, nm, nx, ny, nz, nxg, nyg, nzg)
     call debug_check('k_div_pack')
 
-    ! 2D batched forward FFT (2*nxp x nzp, nm batches)
-    istat = cufftExecZ2Z(cufft_plan_2d, plane_d, plane_d, CUFFT_FORWARD)
-    call debug_check_cufft('cufftExecZ2Z(plan_2d fwd)', istat)
+    ! x-FFT (1D length nxp, batched over nzp*nm)
+    istat = cufftExecZ2Z(cufft_plan_x, plane_d, plane_d, CUFFT_FORWARD)
+    call debug_check_cufft('cufftExecZ2Z(plan_x fwd)', istat)
 
-    ! Extract modes with DCT-II twiddle
+    ! DCT-II coefficients: D_k = 2*Re( tw_k * V_k ), real, into rhs_hat
+    ! (z still physical; the (k <-> b) transposition happens here)
     gr = dim3( ceil_div(mx+1, 64), ceil_div(mz+1, 4), nm )
-    call k_twiddle_extract<<<gr, tb>>>(rhs_hat_d, plane_d, dct_twiddle_d, &
-                                       mx+1, mz+1, nm, nx2, nzp)
-    call debug_check('k_twiddle_extract')
+    call k_extract_dct<<<gr, tb>>>(rhs_hat_d, plane_d, dct_twiddle_d, &
+                                   mx+1, mz+1, nm, nxp, nzp)
+    call debug_check('k_extract_dct')
+
+    ! z-FFT (strided, batched over nxp*nm) -> full spectral space
+    istat = cufftExecZ2Z(cufft_plan_z, rhs_hat_d, rhs_hat_d, CUFFT_FORWARD)
+    call debug_check_cufft('cufftExecZ2Z(plan_z fwd)', istat)
 
     ! ======== THOMAS TRIDIAGONAL SOLVE (batched over (k,i) modes) ========
     gr = dim3( ceil_div(mx+1, 64), ceil_div(mz+1, 4), 1 )
@@ -518,32 +509,30 @@ contains
                               thomas_du_d, mx+1, mz+1, nm)
     call debug_check('k_thomas')
 
-    ! ======== INVERSE: z-IFFT first (makes data real), then x-IDCT ========
+    ! ======== INVERSE: z-IFFT -> build V' -> x-IFFT -> unpack ========
 
-    ! Step 1: z-IFFT on rhs_hat_d (nzp-point, batched over nxp*nm)
-    ! After this, rhs_hat_d(i,b,k) is in z-physical space
-    istat = cufftExecZ2Z(cufft_plan_zi, rhs_hat_d, rhs_hat_d, CUFFT_INVERSE)
-    call debug_check_cufft('cufftExecZ2Z(plan_zi inv)', istat)
+    ! z-IFFT: rhs_hat_d(i,b,k) back to z-physical space; the Poisson
+    ! operator is real with kzz(kz) = kzz(nzp-kz), so the result is real
+    ! per line (imaginary part is roundoff) — the DCT coefficients D_k of
+    ! the solution.
+    istat = cufftExecZ2Z(cufft_plan_z, rhs_hat_d, rhs_hat_d, CUFFT_INVERSE)
+    call debug_check_cufft('cufftExecZ2Z(plan_z inv)', istat)
 
-    ! Step 2: un-twiddle + Hermitian extend into plane_d for x-IFFT
-    ! (data is now real in z-physical, so the x-spectrum is Hermitian).
-    ! Fused single pass over the full plane: each element written exactly
-    ! once (mode, conjugate mirror, or the zero Nyquist column nxp+1) —
-    ! replaces the reference's zero-fill + two overwrite sweeps bitwise-
-    ! identically while removing ~2 full passes over the work array.
-    gr = dim3( ceil_div(nx2, 64), ceil_div(nzp, 4), nm )
-    call k_untwiddle_herm<<<gr, tb>>>(plane_d, rhs_hat_d, dct_twiddle_d, &
-                                      nxp, nx2, nzp, nm, mx+1, mz+1)
-    call debug_check('k_untwiddle_herm')
+    ! Build the half-length inverse-DCT spectrum
+    !   V'_k = 0.5 * conjg(tw_k) * ( D_k - i*D_{N-k} ),  D_N = 0
+    gr = dim3( ceil_div(nxp, 64), ceil_div(nzp, 4), nm )
+    call k_build_vprime<<<gr, tb>>>(plane_d, rhs_hat_d, dct_twiddle_d, &
+                                    nxp, nzp, nm, mx+1, mz+1)
+    call debug_check('k_build_vprime')
 
-    ! Step 3: x-IFFT (1D, batched over nzp*nm)
-    istat = cufftExecZ2Z(cufft_plan_xi, plane_d, plane_d, CUFFT_INVERSE)
-    call debug_check_cufft('cufftExecZ2Z(plan_xi inv)', istat)
+    ! x-IFFT (1D length nxp, batched over nzp*nm)
+    istat = cufftExecZ2Z(cufft_plan_x, plane_d, plane_d, CUFFT_INVERSE)
+    call debug_check_cufft('cufftExecZ2Z(plan_x inv)', istat)
 
-    ! Extract physical-space result (normalized)
+    ! Unpack (inverse even/odd reorder) + normalize into rhs_p
     gr = dim3( ceil_div(nxp, 64), ceil_div(nzp, 4), nm )
     call k_extract_out<<<gr, tb>>>(rhs_p_d, plane_d, fft_norm, &
-                                   nxp, nx2, nzp, nm, nxg, nyg, nzg)
+                                   nxp, nzp, nm, nxg, nyg, nzg)
     call debug_check('k_extract_out')
 
   end subroutine solve_poisson_gpu
@@ -720,29 +709,27 @@ contains
   !   rhs_p(i,j,k) = du/dx + dv/dy + dw/dz
   ! over i = 2..nxg-1, j = 2..nyg-1, k = 2..nzg-1 (NOT divided by dt).
   !----------------------------------------------------------------------------
-  ! k_div_pack — FUSED divergence + DCT-II symmetric-extension pack
-  ! (projection.f90:34-49 and 111-119). For pack thread (ii, k, b) the
-  ! divergence of u* at cell center (i, j, kk) = (ii+1, b+1, k+1) is computed
-  ! in-register with the reference expression and placed directly as the
-  ! complex even extension g[0..N-1] = f, g[2N-1..N] = f (N = nxp), so a
-  ! single complex FFT of length 2N yields the DCT-II after twiddling.
-  ! Note the (j <-> k) transposition: batch b is the y-plane.
-  !
-  ! Exactness: identical expression, identical operands — the reference
-  ! merely stored the same double in rhs_p and re-loaded it here. rhs_p is
-  ! NOT written (nothing ever read the divergence from it: the solve
-  ! overwrites it and all later consumers read post-solve values only).
-  ! The divergence values the reference computed at i = nxg-1 or k = nzg-1
-  ! were never read by any kernel and are simply not computed.
+  ! k_div_pack — FUSED divergence + Makhoul even/odd DCT-II pack
+  ! (projection.f90:34-49 for the divergence; the pack implements the
+  ! half-length real-DCT input ordering: with N = nxp and 0-based n,
+  !   v[n]     = f[2n]     for n = 0..N/2-1
+  !   v[N-1-n] = f[2n+1]   for n = 0..N/2-1
+  ! in 1-based kernel indices: pack slot ii reads the physical column
+  !   ix = 2*ii-1           for ii <= N/2
+  !   ix = 2*(N-ii)+2       for ii >  N/2.
+  ! The divergence of u* at center (i, j, kk) = (ix+1, b+1, k+1) is
+  ! computed in-register with the reference expression (identical
+  ! operands/order; the reference merely stored it in rhs_p and re-read
+  ! it). rhs_p is not written — nothing ever read the divergence from it.
   !----------------------------------------------------------------------------
   attributes(global) subroutine k_div_pack(plane, U, V, W, x, y, z, &
-                                           nx2, nxp, nzp, nm, nx, ny, nz, &
+                                           nxp, nzp, nm, nx, ny, nz, &
                                            nxg, nyg, nzg)
-    integer, value :: nx2, nxp, nzp, nm, nx, ny, nz, nxg, nyg, nzg
-    complex(dp), intent(inout) :: plane(nx2, nzp, nm)
+    integer, value :: nxp, nzp, nm, nx, ny, nz, nxg, nyg, nzg
+    complex(dp), intent(inout) :: plane(nxp, nzp, nm)
     real(dp), intent(in) :: U(nx, nyg, nzg), V(nxg, ny, nzg), W(nxg, nyg, nz)
     real(dp), intent(in) :: x(nx), y(ny), z(nz)
-    integer  :: ii, k, b, i, j, kk
+    integer  :: ii, k, b, ix, i, j, kk
     real(dp) :: div
 
     ii = 1 + (blockIdx%x-1)*blockDim%x + threadIdx%x - 1
@@ -750,7 +737,13 @@ contains
     b  = 1 + blockIdx%z - 1
     if (ii > nxp .or. k > nzp .or. b > nm) return
 
-    i  = ii + 1
+    if (ii <= nxp/2) then
+       ix = 2*ii - 1
+    else
+       ix = 2*(nxp - ii) + 2
+    end if
+
+    i  = ix + 1
     j  = b  + 1
     kk = k  + 1
 
@@ -758,23 +751,22 @@ contains
           ( V(i,j,kk) - V(i,j-1,kk) )/( y(j)-y(j-1) ) + &
           ( W(i,j,kk) - W(i,j,kk-1) )/( z(kk)-z(kk-1) )
 
-    plane(ii,       k, b) = cmplx( div, 0.0_dp, dp )
-    plane(nx2+1-ii, k, b) = cmplx( div, 0.0_dp, dp )
+    plane(ii, k, b) = cmplx( div, 0.0_dp, dp )
 
   end subroutine k_div_pack
 
   !----------------------------------------------------------------------------
-  ! k_twiddle_extract — extract DCT-II modes from the 2D FFT result
-  ! (projection.f90:127-134):
-  !   rhs_hat(i, b, k) = plane(i, k, b) * dct_twiddle(i-1)
-  ! over i = 1..mx+1 x-modes, k = 1..mz+1 z-modes, b = 1..nm y-planes
-  ! (transposed (i, b, k) storage so the z-IFFT can run strided later).
+  ! k_extract_dct — DCT-II coefficients from the half-length x-FFT:
+  !   D_k = 2 * Re( tw_k * V_k ),   tw_k = exp(-i*pi*k/(2*nxp))
+  ! (real for real input; stored as complex with zero imaginary part so the
+  ! subsequent strided z-FFT runs in place on rhs_hat). Transposed (i, b, k)
+  ! storage exactly as before: batch b is the y-plane, k is z-physical here.
   !----------------------------------------------------------------------------
-  attributes(global) subroutine k_twiddle_extract(rhs_hat, plane, tw, &
-                                                  mxp1, mzp1, nm, nx2, nzp)
-    integer, value :: mxp1, mzp1, nm, nx2, nzp
+  attributes(global) subroutine k_extract_dct(rhs_hat, plane, tw, &
+                                              mxp1, mzp1, nm, nxp, nzp)
+    integer, value :: mxp1, mzp1, nm, nxp, nzp
     complex(dp), intent(out) :: rhs_hat(mxp1, nm, mzp1)
-    complex(dp), intent(in)  :: plane(nx2, nzp, nm)
+    complex(dp), intent(in)  :: plane(nxp, nzp, nm)
     complex(dp), intent(in)  :: tw(0:mxp1-1)
     integer :: i, k, b
 
@@ -783,9 +775,10 @@ contains
     b = 1 + blockIdx%z - 1
     if (i > mxp1 .or. k > mzp1 .or. b > nm) return
 
-    rhs_hat(i, b, k) = plane(i, k, b) * tw(i-1)
+    rhs_hat(i, b, k) = cmplx( 2.0_dp*real(tw(i-1)*plane(i, k, b), dp), &
+                              0.0_dp, dp )
 
-  end subroutine k_twiddle_extract
+  end subroutine k_extract_dct
 
   !----------------------------------------------------------------------------
   ! k_thomas — batched Thomas tridiagonal solve in y (projection.f90:137-150):
@@ -821,64 +814,66 @@ contains
   end subroutine k_thomas
 
   !----------------------------------------------------------------------------
-  ! k_untwiddle_herm — FUSED inverse-x pack (projection.f90:162-187: the
-  ! zero-fill, the un-twiddle of the first nxp modes, and the Hermitian
-  ! extension) in a single pass writing every element of the plane exactly
-  ! once:
-  !   ii <= nxp   : plane(ii) = rhs_hat(ii, b, k) * conjg(tw(ii-1))
-  !   ii == nxp+1 : plane(ii) = 0                  (Nyquist column — the only
-  !                                                 slot the reference's
-  !                                                 zero-fill left standing)
-  !   ii >= nxp+2 : plane(ii) = conjg( rhs_hat(jj) * conjg(tw(jj-1)) ),
-  !                 jj = nx2+2-ii in 2..nxp        (Hermitian mirror)
-  ! Exactness: the mirror conjugates the identically-computed product —
-  ! the same value the reference conjugated from memory. Data is real in
-  ! z-physical space after the z-IFFT, so the x-spectrum is Hermitian.
+  ! k_build_vprime — half-length inverse-DCT spectrum from the (real)
+  ! DCT coefficients D_k of the solution (rhs_hat after the z-IFFT):
+  !   V'_k = 0.5 * conjg(tw_k) * ( D_k - i*D_{N-k} ),  k = 0..N-1, D_N = 0
+  ! so that the length-N complex inverse FFT of V' yields the even/odd
+  ! packed physical line (Makhoul inverse; validated against the
+  ! double-length reference pipeline at machine precision).
+  ! 1-based: D_{N-k} for slot ii is rhs_hat(nxp+2-ii); zero for ii = 1.
   !----------------------------------------------------------------------------
-  attributes(global) subroutine k_untwiddle_herm(plane, rhs_hat, tw, &
-                                                 nxp, nx2, nzp, nm, mxp1, mzp1)
-    integer, value :: nxp, nx2, nzp, nm, mxp1, mzp1
-    complex(dp), intent(inout) :: plane(nx2, nzp, nm)
-    complex(dp), intent(in)    :: rhs_hat(mxp1, nm, mzp1)
-    complex(dp), intent(in)    :: tw(0:mxp1-1)
-    integer :: ii, k, b, jj
-
-    ii = 1 + (blockIdx%x-1)*blockDim%x + threadIdx%x - 1
-    k  = 1 + (blockIdx%y-1)*blockDim%y + threadIdx%y - 1
-    b  = 1 + blockIdx%z - 1
-    if (ii > nx2 .or. k > nzp .or. b > nm) return
-
-    if (ii <= nxp) then
-       plane(ii, k, b) = rhs_hat(ii, b, k) * conjg(tw(ii-1))
-    else if (ii == nxp+1) then
-       plane(ii, k, b) = (0.0_dp, 0.0_dp)
-    else
-       jj = nx2 + 2 - ii
-       plane(ii, k, b) = conjg( rhs_hat(jj, b, k) * conjg(tw(jj-1)) )
-    end if
-
-  end subroutine k_untwiddle_herm
-
-  !----------------------------------------------------------------------------
-  ! k_extract_out — extract the physical-space solution with the FFT
-  ! normalization (projection.f90:195-202):
-  !   rhs_p(ii+1, b+1, k+1) = Re(plane(ii, k, b)) * 1/(2*nxp*nzp)
-  ! (inverse of the (j <-> k) transposition done by k_pack_dct).
-  !----------------------------------------------------------------------------
-  attributes(global) subroutine k_extract_out(rhs_p, plane, fft_norm, &
-                                              nxp, nx2, nzp, nm, nxg, nyg, nzg)
-    integer,  value :: nxp, nx2, nzp, nm, nxg, nyg, nzg
-    real(dp), value :: fft_norm
-    real(dp),    intent(inout) :: rhs_p(2:nxg-1, 2:nyg-1, 2:nzg)
-    complex(dp), intent(in)    :: plane(nx2, nzp, nm)
-    integer :: ii, k, b
+  attributes(global) subroutine k_build_vprime(plane, rhs_hat, tw, &
+                                               nxp, nzp, nm, mxp1, mzp1)
+    integer, value :: nxp, nzp, nm, mxp1, mzp1
+    complex(dp), intent(out) :: plane(nxp, nzp, nm)
+    complex(dp), intent(in)  :: rhs_hat(mxp1, nm, mzp1)
+    complex(dp), intent(in)  :: tw(0:mxp1-1)
+    integer  :: ii, k, b
+    real(dp) :: dk, dnk
 
     ii = 1 + (blockIdx%x-1)*blockDim%x + threadIdx%x - 1
     k  = 1 + (blockIdx%y-1)*blockDim%y + threadIdx%y - 1
     b  = 1 + blockIdx%z - 1
     if (ii > nxp .or. k > nzp .or. b > nm) return
 
-    rhs_p(ii+1, b+1, k+1) = real(plane(ii, k, b), dp) * fft_norm
+    dk = real(rhs_hat(ii, b, k), dp)
+    if (ii == 1) then
+       dnk = 0.0_dp
+    else
+       dnk = real(rhs_hat(nxp+2-ii, b, k), dp)
+    end if
+
+    plane(ii, k, b) = 0.5_dp * conjg(tw(ii-1)) * cmplx( dk, -dnk, dp )
+
+  end subroutine k_build_vprime
+
+  !----------------------------------------------------------------------------
+  ! k_extract_out — unpack the even/odd order and extract the physical-
+  ! space solution with the half-length normalization:
+  !   rhs_p(ix+1, b+1, k+1) = Re(plane(ii, k, b)) / (nxp*nzp)
+  ! with the same slot -> column mapping as k_div_pack (self-inverse
+  ! pairing), inverting the (j <-> k) transposition.
+  !----------------------------------------------------------------------------
+  attributes(global) subroutine k_extract_out(rhs_p, plane, fft_norm, &
+                                              nxp, nzp, nm, nxg, nyg, nzg)
+    integer,  value :: nxp, nzp, nm, nxg, nyg, nzg
+    real(dp), value :: fft_norm
+    real(dp),    intent(inout) :: rhs_p(2:nxg-1, 2:nyg-1, 2:nzg)
+    complex(dp), intent(in)    :: plane(nxp, nzp, nm)
+    integer :: ii, k, b, ix
+
+    ii = 1 + (blockIdx%x-1)*blockDim%x + threadIdx%x - 1
+    k  = 1 + (blockIdx%y-1)*blockDim%y + threadIdx%y - 1
+    b  = 1 + blockIdx%z - 1
+    if (ii > nxp .or. k > nzp .or. b > nm) return
+
+    if (ii <= nxp/2) then
+       ix = 2*ii - 1
+    else
+       ix = 2*(nxp - ii) + 2
+    end if
+
+    rhs_p(ix+1, b+1, k+1) = real(plane(ii, k, b), dp) * fft_norm
 
   end subroutine k_extract_out
 

@@ -41,6 +41,12 @@ real-input DCT are the next optimization phase.
 Legacy reference numbers: 22x vs 16 CPU cores, 2.09 ns/cell/step at
 814x257x193 on an A100-80GB-SXM.
 
+**Grid-size tip:** the Poisson solve FFTs have length `nx-2` (x) and
+`nz-2` (z). Choose grids so these factor into small primes (2, 3, 5, 7).
+Example: `nx = 812` (810 = 2*3^4*5) runs the same physics ~11% faster
+per step than `nx = 814` (812 = 4*7*29, which forces cuFFT through a
+slow large-prime path).
+
 ## Prerequisites
 
 - NVIDIA HPC SDK 24.3+ (`nvfortran`) and a GPU with compute capability

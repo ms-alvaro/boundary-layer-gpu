@@ -56,6 +56,17 @@ validation/
 | cuda-v1 (Phase 2 port) | bench 814x125x66 | 15.55 | 2.32 |
 | cuda-v4 (Phase 3: fusions + async reductions) | laminar 302x64x8 | 0.73 | 4.7 |
 | cuda-v4 (Phase 3: fusions + async reductions) | bench 814x125x66 | 13.8-14.1 | 2.05-2.10 |
+| cuda-v5 (half-length real-DCT Poisson) | laminar 302x64x8 | 0.83 | 5.4 |
+| cuda-v5 (half-length real-DCT Poisson) | bench 814x125x66 | 14.0 | 2.08 |
+| cuda-v5 (half-length real-DCT Poisson) | bench 812x125x66 (FFT-friendly) | 12.5 | 1.87 |
+
+cuda-v5 changes the DCT factorization (Makhoul half-length; validated
+against the double-length pipeline at machine precision in a numpy
+prototype, and vs openacc-ref at 3.6e-14 on the laminar case). It halves
+the Poisson work-array memory and is ~6-10% faster than v4 on
+FFT-friendly grids (nx-2 with small prime factors); on nx=814
+(812 = 4*7*29) cuFFT's large-prime path makes it a wash. See the
+grid-size tip in the top-level README.
 
 cuda-v1 vs openacc-ref: max relative field diff 4.5e-12 after 2000
 laminar steps; both builds bitwise run-to-run deterministic. All Phase 3
