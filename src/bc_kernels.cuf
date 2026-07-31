@@ -93,7 +93,7 @@ module bc_kernels
                            Ut_inlet_d, Vt_inlet_d, Wt_inlet_d, &
                            qu_inlet_d, qv_inlet_d, qw_inlet_d, &
                            zmode_inlet_d, tmode_inlet_d
-  use reductions,    only: device_wsum3
+  use reductions,    only: wsum3_partials, scratch_d
 
   implicit none
   private
@@ -115,6 +115,7 @@ module bc_kernels
   ! inline subtractions (host and device grids hold identical values).
   !--------------------------------------------------------------------
   real(dp), device, allocatable :: dy_d(:), dx_d(:)
+  real(dp), device, allocatable :: delta_d(:)   ! (1) device-resident Delta_U
   real(dp) :: length_y = 0.0_dp
   logical  :: bc_initialized = .false.
 
@@ -156,9 +157,10 @@ contains
        dxh(i) = x(i) - x(i-1)
     end do
 
-    allocate (dy_d(nyg), dx_d(nxg))
+    allocate (dy_d(nyg), dx_d(nxg), delta_d(1))
     dy_d = dyh
     dx_d = dxh
+    delta_d = 0.0_dp
     deallocate (dyh, dxh)
 
     ! length_y — verbatim host accumulation (boundary_conditions.f90:
@@ -176,6 +178,7 @@ contains
   subroutine bc_finalize()
     if (allocated(dy_d)) deallocate (dy_d)
     if (allocated(dx_d)) deallocate (dx_d)
+    if (allocated(delta_d)) deallocate (delta_d)
     bc_initialized = .false.
   end subroutine bc_finalize
 
@@ -400,9 +403,9 @@ contains
   !   F(n1-1,j,k) = F(n1-1,j,k) + Delta_U
   !   F(n1  ,j,k) = F(n1-1,j,k)
   !--------------------------------------------------------------------
-  attributes(global) subroutine bc_massflux_correct_kernel(F, n1, n2, n3, Delta_U)
+  attributes(global) subroutine bc_massflux_correct_kernel(F, n1, n2, n3, delta)
     integer,  value         :: n1, n2, n3
-    real(dp), value         :: Delta_U
+    real(dp), intent(in)    :: delta(1)   ! device-resident Delta_U
     real(dp), intent(inout) :: F(n1, n2, n3)
     integer  :: j, k
     real(dp) :: fnew
@@ -411,10 +414,52 @@ contains
     k = (blockIdx%y - 1)*blockDim%y + threadIdx%y
     if (j > n2 .or. k > n3) return
 
-    fnew = F(n1-1,j,k) + Delta_U
+    fnew = F(n1-1,j,k) + delta(1)
     F(n1-1,j,k) = fnew
     F(n1  ,j,k) = fnew
   end subroutine bc_massflux_correct_kernel
+
+  !--------------------------------------------------------------------
+  ! bc_massflux_delta_kernel — combine the four mass-flux partial sets
+  ! (written by wsum3_partials at offsets 0, nbA, nbA+nbB, nbA+nbB+nbC
+  ! of reductions' scratch_d) into the device-resident correction
+  ! increment:
+  !   Delta_U = ( (sA-sB) + (sC-sD) ) / length_y / (nzg-3)
+  ! Single thread; each set is summed strictly in index order, then the
+  ! subtractions/addition/divisions follow the exact former host
+  ! sequence — bitwise-identical to the device_wsum3 + host-math
+  ! version this replaces.
+  !--------------------------------------------------------------------
+  attributes(global) subroutine bc_massflux_delta_kernel(nbA, nbB, nbC, nbD, &
+                                                         length_y, denom, delta)
+    integer,  value       :: nbA, nbB, nbC, nbD
+    real(dp), value       :: length_y, denom
+    real(dp), intent(out) :: delta(1)
+    integer  :: b
+    real(dp) :: sA, sB, sC, sD, Qx, Qy, Q_total
+
+    sA = 0.0_dp
+    do b = 1, nbA
+       sA = sA + scratch_d(b)
+    end do
+    sB = 0.0_dp
+    do b = 1, nbB
+       sB = sB + scratch_d(nbA + b)
+    end do
+    sC = 0.0_dp
+    do b = 1, nbC
+       sC = sC + scratch_d(nbA + nbB + b)
+    end do
+    sD = 0.0_dp
+    do b = 1, nbD
+       sD = sD + scratch_d(nbA + nbB + nbC + b)
+    end do
+
+    Qx      = sA - sB
+    Qy      = sC - sD
+    Q_total = Qx + Qy
+    delta(1) = Q_total/length_y/denom
+  end subroutine bc_massflux_delta_kernel
 
   !====================================================================
   ! apply_bc — public host wrapper: full BC application to U_d/V_d/W_d.
@@ -463,7 +508,7 @@ contains
 
     type(dim3) :: tBlock, gridS
     real(dp)   :: Uc, coef, dxo_u, dxo_vw
-    real(dp)   :: Qx, Qy, Q_total, Delta_U
+    integer    :: nbA, nbB, nbC, nbD
 
     if (.not. bc_initialized) call bc_setup()
 
@@ -610,25 +655,31 @@ contains
     !    which the OpenACC reduction never guaranteed either — well
     !    within the 1e-8 gate, see reductions.cuf notes).
     !------------------------------------------------------------------
-    Qx = device_wsum3(U_d, nx, nyg, nzg,    1,     1, 2, nyg-1, 2, nzg-2, &
-                      dy_d, nyg, 2) &
-       - device_wsum3(U_d, nx, nyg, nzg, nx-1,  nx-1, 2, nyg-1, 2, nzg-2, &
-                      dy_d, nyg, 2)
-    Qy = device_wsum3(V_d, nxg, ny, nzg,    2, nxg-2, 1,     1, 2, nzg-2, &
-                      dx_d, nxg, 1) &
-       - device_wsum3(V_d, nxg, ny, nzg,    2, nxg-2, ny,   ny, 2, nzg-2, &
-                      dx_d, nxg, 1)
+    ! DEVICE-RESIDENT (Phase 3): the four plane weighted sums run as
+    ! async partial passes into disjoint scratch_d slices, and a
+    ! single-thread kernel combines them into Delta_U on the device with
+    ! the exact arithmetic sequence of the previous host code (per-set
+    ! index-order sums, then Qx = sA-sB, Qy = sC-sD, Q = Qx+Qy,
+    ! Delta = Q/length_y/(nzg-3)) — bitwise-identical, and the entire BC
+    ! call is now free of device synchronization (previously 4 blocking
+    ! scalar reductions per call, 16 per RK2 step).
+    nbA = wsum3_partials(U_d, nx, nyg, nzg,    1,     1, 2, nyg-1, 2, nzg-2, &
+                         dy_d, nyg, 2, 0)
+    nbB = wsum3_partials(U_d, nx, nyg, nzg, nx-1,  nx-1, 2, nyg-1, 2, nzg-2, &
+                         dy_d, nyg, 2, nbA)
+    nbC = wsum3_partials(V_d, nxg, ny, nzg,    2, nxg-2, 1,     1, 2, nzg-2, &
+                         dx_d, nxg, 1, nbA+nbB)
+    nbD = wsum3_partials(V_d, nxg, ny, nzg,    2, nxg-2, ny,   ny, 2, nzg-2, &
+                         dx_d, nxg, 1, nbA+nbB+nbC)
 
-    ! total mass flow (Q_local = Qx_local + Qy_local; Allreduce dropped)
-    Q_total = Qx + Qy
-
-    ! velocity correction (reference line 256; nzg_global-3 -> nzg-3)
-    Delta_U = Q_total/length_y/real(nzg-3, dp)
+    call bc_massflux_delta_kernel<<<1, 1>>>(nbA, nbB, nbC, nbD, &
+         length_y, real(nzg-3, dp), delta_d)
+    call debug_check('bc_massflux_delta_kernel')
 
     ! U(nx-1,:,:) += Delta_U; U(nx,:,:) = U(nx-1,:,:)
     gridS = dim3(ceil_div(nyg, BX), ceil_div(nzg, BY), 1)
     call bc_massflux_correct_kernel<<<gridS, tBlock>>>(U_d, nx, nyg, nzg, &
-         Delta_U)
+         delta_d)
     call debug_check('bc_massflux_correct_kernel(U)')
 
   end subroutine apply_bc

@@ -47,6 +47,8 @@ module reductions
   public :: device_sum3
   public :: device_wsum3
   public :: device_max_ratio3
+  public :: wsum3_partials      ! async partial pass into scratch_d(offset+1:)
+  public :: scratch_d           ! for cross-module final-combine kernels
   public :: reductions_finalize
 
   ! Fixed launch geometry — MUST be compile-time constants so that the
@@ -54,7 +56,9 @@ module reductions
   integer, parameter :: NTHREADS   = 256   ! threads per block (power of 2)
   integer, parameter :: MAX_BLOCKS = 1024  ! cap on partial count
 
-  ! Persistent device scratch: (0) = final result, (1:MAX_BLOCKS) = partials.
+  ! Persistent device scratch: (0) = final result; (1:) = partials. Sized
+  ! 4*MAX_BLOCKS so up to four wsum3_partials sets (the mass-flux BC's two
+  ! plane pairs) can coexist at distinct offsets before a combining kernel.
   real(dp), device, allocatable :: scratch_d(:)
 
 contains
@@ -65,7 +69,7 @@ contains
 
   !> Allocate the persistent scratch buffer on first use.
   subroutine ensure_scratch()
-    if (.not. allocated(scratch_d)) allocate (scratch_d(0:MAX_BLOCKS))
+    if (.not. allocated(scratch_d)) allocate (scratch_d(0:4*MAX_BLOCKS))
   end subroutine ensure_scratch
 
   !> Free the scratch buffer (call once at shutdown; optional).
@@ -230,8 +234,9 @@ contains
   !> that spacing vector, precomputed once, as w.
   attributes(global) subroutine red_partial_wsum(A, n1, n2, n3, &
                                                  ilo, jlo, klo, ni, nj, nk, &
-                                                 w, nw, wdim)
+                                                 w, nw, wdim, offset)
     integer,  value      :: n1, n2, n3, ilo, jlo, klo, ni, nj, nk, nw, wdim
+    integer,  value      :: offset   ! partials land at scratch_d(offset+b)
     real(dp), intent(in) :: A(n1, n2, n3)
     real(dp), intent(in) :: w(nw)
     real(dp), shared     :: sdata(NTHREADS)
@@ -269,7 +274,7 @@ contains
        call syncthreads()
        s = s/2
     end do
-    if (t == 1) scratch_d(blockIdx%x) = sdata(1)
+    if (t == 1) scratch_d(offset + blockIdx%x) = sdata(1)
   end subroutine red_partial_wsum
 
   !> Partial MAX RATIO: max of w(m)/abs(A(i,j,k)) over the section,
@@ -479,12 +484,50 @@ contains
     nb   = nblocks_for(ntot)
     call red_partial_wsum<<<nb, NTHREADS>>>(A_d, n1, n2, n3, &
                                             ilo, jlo, klo, ni, nj, nk, &
-                                            w_d, nw, wdim)
+                                            w_d, nw, wdim, 0)
     call debug_check('red_partial_wsum')
     call red_final_sum<<<1, 1>>>(nb)
     call debug_check('red_final_sum')
     r = scratch_d(0)
   end function device_wsum3
+
+  !> ASYNC weighted-sum partial pass: launches only the stage-1 kernel,
+  !> writing the per-block partials to scratch_d(offset+1 : offset+nb),
+  !> and returns nb WITHOUT any synchronization or final combine. The
+  !> caller combines one or more partial sets in its own device kernel
+  !> (in index order per set, to reproduce red_final_sum's rounding
+  !> exactly — see bc_kernels' mass-flux Delta_U). The partial pass is
+  !> identical to device_wsum3's, so each set's partial values are
+  !> bitwise those device_wsum3 would have produced. Caller must ensure
+  !> offset + nb <= 4*MAX_BLOCKS. Empty sections return nb = 0.
+  function wsum3_partials(A_d, n1, n2, n3, ilo, ihi, jlo, jhi, klo, khi, &
+                          w_d, nw, wdim, offset) result(nb)
+    integer,  intent(in)         :: n1, n2, n3, ilo, ihi, jlo, jhi, klo, khi
+    integer,  intent(in)         :: nw, wdim, offset
+    real(dp), device, intent(in) :: A_d(n1, n2, n3)
+    real(dp), device, intent(in) :: w_d(nw)
+    integer        :: ni, nj, nk, nb
+    integer(int64) :: ntot
+
+    ni = ihi - ilo + 1
+    nj = jhi - jlo + 1
+    nk = khi - klo + 1
+    if (ni <= 0 .or. nj <= 0 .or. nk <= 0) then
+       nb = 0
+       return
+    end if
+    call ensure_scratch()
+    ntot = int(ni, int64)*int(nj, int64)*int(nk, int64)
+    nb   = nblocks_for(ntot)
+    if (offset + nb > 4*MAX_BLOCKS) then
+       write(*,*) 'wsum3_partials: scratch overflow (offset+nb too large)'
+       error stop 1
+    end if
+    call red_partial_wsum<<<nb, NTHREADS>>>(A_d, n1, n2, n3, &
+                                            ilo, jlo, klo, ni, nj, nk, &
+                                            w_d, nw, wdim, offset)
+    call debug_check('red_partial_wsum (async)')
+  end function wsum3_partials
 
   !> Max over the section of w_d(m)/|A(i,j,k)|, with m the section
   !> point's index along dimension wdim. CFL building block; the dt
