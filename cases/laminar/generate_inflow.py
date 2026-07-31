@@ -4,7 +4,7 @@ from scipy.interpolate import splev, splrep
 import sys, os
 
 # Add parent pyfiles to path for Re_theta profiles
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'pyfiles'))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'profiles'))
 
 xi, Ui = 1., 1.
 
@@ -58,5 +58,5 @@ if __name__ == "__main__":
     y = np.linspace(0., 1., ny)
     y = np.sinh(alpy * y) / np.sinh(alpy) * Ly
 
-    profdir = os.path.join(os.path.dirname(__file__), '..', 'pyfiles')
+    profdir = os.path.join(os.path.dirname(__file__), '..', 'profiles')
     fout, Uint, Vint, yg = generate_profile(y, Reti, profdir)
