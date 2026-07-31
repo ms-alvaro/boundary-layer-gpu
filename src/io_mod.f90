@@ -71,10 +71,13 @@ module io_mod
                              boxout_jmax
   use grid_mod,        only: nx, ny, nz, nxg, nyg, nzg,                        &
                              x, y, z, xm, ym, zm, yg,                          &
-                             weight_y_0, weight_y_1
+                             weight_y_0, weight_y_1,                           &
+                             z_global, zm_global, k1, kg1
   use field_mod,       only: U, V, W, P, fields_from_device
   use timestep_mod,    only: t, dt, dt_min_cfl
   use poisson_mod,     only: check_divergence
+  use mpi_mod,         only: nprocs, myid, is_root, allreduce_max, &
+                             allreduce_sum, gather_slabs_host
 
   implicit none
   private
@@ -273,6 +276,11 @@ contains
 
       call refresh_host_fields(istep)
 
+      if (nprocs > 1) then
+         call snapshot_write_global(istep)
+         return
+      end if
+
       write(ext,'(I0.8)') istep + nstep_init
 
       fname = trim(adjustl(fileout))//'.'//trim(adjustl(ext))
@@ -329,6 +337,81 @@ contains
     end if
 
   end subroutine output_snapshot
+
+  !---------------------------------------------------------------------------
+  ! snapshot_write_global — P5.1 multi-rank snapshot: assemble the global
+  ! fields on rank 0 (host slab gather; overlapping planes are identical
+  ! because ghosts are exchanged every substep) and write the reference
+  ! format at GLOBAL sizes. Byte-identical to a single-rank snapshot of the
+  ! same state.
+  !---------------------------------------------------------------------------
+  subroutine snapshot_write_global(istep)
+
+    integer, intent(in) :: istep
+
+    character(200) :: fname
+    character(8)   :: ext
+    integer        :: unit_s
+    real(dp), allocatable :: Ug(:,:,:), Vg(:,:,:), Wg(:,:,:), Pg(:,:,:)
+    real(dp), allocatable :: nu_t_zero(:,:,:)
+
+    if (is_root()) then
+       allocate ( Ug(nx,  nyg, nzg_global) )
+       allocate ( Vg(nxg, ny,  nzg_global) )
+       allocate ( Wg(nxg, nyg, nz_global ) )
+       allocate ( Pg(nxg, nyg, nzg_global) )
+    else
+       allocate ( Ug(1,1,1), Vg(1,1,1), Wg(1,1,1), Pg(1,1,1) )
+    end if
+
+    call gather_slabs_host(U, nx,  nyg, nzg, kg1, Ug, nzg_global)
+    call gather_slabs_host(V, nxg, ny,  nzg, kg1, Vg, nzg_global)
+    call gather_slabs_host(W, nxg, nyg, nz,  k1,  Wg, nz_global )
+    call gather_slabs_host(P, nxg, nyg, nzg, kg1, Pg, nzg_global)
+
+    if (is_root()) then
+       write(ext,'(I0.8)') istep + nstep_init
+       fname = trim(adjustl(fileout))//'.'//trim(adjustl(ext))
+       write(*,*) 'writting ', trim(adjustl(fname))
+       open(newunit=unit_s, file=fname, access='stream', form='unformatted', &
+            action='write')
+
+       write(unit_s) t, nu
+       write(unit_s) -73, istep + nstep_init
+
+       write(unit_s) nx, x
+       write(unit_s) ny, y
+       write(unit_s) nz_global, z_global
+       write(unit_s) nx-1, xm
+       write(unit_s) ny-1, ym
+       write(unit_s) nz_global-1, zm_global
+
+       write(unit_s) nx, nyg, nzg_global
+       write(unit_s) Ug(:,:,1:nzg_global-1)
+       write(unit_s) nxg, ny, nzg_global
+       write(unit_s) Vg(:,:,1:nzg_global-1)
+       write(unit_s) nxg, nyg, nz_global
+       write(unit_s) Wg(:,:,1:nz_global-1)
+
+       allocate ( nu_t_zero(nxg,nyg,nzg_global-1) )
+       nu_t_zero = 0.0_dp
+       write(unit_s) nxg, nyg, nzg_global
+       write(unit_s) nu_t_zero
+       deallocate ( nu_t_zero )
+
+       write(unit_s) nxg, nyg, nzg_global
+       write(unit_s) Pg
+
+       close(unit_s)
+
+       last_snapshot_fname = fname
+       have_snapshot       = .true.
+       call write_restart()
+    end if
+
+    deallocate (Ug, Vg, Wg, Pg)
+
+  end subroutine snapshot_write_global
 
   !---------------------------------------------------------------------------
   ! write_restart — recreate the '<fileout>.restart' symlink pointing at the
@@ -583,6 +666,14 @@ contains
     real(dp) :: Uinf, theta_inlet, Umean99, w0, w1, T_mean
     real(dp) :: tau_sgs_wall(nx)
     real(dp) :: temp_1d(ny)
+
+    ! P5.1: statistics are not yet distributed (z-averages and Cf need
+    ! cross-rank reductions); skipped for nprocs > 1.
+    if (nprocs > 1) then
+       if (is_root() .and. istep == 1) &
+          write(*,*) 'NOTE: statistics output disabled for nprocs > 1 (P5.1)'
+       return
+    end if
 
     if (.not. io_initialized) call io_init()
 
@@ -863,20 +954,33 @@ contains
 
       call refresh_host_fields(istep)
 
-      ! compute mean values (single rank: MPI_Reduce is the identity)
+      ! compute mean values. The overlapping-slab bookkeeping makes the
+      ! local interiors an exact partition of the global interior, so the
+      ! cross-rank sums with the *_global denominators are exact.
       meanU = sum( U(2:nx-1, 2:nyg-1, 2:nzg-1) )
       meanV = sum( V(2:nxg-1, 2:ny-1, 2:nzg-1) )
       meanW = sum( W(2:nxg-1, 2:nyg-1, 2:nz-1) )
+      call allreduce_sum(meanU)
+      call allreduce_sum(meanV)
+      call allreduce_sum(meanW)
 
-      ! compute maximum values
+      ! compute maximum values (global across ranks)
       maxU = maxval( U(2:nx-1, 2:nyg-1, 2:nzg-1) )
       maxV = maxval( V(2:nxg-1, 2:ny-1, 2:nzg-1) )
       maxW = maxval( W(2:nxg-1, 2:nyg-1, 2:nz-1) )
+      call allreduce_max(maxU)
+      call allreduce_max(maxV)
+      call allreduce_max(maxW)
 
-      call check_divergence(max_divergence)
+      call check_divergence(max_divergence)   ! already globally reduced
 
       ! end measure time per step
       time2 = wtime()
+
+      if (.not. is_root()) then
+         time1 = wtime()
+         return
+      end if
 
       write(*,*) 'step number  :', istep
       write(*,*) 'time         :', t

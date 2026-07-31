@@ -22,6 +22,7 @@ program boundary_layer_cuda
   use timestep_mod,  only: timestep_init, advance_one_step, t
   use bc_kernels,    only: bc_finalize
   use reductions,    only: reductions_finalize
+  use mpi_mod,       only: mpi_initialize, mpi_finalize_run, is_root
   use hit_inflow_mod, only: init_hit_inflow
   use io_mod,        only: io_init, read_restart,                            &
                            output_stats, output_monitor, output_snapshot,    &
@@ -31,8 +32,9 @@ program boundary_layer_cuda
   integer :: istep
 
   ! ---- setup (mirrors the reference initialize() sequence) ----
-  call print_banner()
-  call read_input_parameters()
+  call mpi_initialize()                   ! rank/GPU binding (no-op alone)
+  if (is_root()) call print_banner()
+  call read_input_parameters()            ! every rank parses the input
   call check_supported()
 
   call grid_generate()
@@ -58,7 +60,7 @@ program boundary_layer_cuda
   call timestep_init()                    ! RK tableaus, CFL spacing vectors
   call io_init()                          ! statistics arrays, wall clock
 
-  call param_summary()
+  if (is_root()) call param_summary()
 
   ! ---- time loop (mirrors reference main.f90:84-113) ----
   do istep = 1, nsteps
@@ -73,6 +75,7 @@ program boundary_layer_cuda
   call poisson_finalize()
   call bc_finalize()
   call reductions_finalize()
-  write(*,*) 'Done!'
+  if (is_root()) write(*,*) 'Done!'
+  call mpi_finalize_run()
 
 end program boundary_layer_cuda

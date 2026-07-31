@@ -78,6 +78,7 @@ module timestep_mod
                              Fv1_d, Fv2_d, Fv3_d, &
                              Fw1_d, Fw2_d, Fw3_d
   use reductions,      only: device_max_ratio3
+  use mpi_mod,         only: allreduce_max
   ! Modules written in parallel (assumed public APIs — see doc comments at
   ! the call sites and the integration notes in the module header):
   use rhs_kernels,     only: compute_rhs_u, compute_rhs_v, compute_rhs_w
@@ -288,6 +289,11 @@ contains
                               2, nzg-1, dyg_d, nyg-1, 2)
     lWmax = device_max_ratio3(W_d, nxg, nyg, nz , 2, nxg-1, 2, nyg-1, &
                               2, nzg-1, dzg_d, nzg-1, 3)
+
+    ! P5.1: global maxima across z-slabs (legacy MPI_Allreduce equivalent)
+    call allreduce_max(lUmax)
+    call allreduce_max(lVmax)
+    call allreduce_max(lWmax)
 
     dt_conv_u = CFLa*lUmax
     dt_conv_v = CFLa*lVmax

@@ -1,7 +1,20 @@
 # Multi-GPU design (Phase 5 proposal — not yet implemented)
 
-Status: design document. The CUDA solver (src/) is single-GPU; this is the
-plan for distributing it. Nothing here is built yet.
+Status: **P5.1 implemented and validated** (2026-07-31): z-slab
+decomposition, device-direct halo/periodic exchanges, distributed
+RHS/advance/BCs and mass conservation, Poisson via rank-0 gather at global
+size, gathered snapshot writer. 2-rank transition fields match single-rank
+at 9e-15 after 2000 steps. As expected for the gather-Poisson interim,
+2 ranks are ~2x SLOWER than 1 (the 4 gather/scatters per step dominate at
+test-grid size) — P5.2 (distributed transposes) is the speed step. P5.1
+restrictions: restart, statistics, and boxout are single-rank only.
+
+Implementation lesson recorded: CUDA-aware MPI is not stream-aware — a
+cudaDeviceSynchronize is required before handing device pointers to MPI
+(kernels still writing the buffer otherwise race the transfer; symptom was
+a timing-dependent blow-up that the z-uniform laminar case could not see).
+
+The remaining phases below are unchanged.
 
 ## Why
 
