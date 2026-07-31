@@ -15,7 +15,7 @@ python3 validation/validate.py compare --a openacc-ref --b cuda-v1
 
 ## What each subcommand does
 
-- **laminar** — runs `laminar_test/laminar.turbb` (302x64x8 Blasius BL,
+- **laminar** — runs `cases/laminar/laminar.turbb` (302x64x8 Blasius BL,
   2000 steps, ~8 s on an A100) and checks:
   - mean Cf vs the golden value from the validated OpenACC baseline
   - max divergence < 1e-12 (projection works)
@@ -82,7 +82,7 @@ grid) cuda-v4 runs 10.0 ms/step vs 13.2 for the OpenACC reference
 
 ## Full transition physics validation (2026-07-31)
 
-Complete 500k-step transition runs (transition_test, 10 flow-throughs)
+Complete 500k-step transition runs (cases/transition, 10 flow-throughs)
 on both builds: transition-onset location (x where Cf > 1.5 Cf_lam)
 IDENTICAL to 4 decimals at every 5000-step checkpoint over 20 time
 units, including every phase oscillation of the TS-driven onset;
@@ -112,7 +112,7 @@ REQUIRE the UCX flags printed in the README.
 ## Transition-path validation (2026-07-30)
 
 The TS-mode temporal inflow path (unused by the laminar case) was
-validated head-to-head on transition_test (5000 steps, active
+validated head-to-head on cases/transition (5000 steps, active
 temporal modes): max relative field diff 1.8e-14 (U), 2.4e-14 (V/W),
 identical Cf to all printed digits, max divergence ~1.4e-12 in both.
 
