@@ -20,7 +20,7 @@ program boundary_layer_cuda
                            inflow_tables_to_device
   use poisson_mod,   only: poisson_init, poisson_finalize
   use timestep_mod,  only: timestep_init, advance_one_step, t
-  use bc_kernels,    only: bc_finalize
+  use bc_kernels,    only: bc_finalize, sync_z_ghosts
   use reductions,    only: reductions_finalize
   use mpi_mod,       only: mpi_initialize, mpi_finalize_run, is_root
   use hit_inflow_mod, only: init_hit_inflow
@@ -48,6 +48,11 @@ program boundary_layer_cuda
      call grid_to_device()                ! grids may have been overwritten
   end if
   call fields_to_device()
+
+  if (random_init /= 1) then
+     call sync_z_ghosts()                 ! rebuild the z-ghost planes the
+  end if                                  ! snapshot does not store (legacy
+                                          ! 'force periodicity in z' fixup)
 
   call compute_blasius_solution_for_bc()  ! inlet/top profiles + mode tables
   call inflow_tables_to_device()

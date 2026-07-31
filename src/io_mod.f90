@@ -72,12 +72,13 @@ module io_mod
   use grid_mod,        only: nx, ny, nz, nxg, nyg, nzg,                        &
                              x, y, z, xm, ym, zm, yg,                          &
                              weight_y_0, weight_y_1,                           &
-                             z_global, zm_global, k1, kg1
+                             z_global, zm_global, k1, k2, kg1, nzm
   use field_mod,       only: U, V, W, P, fields_from_device
   use timestep_mod,    only: t, dt, dt_min_cfl
   use poisson_mod,     only: check_divergence
   use mpi_mod,         only: nprocs, myid, is_root, allreduce_max, &
-                             allreduce_sum, gather_slabs_host
+                             allreduce_sum, allreduce_sum_arr, &
+                             gather_slabs_host, gather_planes_r4
 
   implicit none
   private
@@ -461,12 +462,14 @@ contains
 
     integer, parameter :: NKB = 256          ! z planes saved (one period)
     integer :: b, i, j, k, ii, absstep, npx, jm
+    integer :: g0, g1, nploc, pl
     character(300) :: fname
     character(8)   :: ext
     integer,       save :: box_unit(8) = -1
     logical,       save :: box_open(8) = .false.
     logical,       save :: checked = .false.
-    real(4), allocatable, save :: rbuf(:,:,:,:)
+    real(4), allocatable, save :: loc4(:,:,:,:)   ! (npx, jm, nploc, 3)
+    real(4), allocatable, save :: glb4(:,:,:,:)   ! (npx, jm, NKB, 3) root
 
     if ( boxout_every <= 0 .or. n_boxout <= 0 ) return
     absstep = istep + nstep_init
@@ -475,16 +478,24 @@ contains
 
     if (.not. io_initialized) call io_init()
 
+    ! this rank's window of the global box z-planes 1..NKB (faces):
+    ! global face g = k1 + p - 1; overlapping planes are ghost-synced, so
+    ! assembly-by-overwrite on the root is exact.
+    g0 = max( 1, k1 )
+    g1 = min( NKB, k2 )
+    nploc = max( 0, g1 - g0 + 1 )
+
     if ( .not. checked ) then
        ii = 0; j = 0
        do b = 1, n_boxout
-          if ( boxout_i1(b) > nx .or. boxout_jmax(b) > ny .or. NKB > nz ) &
+          if ( boxout_i1(b) > nx .or. boxout_jmax(b) > ny .or. NKB > nz_global ) &
                stop 'ERROR: boxout window exceeds grid'
           if ( boxout_is(b) < 1 .or. boxout_i0(b) < 1 ) stop 'ERROR: bad boxout spec'
           ii = max( ii, (boxout_i1(b)-boxout_i0(b))/boxout_is(b) + 1 )
           j  = max( j, boxout_jmax(b) )
        end do
-       allocate( rbuf(ii, j, NKB, 3) )   ! sized once to the largest box
+       allocate( loc4(ii, j, max(nploc,1), 3) )   ! sized once to the largest box
+       if (is_root()) allocate( glb4(ii, j, NKB, 3) )
        checked = .true.
     end if
 
@@ -495,7 +506,7 @@ contains
        npx = (boxout_i1(b) - boxout_i0(b))/boxout_is(b) + 1
        jm  = boxout_jmax(b)
 
-       if ( .not. box_open(b) ) then
+       if ( is_root() .and. .not. box_open(b) ) then
           write(ext,'(I0.8)') absstep
           fname = trim(dir_boxout)//'/box'//char(48+b)//'_'//ext//'.bin'
           open(newunit=box_unit(b), file=trim(fname), access='stream', &
@@ -504,28 +515,43 @@ contains
                              boxout_is(b), jm, npx, jm, NKB, boxout_every, 3
           write(box_unit(b)) x(boxout_i0(b):boxout_i1(b):boxout_is(b))
           write(box_unit(b)) y(1:jm)
-          write(box_unit(b)) z(1:NKB)
+          write(box_unit(b)) z_global(1:NKB)
           box_open(b) = .true.
           write(*,'(a,i2,a,a)') '   boxout: opened box ', b, ' -> ', trim(fname)
        end if
 
-       do k = 1, NKB
+       ! local slab contribution (local plane pl = global g0..g1)
+       do k = 1, nploc
+          pl = g0 - k1 + k       ! local z index of global plane g0+k-1
           do j = 1, jm
              ii = 0
              do i = boxout_i0(b), boxout_i1(b), boxout_is(b)
                 ii = ii + 1
-                rbuf(ii,j,k,1) = real( U(i,j,k), 4 )
-                rbuf(ii,j,k,2) = real( V(i,j,k), 4 )
-                rbuf(ii,j,k,3) = real( W(i,j,k), 4 )
+                loc4(ii,j,k,1) = real( U(i,j,pl), 4 )
+                loc4(ii,j,k,2) = real( V(i,j,pl), 4 )
+                loc4(ii,j,k,3) = real( W(i,j,pl), 4 )
              end do
           end do
        end do
 
-       write(box_unit(b)) t, absstep
-       write(box_unit(b)) rbuf(1:npx,1:jm,1:NKB,1)
-       write(box_unit(b)) rbuf(1:npx,1:jm,1:NKB,2)
-       write(box_unit(b)) rbuf(1:npx,1:jm,1:NKB,3)
-       flush(box_unit(b))
+       ! assemble the global box on the root (identity copy at nprocs = 1)
+       do k = 1, 3
+          if (is_root()) then
+             call gather_planes_r4(loc4(1:npx,1:jm,1:max(nploc,1),k), npx, jm, &
+                                   nploc, g0, glb4(1:npx,1:jm,:,k), NKB)
+          else
+             call gather_planes_r4(loc4(1:npx,1:jm,1:max(nploc,1),k), npx, jm, &
+                                   nploc, g0, loc4(1:npx,1:jm,1:1,k), 1)
+          end if
+       end do
+
+       if (is_root()) then
+          write(box_unit(b)) t, absstep
+          write(box_unit(b)) glb4(1:npx,1:jm,1:NKB,1)
+          write(box_unit(b)) glb4(1:npx,1:jm,1:NKB,2)
+          write(box_unit(b)) glb4(1:npx,1:jm,1:NKB,3)
+          flush(box_unit(b))
+       end if
     end do
 
   end subroutine output_boxes
@@ -596,7 +622,9 @@ contains
     read(unit_r) nz_global_f
     write(err_msg,'(A,I5,A,I5,A)') 'nz_f(', nz_global_f, ')/=nz(', nz_global, ')'
     if ( nz_global_f /= nz_global ) stop trim(err_msg)
-    read(unit_r) z
+    ! z record is GLOBAL; every rank reads it and slices its slab
+    read(unit_r) z_global
+    z = z_global(k1:k2)
 
     read(unit_r) nxm_global_f
     write(err_msg,'(A,I5,A,I5,A)') 'nxm_f(', nxm_global_f, ')/=nxm(', nxm_global, ')'
@@ -611,19 +639,36 @@ contains
     read(unit_r) nzm_global_f
     write(err_msg,'(A,I5,A,I5,A)') 'nzm_f(', nzm_global_f, ')/=nzm(', nzm_global, ')'
     if ( nzm_global_f /= nzm_global ) stop trim(err_msg)
-    read(unit_r) zm
+    read(unit_r) zm_global
+    zm = zm_global(kg1:kg1+nzm-1)
 
-    ! U (size record read as a dummy, as in the reference)
-    read(unit_r) nn
-    read(unit_r) U(:,:,1:nzg-1)
+    ! Field blocks. The file stores GLOBAL fields (nzg_global-1 z-planes
+    ! for the z-centered U,V; nz_global-1 for the z-faced W). Every rank
+    ! seeks directly to its own z-window (POS= stream addressing, Int64) —
+    ! fully parallel reads, no MPI. Planes past the stored range (the top
+    ! ghost planes) stay zero and are rebuilt by the first BC application,
+    ! exactly like the single-rank read of 1:nzg-1.
+    block
+      integer(int64) :: pos_u, pos_v, pos_w, pu, pv, pw
+      integer :: nu_pl, nv_pl, nw_pl
+      inquire(unit_r, pos=pos_u)          ! start of the U size record
+      pu = pos_u + 12_int64
+      pos_v = pu + int(nx, int64)*int(nyg, int64)*int(nzg_global-1, int64)*8_int64
+      pv = pos_v + 12_int64
+      pos_w = pv + int(nxg, int64)*int(ny, int64)*int(nzg_global-1, int64)*8_int64
+      pw = pos_w + 12_int64
 
-    ! V
-    read(unit_r) nn
-    read(unit_r) V(:,:,1:nzg-1)
+      nu_pl = min( nzg, nzg_global-1 - kg1 + 1 )
+      nv_pl = nu_pl
+      nw_pl = min( nz, nz_global-1 - k1 + 1 )
 
-    ! W
-    read(unit_r) nn
-    read(unit_r) W(:,:,1:nz-1)
+      read(unit_r, pos=pu + int(kg1-1, int64)*int(nx, int64)*int(nyg, int64)*8_int64) &
+           U(:,:,1:nu_pl)
+      read(unit_r, pos=pv + int(kg1-1, int64)*int(nxg, int64)*int(ny, int64)*8_int64) &
+           V(:,:,1:nv_pl)
+      read(unit_r, pos=pw + int(k1-1, int64)*int(nxg, int64)*int(nyg, int64)*8_int64) &
+           W(:,:,1:nw_pl)
+    end block
 
     ! close file (nu_t and P blocks are not read, as in the reference)
     close(unit_r)
@@ -667,14 +712,6 @@ contains
     real(dp) :: tau_sgs_wall(nx)
     real(dp) :: temp_1d(ny)
 
-    ! P5.1: statistics are not yet distributed (z-averages and Cf need
-    ! cross-rank reductions); skipped for nprocs > 1.
-    if (nprocs > 1) then
-       if (is_root() .and. istep == 1) &
-          write(*,*) 'NOTE: statistics output disabled for nprocs > 1 (P5.1)'
-       return
-    end if
-
     if (.not. io_initialized) call io_init()
 
     ! statistics computed at grid y -> U and W interpolated
@@ -716,6 +753,23 @@ contains
         end do
       end do
 
+      ! P5.3: cross-rank reduction of the partial z-sums. The local sum
+      ! ranges above partition the global z exactly (overlapping-slab
+      ! bookkeeping: centers 2:nzg-1 and faces 1:nz-2 tile the globe), so
+      ! summing the per-rank partials and dividing by the *_global counts
+      ! below reproduces the single-rank statistics exactly.
+      if (nprocs > 1) then
+         call allreduce_sum_arr(Umean,  nx*ny)
+         call allreduce_sum_arr(Vmean,  nx*ny)
+         call allreduce_sum_arr(Wmean,  nx*ny)
+         call allreduce_sum_arr(U2mean, nx*ny)
+         call allreduce_sum_arr(V2mean, nx*ny)
+         call allreduce_sum_arr(W2mean, nx*ny)
+         call allreduce_sum_arr(UVmean, nx*ny)
+         call allreduce_sum_arr(Pmean,  nx*ny)
+         call allreduce_sum_arr(P2mean, nx*ny)
+      end if
+
       ! z-averages (statistics.f90:122-135)
       Umean  = Umean /real( nzg_global-2, dp )
       Vmean  = Vmean /real( nzg_global-2, dp )
@@ -735,6 +789,10 @@ contains
         Uaux_1(ii) = sum( U(ii,1,2:nzg-1) )
         Uaux_2(ii) = sum( U(ii,2,2:nzg-1) )
       end do
+      if (nprocs > 1) then
+         call allreduce_sum_arr(Uaux_1, nx)
+         call allreduce_sum_arr(Uaux_2, nx)
+      end if
       Uaux_1    = Uaux_1/real( nzg_global-2, dp )
       Uaux_2    = Uaux_2/real( nzg_global-2, dp )
       dUdy_wall = ( Uaux_2 - Uaux_1 )/( yg(2) - yg(1) )
@@ -783,8 +841,9 @@ contains
       Retheta_inlet = theta_inlet*Uinf/nu
       Redelta_inlet = delta99_inlet_ins*Uinf/nu
 
-      ! write statistics
-      call write_stats_file(istep)
+      ! write statistics (all ranks hold identical reduced values;
+      ! only the root writes the file)
+      if (is_root()) call write_stats_file(istep)
 
     end if
 

@@ -45,6 +45,8 @@ module mpi_mod
   public :: alltoall_dev
   public :: pressure_exchange_z
   public :: gather_slabs_host
+  public :: allreduce_sum_arr
+  public :: gather_planes_r4
   public :: barrier
 
   integer, public :: STAG_CENTER = 1   ! z-center staggering (U, V, rhs_p)
@@ -291,5 +293,59 @@ contains
        call MPI_Send(loc, n1*n2*n3loc, MPI_REAL8, 0, 901, MPI_COMM_WORLD, ierr)
     end if
   end subroutine gather_slabs_host
+
+  !---------------------------------------------------------------------------
+  ! allreduce_sum_arr — in-place elementwise sum-reduce of a host array
+  ! (the P5.3 statistics: per-rank partial z-sums -> global sums).
+  !---------------------------------------------------------------------------
+  subroutine allreduce_sum_arr(a, n)
+    integer,  intent(in)    :: n
+    real(dp), intent(inout) :: a(n)
+    if (nprocs == 1) return
+    call MPI_Allreduce(MPI_IN_PLACE, a, n, MPI_REAL8, MPI_SUM, &
+                       MPI_COMM_WORLD, ierr)
+  end subroutine allreduce_sum_arr
+
+  !---------------------------------------------------------------------------
+  ! gather_planes_r4 — assemble float32 z-plane windows on rank 0 (the P5.3
+  ! box output). Rank r's contribution covers global planes gstart_r ..
+  ! gstart_r+nploc_r-1 of glob's third dimension; overlapping planes hold
+  ! identical values (ghost-synced fields) and are simply overwritten.
+  !---------------------------------------------------------------------------
+  subroutine gather_planes_r4(loc4, n1, n2, nploc, gstart, glob4, n3glob)
+    integer, intent(in)    :: n1, n2, nploc, gstart, n3glob
+    real(4), intent(in)    :: loc4(n1, n2, nploc)
+    real(4), intent(inout) :: glob4(n1, n2, n3glob)
+    integer :: istat_mpi(MPI_STATUS_SIZE)
+    integer :: r, meta(2)
+    real(4), allocatable :: buf(:,:,:)
+
+    if (nprocs == 1) then
+       if (nploc > 0) glob4(:,:,gstart:gstart+nploc-1) = loc4
+       return
+    end if
+    istat_mpi = 0
+
+    if (myid == 0) then
+       if (nploc > 0) glob4(:,:,gstart:gstart+nploc-1) = loc4
+       do r = 1, nprocs-1
+          call MPI_Recv(meta, 2, MPI_INTEGER, r, 910, MPI_COMM_WORLD, &
+                        istat_mpi, ierr)
+          if (meta(2) > 0) then
+             allocate (buf(n1, n2, meta(2)))
+             call MPI_Recv(buf, n1*n2*meta(2), MPI_REAL4, r, 911, &
+                           MPI_COMM_WORLD, istat_mpi, ierr)
+             glob4(:,:,meta(1):meta(1)+meta(2)-1) = buf
+             deallocate (buf)
+          end if
+       end do
+    else
+       meta = [gstart, nploc]
+       call MPI_Send(meta, 2, MPI_INTEGER, 0, 910, MPI_COMM_WORLD, ierr)
+       if (nploc > 0) &
+          call MPI_Send(loc4, n1*n2*nploc, MPI_REAL4, 0, 911, &
+                        MPI_COMM_WORLD, ierr)
+    end if
+  end subroutine gather_planes_r4
 
 end module mpi_mod
