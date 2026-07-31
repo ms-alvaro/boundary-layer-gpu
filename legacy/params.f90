@@ -145,6 +145,36 @@
       call get_dbl('Lund_deltai'  , delta_inlet     , f)
       call get_dbl('Lund_T'       , T_resc          , f)
 
+      ! HIT plane inflow (inflow_flag=6)
+      call get_str('hit_file'     , file_hit_planes , 200, f)
+      if (f.eqv..FALSE.) file_hit_planes = ''
+      call get_int('N_buffer_hit' , N_buffer_hit    , f)
+      if (f.eqv..FALSE.) N_buffer_hit = 1000
+      ! optional wall-normal grid from file (blended-sinh)
+      call get_str('ygrid_file'   , file_ygrid      , 200, f)
+      if (f.eqv..FALSE.) file_ygrid = ''
+
+      ! subvolume (box) output for causal-analysis campaigns
+      call get_int('boxout_every' , boxout_every    , f)
+      if (f.eqv..FALSE.) boxout_every = 0
+      call get_int('boxout_start' , boxout_start    , f)
+      if (f.eqv..FALSE.) boxout_start = 0
+      call get_int('boxout_n'     , n_boxout        , f)
+      if (f.eqv..FALSE.) n_boxout = 0
+      call get_str('boxout_dir'   , dir_boxout      , 200, f)
+      if (f.eqv..FALSE.) dir_boxout = './boxout'
+      if (n_boxout.gt.8) stop ' ERROR: boxout_n > 8'
+      if (n_boxout.gt.0) then
+          call get_int_arr('boxout_i0'  , boxout_i0  , n_boxout, f)
+          if (f.eqv..FALSE.) stop ' ERROR: boxout_n>0 needs boxout_i0'
+          call get_int_arr('boxout_i1'  , boxout_i1  , n_boxout, f)
+          if (f.eqv..FALSE.) stop ' ERROR: boxout_n>0 needs boxout_i1'
+          call get_int_arr('boxout_is'  , boxout_is  , n_boxout, f)
+          if (f.eqv..FALSE.) stop ' ERROR: boxout_n>0 needs boxout_is'
+          call get_int_arr('boxout_jmax', boxout_jmax, n_boxout, f)
+          if (f.eqv..FALSE.) stop ' ERROR: boxout_n>0 needs boxout_jmax'
+      endif
+
 
       call get_dbl('dPdx'         , dPdx            , f)
       call get_dbl('dPdz'         , dPdz            , f)
@@ -194,6 +224,7 @@
       endif
     
       call get_str('timeinflow_file' , file_temporal_inlet, 200, f)
+      if (f.eqv..FALSE.) file_temporal_inlet = ''
     
       call get_int('RKscheme'        , itime_step   , f)        
 

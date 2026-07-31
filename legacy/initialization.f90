@@ -11,7 +11,7 @@ Module initialization
   Use input_output
   Use fftz
   Use cufft_solver
-  Use boundary_conditions, Only : apply_periodic_bc_z
+  Use boundary_conditions, Only : apply_periodic_bc_z, init_hit_inflow
  
   ! prevent implicit typing
   Implicit None
@@ -624,6 +624,11 @@ Contains
     Else
        If ( myid==0 ) Write(*,*) 'initializing blasius boundary conditions...'
        Call compute_blasius_solution_for_bc
+    End If
+
+    ! HIT plane inflow (reads planes file, loads first GPU buffer)
+    If ( inflow_boundary_flag == 6 ) Then
+       Call init_hit_inflow
     End If
 
     If ( myid==0 ) Write(*,*) 'initializating some statistics...'

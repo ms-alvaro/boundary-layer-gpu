@@ -31,3 +31,5 @@ nohup.out
 # Python
 __pycache__/
 *.pyc
+validation/runs/
+laminar_test/figures/

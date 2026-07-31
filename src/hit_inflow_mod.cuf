@@ -1,0 +1,343 @@
+!------------------------------------------------------------------------------
+! hit_inflow_mod — HIT plane inflow (inflow_flag = 6)
+!
+! Part of the CUDA Fortran port of the boundary-layer DNS solver
+! (see docs/CUDA_PORT_DESIGN.md). Single GPU, no MPI.
+!
+! Time-resolved y-z velocity planes from a precursor HIT simulation,
+! preprocessed (rescaled + blended) by preprocess_planes.py (format v2,
+! magic 20260612). Planes are z-PERIODIC with period Lz_box_hit, which must
+! equal the domain's spanwise period dz*(nz-2).
+!
+! Port provenance (verbatim numerics): legacy/boundary_conditions.f90,
+! subroutines init_hit_inflow / load_hit_buffer / update_hit_inlet_gpu
+! (imported from the gpu-openacc branch + tbl-gpu working tree).
+!
+!   init_hit_inflow()    read header, consistency checks, allocate buffers,
+!                        load + upload the first buffer          [host]
+!   update_hit_inlet(t)  temporal interpolation of the bracketing planes
+!                        into Ut/Vt/Wt_inlet_d; reloads the disk buffer
+!                        when exhausted                          [kernels]
+!
+! NO-WRAP CAMPAIGN RULE (audit blueprint, commit 809e902): the plane library
+! must NEVER be recycled — running past its end is a fatal configuration
+! error, not something to paper over with Mod().
+!------------------------------------------------------------------------------
+module hit_inflow_mod
+
+  use iso_fortran_env, only: int64
+  use precision_mod,   only: dp, ceil_div
+  use param_mod,       only: CFL, file_hit_planes, N_buffer_hit
+  use grid_mod,        only: ny, nz, nyg, nzg, y, yg, z, zg
+  use ic_inflow_mod,   only: Ut_inlet_d, Vt_inlet_d, Wt_inlet_d
+  use cudafor
+
+  implicit none
+  private
+
+  public :: init_hit_inflow    ! call once, after grids + inflow tables exist
+  public :: update_hit_inlet   ! call per BC application when inflow_flag = 6
+  public :: hit_finalize
+
+  ! header metadata (file format v2)
+  integer  :: n_planes_hit = 0       !< total planes in the file
+  integer  :: ny_hit_f = 0, nz_hit_f = 0  !< plane grid: y points, native z
+  integer  :: ibuf_start_hit = 0     !< 1-based global index of buffer start
+  integer  :: n_buf = 0              !< planes actually held in the buffer
+  integer(int64) :: hit_data_offset = 0  !< stream POS where plane data starts
+  real(dp) :: dt_plane_hit = 0.0_dp  !< BL time between planes
+  real(dp) :: Lz_box_hit = 0.0_dp    !< z period of the planes (must equal Lz)
+  real(dp) :: y_blend_hit, A_vel_hit, Tu_hit
+  real(dp), allocatable :: y_hit_f(:)     !< file y grid
+
+  ! plane buffers interpolated to the staggered inlet grids: host mirrors
+  ! (filled by load_hit_buffer) and device copies (read by the kernels)
+  real(dp), allocatable         :: hit_buf_u(:,:,:)  ! (nyg, nzg, N_buffer)
+  real(dp), allocatable         :: hit_buf_v(:,:,:)  ! (ny , nzg, N_buffer)
+  real(dp), allocatable         :: hit_buf_w(:,:,:)  ! (nyg, nz , N_buffer)
+  real(dp), device, allocatable :: hit_buf_u_d(:,:,:)
+  real(dp), device, allocatable :: hit_buf_v_d(:,:,:)
+  real(dp), device, allocatable :: hit_buf_w_d(:,:,:)
+
+contains
+
+  !----------------------------------------------------------------------------
+  ! init_hit_inflow — read the planes-file header, run the consistency
+  ! checks, allocate the buffers, and load + upload the first buffer.
+  !----------------------------------------------------------------------------
+  subroutine init_hit_inflow()
+
+    integer  :: magic, unit_h
+    real(dp) :: L11r_f, alphaL_f, alphat_f, Uinf_f
+
+    if ( len_trim(file_hit_planes) == 0 ) &
+         stop 'inflow_flag=6 requires hit_file in input'
+
+    write(*,*) 'Initializing HIT plane inflow from: ', trim(file_hit_planes)
+
+    open(newunit=unit_h, file=trim(file_hit_planes), form='unformatted', &
+         action='read', access='stream', status='old')
+    read(unit_h) magic
+    if ( magic /= 20260612 ) then
+       write(*,*) 'ERROR: bad magic in hit_file: ', magic
+       stop 'hit_file format mismatch (need v2, magic 20260612)'
+    end if
+    read(unit_h) n_planes_hit
+    read(unit_h) ny_hit_f
+    read(unit_h) nz_hit_f
+    read(unit_h) dt_plane_hit
+    read(unit_h) Lz_box_hit
+    read(unit_h) Tu_hit, L11r_f, alphaL_f, A_vel_hit, alphat_f, &
+                 y_blend_hit, Uinf_f
+    allocate( y_hit_f(ny_hit_f) )
+    read(unit_h) y_hit_f
+    close(unit_h)
+
+    ! data start offset (bytes, 1-based POS for stream access)
+    hit_data_offset = 4_int64*4_int64 + 8_int64*2_int64 + 8_int64*7_int64 &
+                    + 8_int64*int(ny_hit_f, int64) + 1_int64
+
+    ! consistency checks
+    ! true spanwise period of the code: dz*(nz-2)
+    ! (z(1) and z(nz-1) are periodic images; z(nz) is a ghost)
+    if ( abs( Lz_box_hit - (z(2)-z(1))*real(nz-2, dp) ) > 1.0e-6_dp*Lz_box_hit ) then
+       write(*,*) 'ERROR: domain z-period=', (z(2)-z(1))*real(nz-2, dp), &
+                  ' /= plane z-period=', Lz_box_hit
+       write(*,*) 'Planes are z-periodic over Lz_box: set boxsize Lz accordingly'
+       stop 'hit_file z-period mismatch'
+    end if
+    if ( y_hit_f(ny_hit_f) < yg(nyg-1) ) then
+       write(*,*) 'WARNING: plane y range ', y_hit_f(ny_hit_f), &
+                  ' < domain top ', yg(nyg-1), ' (will clamp)'
+    end if
+
+    if ( N_buffer_hit > n_planes_hit ) N_buffer_hit = n_planes_hit
+
+    ! host + device buffers on the staggered inlet grids
+    allocate( hit_buf_u(nyg, nzg, N_buffer_hit) )
+    allocate( hit_buf_v(ny , nzg, N_buffer_hit) )
+    allocate( hit_buf_w(nyg, nz , N_buffer_hit) )
+    allocate( hit_buf_u_d(nyg, nzg, N_buffer_hit) )
+    allocate( hit_buf_v_d(ny , nzg, N_buffer_hit) )
+    allocate( hit_buf_w_d(nyg, nz , N_buffer_hit) )
+
+    call load_hit_buffer(1)
+    hit_buf_u_d = hit_buf_u
+    hit_buf_v_d = hit_buf_v
+    hit_buf_w_d = hit_buf_w
+
+    write(*,*) '   planes: ', n_planes_hit, '  grid: ', ny_hit_f, 'x', nz_hit_f
+    write(*,*) '   dt_plane = ', dt_plane_hit, ' (', dt_plane_hit/abs(CFL), ' steps)'
+    write(*,*) '   time covered = ', real(n_planes_hit-1, dp)*dt_plane_hit
+    write(*,*) '   buffer = ', N_buffer_hit, ' planes (', &
+               real(N_buffer_hit, dp)*real(nyg*nzg+ny*nzg+nyg*nz, dp)*8.0_dp/1.0e9_dp, ' GB)'
+    write(*,*) '   Tu = ', Tu_hit, '  y_blend = ', y_blend_hit
+
+  end subroutine init_hit_inflow
+
+  !----------------------------------------------------------------------------
+  ! load_hit_buffer — load planes [istart, istart+N_buffer-1] (1-based,
+  ! clamped to the file end) from disk and interpolate to the staggered
+  ! inlet grids on the host (verbatim from the legacy implementation:
+  ! clamped-linear in y, periodic-linear in z, float32 file storage with
+  ! iy slow / iz fast).
+  !----------------------------------------------------------------------------
+  subroutine load_hit_buffer(istart)
+
+    integer, intent(in) :: istart
+
+    integer  :: n_load, p, ip, j, k, j0, j1, k0, k1, unit_h
+    integer(int64) :: pos, rec_bytes
+    real(dp) :: yy, zz, fz, wyj, wzk, dzf
+    real(4), allocatable :: raw_u(:,:), raw_v(:,:), raw_w(:,:)
+    ! precomputed y-weights for centers (yg) and faces (y)
+    integer,  allocatable :: jg0(:), jf0(:)
+    real(dp), allocatable :: wg(:), wf(:)
+    ! precomputed z-weights for centers (zg) and faces (z)
+    integer,  allocatable :: kc0(:), kc1(:), kf0v(:), kf1v(:)
+    real(dp), allocatable :: wc(:), wfz(:)
+
+    n_load = min( N_buffer_hit, n_planes_hit - istart + 1 )
+    ibuf_start_hit = istart
+    n_buf = n_load
+    rec_bytes = 3_int64 * int(ny_hit_f, int64) * int(nz_hit_f, int64) * 4_int64
+
+    allocate( raw_u(nz_hit_f, ny_hit_f) )   ! file order: iy slow, iz fast
+    allocate( raw_v(nz_hit_f, ny_hit_f) )
+    allocate( raw_w(nz_hit_f, ny_hit_f) )
+
+    ! ---- y interpolation weights (clamped linear on y_hit_f) ----
+    allocate( jg0(nyg), wg(nyg), jf0(ny), wf(ny) )
+    do j = 1, nyg
+       yy = min( max( yg(j), y_hit_f(1) ), y_hit_f(ny_hit_f) )
+       j0 = 1
+       do j1 = 2, ny_hit_f
+          if ( y_hit_f(j1) >= yy ) then
+             j0 = j1 - 1
+             exit
+          end if
+          if ( j1 == ny_hit_f ) j0 = ny_hit_f - 1
+       end do
+       jg0(j) = j0
+       wg (j) = ( yy - y_hit_f(j0) ) / ( y_hit_f(j0+1) - y_hit_f(j0) )
+    end do
+    do j = 1, ny
+       yy = min( max( y(j), y_hit_f(1) ), y_hit_f(ny_hit_f) )
+       j0 = 1
+       do j1 = 2, ny_hit_f
+          if ( y_hit_f(j1) >= yy ) then
+             j0 = j1 - 1
+             exit
+          end if
+          if ( j1 == ny_hit_f ) j0 = ny_hit_f - 1
+       end do
+       jf0(j) = j0
+       wf (j) = ( yy - y_hit_f(j0) ) / ( y_hit_f(j0+1) - y_hit_f(j0) )
+    end do
+
+    ! ---- z interpolation weights (periodic over Lz_box_hit) ----
+    dzf = Lz_box_hit / real(nz_hit_f, dp)
+    allocate( kc0(nzg), kc1(nzg), wc(nzg), kf0v(nz), kf1v(nz), wfz(nz) )
+    do k = 1, nzg
+       zz = modulo( zg(k), Lz_box_hit )
+       fz = zz / dzf
+       k0 = int(fz)
+       wc(k)  = fz - real(k0, dp)
+       kc0(k) = mod(k0  , nz_hit_f) + 1
+       kc1(k) = mod(k0+1, nz_hit_f) + 1
+    end do
+    do k = 1, nz
+       zz = modulo( z(k), Lz_box_hit )
+       fz = zz / dzf
+       k0 = int(fz)
+       wfz(k)  = fz - real(k0, dp)
+       kf0v(k) = mod(k0  , nz_hit_f) + 1
+       kf1v(k) = mod(k0+1, nz_hit_f) + 1
+    end do
+
+    ! ---- read + interpolate each plane ----
+    open(newunit=unit_h, file=trim(file_hit_planes), form='unformatted', &
+         action='read', access='stream', status='old')
+    do p = 1, n_load
+       ip  = istart + p - 1
+       pos = hit_data_offset + int(ip-1, int64)*rec_bytes
+       read(unit_h, pos=pos) raw_u, raw_v, raw_w
+
+       ! u at (yg, zg)
+       do k = 1, nzg
+          k0 = kc0(k); k1 = kc1(k); wzk = wc(k)
+          do j = 1, nyg
+             j0 = jg0(j); wyj = wg(j)
+             hit_buf_u(j,k,p) = &
+               (1.0_dp-wyj)*( (1.0_dp-wzk)*real(raw_u(k0,j0  ),dp) + wzk*real(raw_u(k1,j0  ),dp) ) + &
+                       wyj *( (1.0_dp-wzk)*real(raw_u(k0,j0+1),dp) + wzk*real(raw_u(k1,j0+1),dp) )
+          end do
+       end do
+       ! v at (y, zg)
+       do k = 1, nzg
+          k0 = kc0(k); k1 = kc1(k); wzk = wc(k)
+          do j = 1, ny
+             j0 = jf0(j); wyj = wf(j)
+             hit_buf_v(j,k,p) = &
+               (1.0_dp-wyj)*( (1.0_dp-wzk)*real(raw_v(k0,j0  ),dp) + wzk*real(raw_v(k1,j0  ),dp) ) + &
+                       wyj *( (1.0_dp-wzk)*real(raw_v(k0,j0+1),dp) + wzk*real(raw_v(k1,j0+1),dp) )
+          end do
+       end do
+       ! w at (yg, z)
+       do k = 1, nz
+          k0 = kf0v(k); k1 = kf1v(k); wzk = wfz(k)
+          do j = 1, nyg
+             j0 = jg0(j); wyj = wg(j)
+             hit_buf_w(j,k,p) = &
+               (1.0_dp-wyj)*( (1.0_dp-wzk)*real(raw_w(k0,j0  ),dp) + wzk*real(raw_w(k1,j0  ),dp) ) + &
+                       wyj *( (1.0_dp-wzk)*real(raw_w(k0,j0+1),dp) + wzk*real(raw_w(k1,j0+1),dp) )
+          end do
+       end do
+    end do
+    close(unit_h)
+
+    write(*,'(a,i8,a,i8,a)') '   HIT buffer loaded: planes ', &
+         istart, ' to ', istart+n_load-1, ' (interpolated to inlet grids)'
+
+    deallocate( raw_u, raw_v, raw_w, jg0, wg, jf0, wf )
+    deallocate( kc0, kc1, wc, kf0v, kf1v, wfz )
+
+  end subroutine load_hit_buffer
+
+  !----------------------------------------------------------------------------
+  ! update_hit_inlet — fill Ut/Vt/Wt_inlet_d from the HIT buffer at time t
+  ! (linear interpolation between the bracketing planes, on the device).
+  ! Reloads the buffer from disk (and re-uploads it) when exhausted.
+  ! Fatal stop when the library is exhausted (no-wrap rule).
+  !----------------------------------------------------------------------------
+  subroutine update_hit_inlet(t)
+
+    real(dp), intent(in) :: t
+
+    integer    :: ip0, p0, il0
+    real(dp)   :: theta
+    type(dim3) :: tb, gr
+
+    ! global plane interval (0-based). NO-WRAP: running past the library end
+    ! is a fatal configuration error.
+    ip0   = int( t / dt_plane_hit )
+    theta = t/dt_plane_hit - real(ip0, dp)
+    if ( ip0 >= n_planes_hit-1 ) then
+       write(*,*) 'FATAL: HIT inflow library exhausted: t=', t, &
+            ' ip0=', ip0, ' n_planes=', n_planes_hit
+       stop 'HIT library exhausted - no wrap allowed (extend library first)'
+    end if
+    p0 = ip0 + 1                        ! 1-based file index of left plane
+
+    ! reload if [p0, p0+1] not inside the buffer
+    if ( p0 < ibuf_start_hit .or. p0+1 > ibuf_start_hit+n_buf-1 ) then
+       call load_hit_buffer(p0)
+       hit_buf_u_d = hit_buf_u
+       hit_buf_v_d = hit_buf_v
+       hit_buf_w_d = hit_buf_w
+    end if
+    il0 = p0 - ibuf_start_hit + 1       ! local buffer index
+
+    tb = dim3(64, 4, 1)
+
+    gr = dim3( ceil_div(nyg, 64), ceil_div(nzg, 4), 1 )
+    call k_hit_interp<<<gr, tb>>>(Ut_inlet_d, hit_buf_u_d, nyg, nzg, &
+                                  N_buffer_hit, il0, theta)
+    gr = dim3( ceil_div(ny, 64), ceil_div(nzg, 4), 1 )
+    call k_hit_interp<<<gr, tb>>>(Vt_inlet_d, hit_buf_v_d, ny , nzg, &
+                                  N_buffer_hit, il0, theta)
+    gr = dim3( ceil_div(nyg, 64), ceil_div(nz, 4), 1 )
+    call k_hit_interp<<<gr, tb>>>(Wt_inlet_d, hit_buf_w_d, nyg, nz , &
+                                  N_buffer_hit, il0, theta)
+
+  end subroutine update_hit_inlet
+
+  !----------------------------------------------------------------------------
+  ! hit_finalize — free the buffers (optional, at shutdown).
+  !----------------------------------------------------------------------------
+  subroutine hit_finalize()
+    if (allocated(hit_buf_u))   deallocate(hit_buf_u, hit_buf_v, hit_buf_w)
+    if (allocated(hit_buf_u_d)) deallocate(hit_buf_u_d, hit_buf_v_d, hit_buf_w_d)
+    if (allocated(y_hit_f))     deallocate(y_hit_f)
+  end subroutine hit_finalize
+
+  !----------------------------------------------------------------------------
+  ! k_hit_interp — F(j,k) = (1-theta)*buf(j,k,il0) + theta*buf(j,k,il0+1)
+  ! (verbatim expression from legacy update_hit_inlet_gpu's acc loops).
+  !----------------------------------------------------------------------------
+  attributes(global) subroutine k_hit_interp(F, buf, n1, n2, nb, il0, theta)
+    integer,  value         :: n1, n2, nb, il0
+    real(dp), value         :: theta
+    real(dp), intent(out)   :: F(n1, n2)
+    real(dp), intent(in)    :: buf(n1, n2, nb)
+    integer :: j, k
+
+    j = 1 + (blockIdx%x-1)*blockDim%x + threadIdx%x - 1
+    k = 1 + (blockIdx%y-1)*blockDim%y + threadIdx%y - 1
+    if (j > n1 .or. k > n2) return
+
+    F(j,k) = (1.0_dp-theta)*buf(j,k,il0) + theta*buf(j,k,il0+1)
+
+  end subroutine k_hit_interp
+
+end module hit_inflow_mod

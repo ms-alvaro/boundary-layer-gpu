@@ -1,0 +1,439 @@
+!------------------------------------------------------------------------------
+! rhs_kernels — Navier-Stokes RHS kernels for u, v, w (DNS branch)
+!
+! Part of the CUDA Fortran port of the boundary-layer DNS solver
+! (see docs/CUDA_PORT_DESIGN.md).
+!
+! Reference provenance (verbatim numerics):
+!   equations.f90, Module equations —
+!     compute_rhs_u (lines ~24-156), compute_rhs_v (~163-294),
+!     compute_rhs_w (~301-415), DNS (LES_model == 0) branches.
+!
+! The discrete equations (staggered 2nd-order FD, divergence-form convection):
+!   du/dt = -du^2/dx - duv/dy - duw/dz + nu*Laplacian(u) + dPdx
+!   dv/dt = -duv/dx - dv^2/dy - dvw/dz + nu*Laplacian(v)
+!   dw/dt = -duw/dx - dvw/dy - dw^2/dz + nu*Laplacian(w) + dPdz
+!
+! FUSION (Phase 3): the reference computes each RHS in three kernels
+! (convective sweep, viscous sweep accumulating into the same array, and a
+! small kernel zeroing the dummy last x-plane). Here each component is ONE
+! kernel: the same statement sequence accumulates in a register and the
+! result is stored once; the dummy plane stores literal zero. This is
+! bitwise-identical to the split version — every per-point operation and its
+! order is unchanged; only the redundant global-memory round trip of the
+! partial sum (write conv, read back, add visc) and the extra launches are
+! removed. Verified: max field diff 0.0 vs the unfused Phase 2 build over
+! the 2000-step laminar case.
+!
+! Not ported (Phase 2 non-goals, enforced by a runtime guard in the host
+! wrappers): the LES branch (LES_model /= 0, variable nu_t) and the rotation
+! branch (Abs(Omega_z) > 1e-6). param_mod's check_supported() already
+! rejects LES_model > 0, and Omega_z is identically zero in this port, so
+! the guard is a safety net, not a reachable path.
+!
+! Host API (unchanged from Phase 2):
+!   compute_rhs_u(U_, V_, W_, rhs_u)   — reference-shaped wrappers; inputs
+!   compute_rhs_v(U_, V_, W_, rhs_v)     and output are device arrays, e.g.
+!   compute_rhs_w(U_, V_, W_, rhs_w)     compute_rhs_u(U_d, V_d, W_d, Fu1_d)
+!   compute_rhs(stage)                 — convenience: computes all three
+!                                        RHS from field_mod's U_d/V_d/W_d
+!                                        into stage arrays Fu<stage>_d,
+!                                        Fv<stage>_d, Fw<stage>_d
+!
+! Thread mapping (design-doc convention): tBlock = dim3(64,4,1), one z-plane
+! per grid z-slot, i fastest.
+!
+! Debug builds: compile with -DDEBUG_KERNELS (file requires preprocessing)
+! to check cudaGetLastError after every launch, matching reductions.cuf.
+!------------------------------------------------------------------------------
+module rhs_kernels
+
+  use precision_mod, only: dp, ceil_div
+  use param_mod,     only: nu, dPdx, dPdz, Omega_z, LES_model, itime_step
+  use grid_mod,      only: nx, ny, nz, nxg, nyg, nzg,              &
+                           x_d, y_d, z_d, xg_d, yg_d, zg_d,        &
+                           weight_y_0_d, weight_y_1_d
+  use field_mod,     only: U_d, V_d, W_d,                          &
+                           Fu1_d, Fu2_d, Fu3_d,                    &
+                           Fv1_d, Fv2_d, Fv3_d,                    &
+                           Fw1_d, Fw2_d, Fw3_d
+  use cudafor
+
+  implicit none
+  private
+
+  public :: compute_rhs_u, compute_rhs_v, compute_rhs_w, compute_rhs
+
+contains
+
+  !===========================================================================
+  ! host wrappers
+  !===========================================================================
+
+  !----------------------------------------------------------------------------
+  ! compute_rhs_u — RHS of the u-momentum equation on interior u-points
+  !                 (i = 2..nx-1, j = 2..nyg-1, k = 2..nzg-1), single fused
+  !                 kernel: convection + viscous + dPdx, dummy plane
+  !                 rhs_u(nx-1,:,:) = 0.
+  !----------------------------------------------------------------------------
+  subroutine compute_rhs_u(U_, V_, W_, rhs_u)
+
+    real(dp), device, intent(in)  :: U_(nx,  nyg, nzg)
+    real(dp), device, intent(in)  :: V_(nxg, ny,  nzg)
+    real(dp), device, intent(in)  :: W_(nxg, nyg, nz )
+    real(dp), device, intent(out) :: rhs_u(2:nx-1, 2:nyg-1, 2:nzg-1)
+
+    type(dim3) :: tBlock, grid3
+
+    call check_dns_only()
+
+    tBlock = dim3(64, 4, 1)
+    grid3  = dim3(ceil_div(nx-2, 64), ceil_div(nyg-2, 4), nzg-2)
+
+    call rhs_u_fused<<<grid3, tBlock>>>(U_, V_, W_, rhs_u,           &
+                                        x_d, xg_d, y_d, yg_d,        &
+                                        z_d, zg_d,                   &
+                                        weight_y_0_d, weight_y_1_d,  &
+                                        nu, dPdx,                    &
+                                        nx, ny, nz, nxg, nyg, nzg)
+    call debug_check('rhs_u_fused')
+
+  end subroutine compute_rhs_u
+
+  !----------------------------------------------------------------------------
+  ! compute_rhs_v — RHS of the v-momentum equation on interior v-points
+  !                 (i = 2..nxg-1, j = 2..ny-1, k = 2..nzg-1), single fused
+  !                 kernel; dummy plane rhs_v(nxg-1,:,:) = 0.
+  !----------------------------------------------------------------------------
+  subroutine compute_rhs_v(U_, V_, W_, rhs_v)
+
+    real(dp), device, intent(in)  :: U_(nx,  nyg, nzg)
+    real(dp), device, intent(in)  :: V_(nxg, ny,  nzg)
+    real(dp), device, intent(in)  :: W_(nxg, nyg, nz )
+    real(dp), device, intent(out) :: rhs_v(2:nxg-1, 2:ny-1, 2:nzg-1)
+
+    type(dim3) :: tBlock, grid3
+
+    call check_dns_only()
+
+    tBlock = dim3(64, 4, 1)
+    grid3  = dim3(ceil_div(nxg-2, 64), ceil_div(ny-2, 4), nzg-2)
+
+    call rhs_v_fused<<<grid3, tBlock>>>(U_, V_, W_, rhs_v,           &
+                                        x_d, xg_d, y_d, yg_d,        &
+                                        z_d, zg_d,                   &
+                                        weight_y_0_d, weight_y_1_d,  &
+                                        nu,                          &
+                                        nx, ny, nz, nxg, nyg, nzg)
+    call debug_check('rhs_v_fused')
+
+  end subroutine compute_rhs_v
+
+  !----------------------------------------------------------------------------
+  ! compute_rhs_w — RHS of the w-momentum equation on interior w-points
+  !                 (i = 2..nxg-1, j = 2..nyg-1, k = 2..nz-1), single fused
+  !                 kernel; dummy plane rhs_w(nxg-1,:,:) = 0.
+  !----------------------------------------------------------------------------
+  subroutine compute_rhs_w(U_, V_, W_, rhs_w)
+
+    real(dp), device, intent(in)  :: U_(nx,  nyg, nzg)
+    real(dp), device, intent(in)  :: V_(nxg, ny,  nzg)
+    real(dp), device, intent(in)  :: W_(nxg, nyg, nz )
+    real(dp), device, intent(out) :: rhs_w(2:nxg-1, 2:nyg-1, 2:nz-1)
+
+    type(dim3) :: tBlock, grid3
+
+    call check_dns_only()
+
+    tBlock = dim3(64, 4, 1)
+    grid3  = dim3(ceil_div(nxg-2, 64), ceil_div(nyg-2, 4), nz-2)
+
+    call rhs_w_fused<<<grid3, tBlock>>>(U_, V_, W_, rhs_w,           &
+                                        x_d, xg_d, y_d, yg_d,        &
+                                        z_d, zg_d,                   &
+                                        weight_y_0_d, weight_y_1_d,  &
+                                        nu, dPdz,                    &
+                                        nx, ny, nz, nxg, nyg, nzg)
+    call debug_check('rhs_w_fused')
+
+  end subroutine compute_rhs_w
+
+  !----------------------------------------------------------------------------
+  ! compute_rhs — compute all three RHS components into the stage-<s> arrays
+  ! (Fu<s>_d, Fv<s>_d, Fw<s>_d) from the current field_mod state U_d/V_d/W_d.
+  ! Mirrors the reference RK call pattern (time_integration.f90 always passes
+  ! the current U,V,W on the RK2/RK3 paths).
+  !----------------------------------------------------------------------------
+  subroutine compute_rhs(stage)
+
+    integer, intent(in) :: stage
+
+    select case (stage)
+    case (1)
+       call compute_rhs_u(U_d, V_d, W_d, Fu1_d)
+       call compute_rhs_v(U_d, V_d, W_d, Fv1_d)
+       call compute_rhs_w(U_d, V_d, W_d, Fw1_d)
+    case (2)
+       call compute_rhs_u(U_d, V_d, W_d, Fu2_d)
+       call compute_rhs_v(U_d, V_d, W_d, Fv2_d)
+       call compute_rhs_w(U_d, V_d, W_d, Fw2_d)
+    case (3)
+       if (itime_step /= 3) then
+          write(*,*) 'compute_rhs: stage 3 requested but itime_step /= 3'
+          error stop 1
+       end if
+       call compute_rhs_u(U_d, V_d, W_d, Fu3_d)
+       call compute_rhs_v(U_d, V_d, W_d, Fv3_d)
+       call compute_rhs_w(U_d, V_d, W_d, Fw3_d)
+    case default
+       write(*,*) 'compute_rhs: invalid stage ', stage
+       error stop 1
+    end select
+
+  end subroutine compute_rhs
+
+  !----------------------------------------------------------------------------
+  ! check_dns_only — safety net: the fused kernels implement only the DNS
+  ! (LES_model == 0), non-rotating (|Omega_z| <= 1e-6, the reference's
+  ! rotation threshold) branch of equations.f90.
+  !----------------------------------------------------------------------------
+  subroutine check_dns_only()
+
+    if (LES_model /= 0) then
+       write(*,*) 'rhs_kernels: LES branch not ported (LES_model /= 0)'
+       error stop 1
+    end if
+    if (abs(Omega_z) > 1.0e-6_dp) then
+       write(*,*) 'rhs_kernels: rotation branch not ported (Omega_z /= 0)'
+       error stop 1
+    end if
+
+  end subroutine check_dns_only
+
+  !----------------------------------------------------------------------------
+  ! debug_check — abort with the kernel name if the last launch failed.
+  ! Active only under -DDEBUG_KERNELS.
+  !----------------------------------------------------------------------------
+  subroutine debug_check(name)
+
+    character(*), intent(in) :: name
+#ifdef DEBUG_KERNELS
+    integer :: istat
+    istat = cudaGetLastError()
+    if (istat /= cudaSuccess) then
+       write(*,*) 'kernel launch failed: ', name, ' : ', &
+                  cudaGetErrorString(istat)
+       error stop 1
+    end if
+#endif
+
+  end subroutine debug_check
+
+  !===========================================================================
+  ! fused kernels
+  !===========================================================================
+
+  !----------------------------------------------------------------------------
+  ! rhs_u_fused — full u-momentum RHS in one pass (equations.f90 DNS branch,
+  ! conv 47-67 then visc 76-94, statement order preserved on a register
+  ! accumulator; dummy plane 149-154 folded in as the i == nx-1 branch):
+  !   r  = -du^2/dx
+  !   r -=  duv/dy
+  !   r -=  duw/dz
+  !   r +=  dPdx + nu*Laplacian(u)
+  !   rhs_u = r        (or 0 on the dummy last x-plane)
+  !----------------------------------------------------------------------------
+  attributes(global) subroutine rhs_u_fused(U_, V_, W_, rhs_u,            &
+                                            x, xg, y, yg, z, zg,          &
+                                            weight_y_0, weight_y_1,       &
+                                            nu, dPdx,                     &
+                                            nx, ny, nz, nxg, nyg, nzg)
+
+    integer, value :: nx, ny, nz, nxg, nyg, nzg
+    real(dp), value :: nu, dPdx
+    real(dp), intent(in)  :: U_(nx,  nyg, nzg)
+    real(dp), intent(in)  :: V_(nxg, ny,  nzg)
+    real(dp), intent(in)  :: W_(nxg, nyg, nz )
+    real(dp), intent(out) :: rhs_u(2:nx-1, 2:nyg-1, 2:nzg-1)
+    real(dp), intent(in)  :: x(nx), xg(nxg), y(ny), yg(nyg), z(nz), zg(nzg)
+    real(dp), intent(in)  :: weight_y_0(ny), weight_y_1(ny)
+
+    integer  :: i, j, k
+    real(dp) :: r, dx_1, dx_2, dx_3, dy_3, dz_1, dz_2, dz_3
+
+    i = 2 + (blockIdx%x - 1)*blockDim%x + threadIdx%x - 1
+    j = 2 + (blockIdx%y - 1)*blockDim%y + threadIdx%y - 1
+    k = 2 + (blockIdx%z - 1)*blockDim%z + threadIdx%z - 1
+    if (i > nx-1 .or. j > nyg-1 .or. k > nzg-1) return
+
+    ! dummy last x-plane (outflow duplicates plane nx-1; RHS never used)
+    if (i == nx-1) then
+       rhs_u(i,j,k) = 0.0_dp
+       return
+    end if
+
+    ! 1) -du^2/dx (interp_x faces->centers = simple average)
+    r = -( (0.5_dp*(U_(i,j,k)+U_(i+1,j,k)))**2 &
+          - (0.5_dp*(U_(i-1,j,k)+U_(i,j,k)))**2 ) / (xg(i+1)-xg(i))
+    ! 2) -duv/dy (interp_y centers->faces = weighted, interp_x centers->faces)
+    r = r &
+       - ( (weight_y_0(j)*U_(i,j,k)+weight_y_1(j)*U_(i,j+1,k)) &
+           * 0.5_dp*(V_(i,j,k)+V_(i+1,j,k)) &
+         - (weight_y_0(j-1)*U_(i,j-1,k)+weight_y_1(j-1)*U_(i,j,k)) &
+           * 0.5_dp*(V_(i,j-1,k)+V_(i+1,j-1,k)) ) / (y(j)-y(j-1))
+    ! 3) -duw/dz (interp_z centers->faces = simple avg, interp_x centers->faces)
+    r = r &
+       - ( 0.5_dp*(U_(i,j,k)+U_(i,j,k+1)) * 0.5_dp*(W_(i,j,k)+W_(i+1,j,k)) &
+         - 0.5_dp*(U_(i,j,k-1)+U_(i,j,k)) * 0.5_dp*(W_(i,j,k-1)+W_(i+1,j,k-1)) ) / (z(k)-z(k-1))
+
+    ! 4) viscous + imposed pressure gradient (conservative staggered Laplacian)
+    dx_1 = x(i) - x(i-1)
+    dx_2 = x(i+1) - x(i)
+    dx_3 = xg(i+1) - xg(i)
+    dy_3 = y(j) - y(j-1)
+    dz_1 = zg(k) - zg(k-1)
+    dz_2 = zg(k+1) - zg(k)
+    dz_3 = z(k) - z(k-1)
+    r = r + dPdx + nu * ( &
+       (1.0_dp/dx_2*(U_(i+1,j,k)-U_(i,j,k)) - 1.0_dp/dx_1*(U_(i,j,k)-U_(i-1,j,k)))/dx_3 + &
+       ((U_(i,j+1,k)-U_(i,j,k))/(yg(j+1)-yg(j)) - (U_(i,j,k)-U_(i,j-1,k))/(yg(j)-yg(j-1)))/dy_3 + &
+       (1.0_dp/dz_2*(U_(i,j,k+1)-U_(i,j,k)) - 1.0_dp/dz_1*(U_(i,j,k)-U_(i,j,k-1)))/dz_3 )
+
+    rhs_u(i,j,k) = r
+
+  end subroutine rhs_u_fused
+
+  !----------------------------------------------------------------------------
+  ! rhs_v_fused — full v-momentum RHS in one pass (equations.f90 DNS branch,
+  ! conv 183-204 then visc 208-230, statement order preserved; dummy plane
+  ! 287-292 folded in as the i == nxg-1 branch). No imposed pressure gradient
+  ! in the v equation.
+  !----------------------------------------------------------------------------
+  attributes(global) subroutine rhs_v_fused(U_, V_, W_, rhs_v,            &
+                                            x, xg, y, yg, z, zg,          &
+                                            weight_y_0, weight_y_1,       &
+                                            nu,                           &
+                                            nx, ny, nz, nxg, nyg, nzg)
+
+    integer, value :: nx, ny, nz, nxg, nyg, nzg
+    real(dp), value :: nu
+    real(dp), intent(in)  :: U_(nx,  nyg, nzg)
+    real(dp), intent(in)  :: V_(nxg, ny,  nzg)
+    real(dp), intent(in)  :: W_(nxg, nyg, nz )
+    real(dp), intent(out) :: rhs_v(2:nxg-1, 2:ny-1, 2:nzg-1)
+    real(dp), intent(in)  :: x(nx), xg(nxg), y(ny), yg(nyg), z(nz), zg(nzg)
+    real(dp), intent(in)  :: weight_y_0(ny), weight_y_1(ny)
+
+    integer  :: i, j, k
+    real(dp) :: r, dx_1, dx_2, dx_3, dy_1, dy_2, dy_3, dz_1, dz_2, dz_3
+
+    i = 2 + (blockIdx%x - 1)*blockDim%x + threadIdx%x - 1
+    j = 2 + (blockIdx%y - 1)*blockDim%y + threadIdx%y - 1
+    k = 2 + (blockIdx%z - 1)*blockDim%z + threadIdx%z - 1
+    if (i > nxg-1 .or. j > ny-1 .or. k > nzg-1) return
+
+    if (i == nxg-1) then
+       rhs_v(i,j,k) = 0.0_dp
+       return
+    end if
+
+    ! 1) -dv^2/dy (interp_y faces->centers = 0.5 average)
+    r = -( (0.5_dp*(V_(i,j,k)+V_(i,j+1,k)))**2 &
+          - (0.5_dp*(V_(i,j-1,k)+V_(i,j,k)))**2 ) / (yg(j+1)-yg(j))
+    ! 2) -duv/dx (interp_y centers->faces=weighted, interp_x centers->faces=0.5avg)
+    r = r &
+       - ( (weight_y_0(j)*U_(i,j,k)+weight_y_1(j)*U_(i,j+1,k)) &
+           * 0.5_dp*(V_(i,j,k)+V_(i+1,j,k)) &
+         - (weight_y_0(j)*U_(i-1,j,k)+weight_y_1(j)*U_(i-1,j+1,k)) &
+           * 0.5_dp*(V_(i-1,j,k)+V_(i,j,k)) ) / (x(i)-x(i-1))
+    ! 3) -dvw/dz (interp_z centers->faces=0.5avg, interp_y centers->faces=weighted)
+    r = r &
+       - ( 0.5_dp*(V_(i,j,k)+V_(i,j,k+1)) &
+           * (weight_y_0(j)*W_(i,j,k)+weight_y_1(j)*W_(i,j+1,k)) &
+         - 0.5_dp*(V_(i,j,k-1)+V_(i,j,k)) &
+           * (weight_y_0(j)*W_(i,j,k-1)+weight_y_1(j)*W_(i,j+1,k-1)) ) / (z(k)-z(k-1))
+
+    ! 4) viscous
+    dx_1 = xg(i) - xg(i-1)
+    dx_2 = xg(i+1) - xg(i)
+    dx_3 = x(i) - x(i-1)
+    dy_1 = y(j) - y(j-1)
+    dy_2 = y(j+1) - y(j)
+    dy_3 = yg(j+1) - yg(j)
+    dz_1 = zg(k) - zg(k-1)
+    dz_2 = zg(k+1) - zg(k)
+    dz_3 = z(k) - z(k-1)
+    r = r + nu * ( &
+       (1.0_dp/dx_2*(V_(i+1,j,k)-V_(i,j,k)) - 1.0_dp/dx_1*(V_(i,j,k)-V_(i-1,j,k)))/dx_3 + &
+       (1.0_dp/dy_2*(V_(i,j+1,k)-V_(i,j,k)) - 1.0_dp/dy_1*(V_(i,j,k)-V_(i,j-1,k)))/dy_3 + &
+       (1.0_dp/dz_2*(V_(i,j,k+1)-V_(i,j,k)) - 1.0_dp/dz_1*(V_(i,j,k)-V_(i,j,k-1)))/dz_3 )
+
+    rhs_v(i,j,k) = r
+
+  end subroutine rhs_v_fused
+
+  !----------------------------------------------------------------------------
+  ! rhs_w_fused — full w-momentum RHS in one pass (equations.f90 DNS branch,
+  ! conv 323-342 then visc 346-366, statement order preserved; dummy plane
+  ! 408-413 folded in as the i == nxg-1 branch).
+  !----------------------------------------------------------------------------
+  attributes(global) subroutine rhs_w_fused(U_, V_, W_, rhs_w,            &
+                                            x, xg, y, yg, z, zg,          &
+                                            weight_y_0, weight_y_1,       &
+                                            nu, dPdz,                     &
+                                            nx, ny, nz, nxg, nyg, nzg)
+
+    integer, value :: nx, ny, nz, nxg, nyg, nzg
+    real(dp), value :: nu, dPdz
+    real(dp), intent(in)  :: U_(nx,  nyg, nzg)
+    real(dp), intent(in)  :: V_(nxg, ny,  nzg)
+    real(dp), intent(in)  :: W_(nxg, nyg, nz )
+    real(dp), intent(out) :: rhs_w(2:nxg-1, 2:nyg-1, 2:nz-1)
+    real(dp), intent(in)  :: x(nx), xg(nxg), y(ny), yg(nyg), z(nz), zg(nzg)
+    real(dp), intent(in)  :: weight_y_0(ny), weight_y_1(ny)
+
+    integer  :: i, j, k
+    real(dp) :: r, dx_1, dx_2, dx_3, dy_3, dz_1, dz_2, dz_3
+
+    i = 2 + (blockIdx%x - 1)*blockDim%x + threadIdx%x - 1
+    j = 2 + (blockIdx%y - 1)*blockDim%y + threadIdx%y - 1
+    k = 2 + (blockIdx%z - 1)*blockDim%z + threadIdx%z - 1
+    if (i > nxg-1 .or. j > nyg-1 .or. k > nz-1) return
+
+    if (i == nxg-1) then
+       rhs_w(i,j,k) = 0.0_dp
+       return
+    end if
+
+    ! 1) -dw^2/dz (interp_z faces->centers = 0.5 average)
+    r = -( (0.5_dp*(W_(i,j,k)+W_(i,j,k+1)))**2 &
+          - (0.5_dp*(W_(i,j,k-1)+W_(i,j,k)))**2 ) / (zg(k+1)-zg(k))
+    ! 2) -duw/dx (interp_z centers->faces=0.5avg, interp_x centers->faces=0.5avg)
+    r = r &
+       - ( 0.5_dp*(U_(i,j,k)+U_(i,j,k+1)) * 0.5_dp*(W_(i,j,k)+W_(i+1,j,k)) &
+         - 0.5_dp*(U_(i-1,j,k)+U_(i-1,j,k+1)) * 0.5_dp*(W_(i-1,j,k)+W_(i,j,k)) ) / (x(i)-x(i-1))
+    ! 3) -dvw/dy (interp_z centers->faces=0.5avg, interp_y centers->faces=weighted)
+    r = r &
+       - ( 0.5_dp*(V_(i,j,k)+V_(i,j,k+1)) &
+           * (weight_y_0(j)*W_(i,j,k)+weight_y_1(j)*W_(i,j+1,k)) &
+         - 0.5_dp*(V_(i,j-1,k)+V_(i,j-1,k+1)) &
+           * (weight_y_0(j-1)*W_(i,j-1,k)+weight_y_1(j-1)*W_(i,j,k)) ) / (y(j)-y(j-1))
+
+    ! 4) viscous + imposed spanwise pressure gradient
+    dx_1 = xg(i) - xg(i-1)
+    dx_2 = xg(i+1) - xg(i)
+    dx_3 = x(i) - x(i-1)
+    dy_3 = y(j) - y(j-1)
+    dz_1 = z(k) - z(k-1)
+    dz_2 = z(k+1) - z(k)
+    dz_3 = zg(k+1) - zg(k)
+    r = r + dPdz + nu * ( &
+       (1.0_dp/dx_2*(W_(i+1,j,k)-W_(i,j,k)) - 1.0_dp/dx_1*(W_(i,j,k)-W_(i-1,j,k)))/dx_3 + &
+       ((W_(i,j+1,k)-W_(i,j,k))/(yg(j+1)-yg(j)) - (W_(i,j,k)-W_(i,j-1,k))/(yg(j)-yg(j-1)))/dy_3 + &
+       (1.0_dp/dz_2*(W_(i,j,k+1)-W_(i,j,k)) - 1.0_dp/dz_1*(W_(i,j,k)-W_(i,j,k-1)))/dz_3 )
+
+    rhs_w(i,j,k) = r
+
+  end subroutine rhs_w_fused
+
+end module rhs_kernels
