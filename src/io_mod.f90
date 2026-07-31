@@ -65,7 +65,10 @@ module io_mod
                              filein, fileout,                                  &
                              nx_global, ny_global, nz_global,                  &
                              nxm_global, nym_global, nzm_global,               &
-                             nzg_global
+                             nzg_global,                                       &
+                             boxout_every, boxout_start, n_boxout,             &
+                             dir_boxout, boxout_i0, boxout_i1, boxout_is,      &
+                             boxout_jmax
   use grid_mod,        only: nx, ny, nz, nxg, nyg, nzg,                        &
                              x, y, z, xm, ym, zm, yg,                          &
                              weight_y_0, weight_y_1
@@ -94,6 +97,9 @@ module io_mod
                              !   integer, intent(in) :: istep
                              !   gated on mod(istep,nmonitor)==0 .or. istep==1:
                              !   print the monitor block (verbatim formats)
+  public :: output_boxes     ! subroutine output_boxes(istep)
+                             !   subvolume float32 dumps for causal-analysis
+                             !   campaigns (self-gated on the ABSOLUTE step)
   public :: write_restart    ! subroutine write_restart()
                              !   recreate the fileout.restart symlink pointing
                              !   at the last snapshot written (no-op before the
@@ -332,34 +338,114 @@ contains
   ! ('call system' replaced by execute_command_line). No-op until the first
   ! snapshot exists.
   !
-  ! NOTE (reference behavior, reproduced deliberately): the link target is
-  ! the snapshot path as written (e.g. 'data/BL_laminar.00000500'), relative
-  ! to the run directory, NOT to the link's own directory — exactly what the
-  ! reference creates. Restart runs point 'filein' at the snapshot itself
-  ! (or at the .restart link when fileout has no directory prefix).
+  ! The link lives in the same directory as the snapshot, so the target must
+  ! be the snapshot BASENAME (a cwd-relative path would dangle from that
+  ! directory). 'ln -sf' overwrites so the link always tracks the newest
+  ! file. (Bug fix imported from the tbl-gpu working tree.)
   !---------------------------------------------------------------------------
   subroutine write_restart()
 
     character(200) :: fname_symlnk
     character(400) :: string_link
-    logical        :: exists
 
     if (.not. have_snapshot) return
 
     fname_symlnk = trim(adjustl(fileout))//'.'//'restart'
 
-    ! check if symlink exists (inquire follows the link, as in the reference)
-    inquire(file=fname_symlnk, exist=exists)
-
-    if (exists) then
-      call execute_command_line( 'rm '//trim(fname_symlnk) )
-    end if
-
-    string_link = 'ln -s '//trim(adjustl(last_snapshot_fname))//' '// &
-                  trim(fname_symlnk)
+    string_link = 'ln -sf '// &
+         trim(adjustl(last_snapshot_fname( &
+              index(last_snapshot_fname, '/', back=.true.)+1: )))// &
+         ' '//trim(fname_symlnk)
     call execute_command_line( string_link )
 
   end subroutine write_restart
+
+  !---------------------------------------------------------------------------
+  ! output_boxes — subvolume ("box") output for causal-analysis campaigns.
+  ! Verbatim port of legacy/input_output.f90 output_boxes (tbl-gpu working
+  ! tree). Every boxout_every steps (gated on the ABSOLUTE step so the
+  ! cadence survives chain restarts), writes u,v,w as float32 on up to 8
+  ! index-window boxes to per-launch stream files:
+  !     <dir_boxout>/box<b>_<first-abs-step>.bin
+  ! File: int32 header (magic 20260709, version, id, i0, i1, is, jmax,
+  ! npx, npy, npz, every, ncomp) + f8 x(sel), y(1:jmax), z(1:NKB), then per
+  ! record: f8 t, int32 absstep, r4 u,v,w (npx, jmax, NKB). Components stay
+  ! on their native staggered grids over the same index window.
+  !---------------------------------------------------------------------------
+  subroutine output_boxes(istep)
+
+    integer, intent(in) :: istep
+
+    integer, parameter :: NKB = 256          ! z planes saved (one period)
+    integer :: b, i, j, k, ii, absstep, npx, jm
+    character(300) :: fname
+    character(8)   :: ext
+    integer,       save :: box_unit(8) = -1
+    logical,       save :: box_open(8) = .false.
+    logical,       save :: checked = .false.
+    real(4), allocatable, save :: rbuf(:,:,:,:)
+
+    if ( boxout_every <= 0 .or. n_boxout <= 0 ) return
+    absstep = istep + nstep_init
+    if ( absstep < boxout_start ) return
+    if ( mod(absstep, boxout_every) /= 0 ) return
+
+    if (.not. io_initialized) call io_init()
+
+    if ( .not. checked ) then
+       ii = 0; j = 0
+       do b = 1, n_boxout
+          if ( boxout_i1(b) > nx .or. boxout_jmax(b) > ny .or. NKB > nz ) &
+               stop 'ERROR: boxout window exceeds grid'
+          if ( boxout_is(b) < 1 .or. boxout_i0(b) < 1 ) stop 'ERROR: bad boxout spec'
+          ii = max( ii, (boxout_i1(b)-boxout_i0(b))/boxout_is(b) + 1 )
+          j  = max( j, boxout_jmax(b) )
+       end do
+       allocate( rbuf(ii, j, NKB, 3) )   ! sized once to the largest box
+       checked = .true.
+    end if
+
+    ! fresh fields on the host (shared with stats/monitor/snapshot)
+    call refresh_host_fields(istep)
+
+    do b = 1, n_boxout
+       npx = (boxout_i1(b) - boxout_i0(b))/boxout_is(b) + 1
+       jm  = boxout_jmax(b)
+
+       if ( .not. box_open(b) ) then
+          write(ext,'(I0.8)') absstep
+          fname = trim(dir_boxout)//'/box'//char(48+b)//'_'//ext//'.bin'
+          open(newunit=box_unit(b), file=trim(fname), access='stream', &
+               form='unformatted', action='write', status='replace')
+          write(box_unit(b)) 20260709, 1, b, boxout_i0(b), boxout_i1(b), &
+                             boxout_is(b), jm, npx, jm, NKB, boxout_every, 3
+          write(box_unit(b)) x(boxout_i0(b):boxout_i1(b):boxout_is(b))
+          write(box_unit(b)) y(1:jm)
+          write(box_unit(b)) z(1:NKB)
+          box_open(b) = .true.
+          write(*,'(a,i2,a,a)') '   boxout: opened box ', b, ' -> ', trim(fname)
+       end if
+
+       do k = 1, NKB
+          do j = 1, jm
+             ii = 0
+             do i = boxout_i0(b), boxout_i1(b), boxout_is(b)
+                ii = ii + 1
+                rbuf(ii,j,k,1) = real( U(i,j,k), 4 )
+                rbuf(ii,j,k,2) = real( V(i,j,k), 4 )
+                rbuf(ii,j,k,3) = real( W(i,j,k), 4 )
+             end do
+          end do
+       end do
+
+       write(box_unit(b)) t, absstep
+       write(box_unit(b)) rbuf(1:npx,1:jm,1:NKB,1)
+       write(box_unit(b)) rbuf(1:npx,1:jm,1:NKB,2)
+       write(box_unit(b)) rbuf(1:npx,1:jm,1:NKB,3)
+       flush(box_unit(b))
+    end do
+
+  end subroutine output_boxes
 
   !---------------------------------------------------------------------------
   ! read_restart — read a binary snapshot (grids, U, V, W, time, init step)

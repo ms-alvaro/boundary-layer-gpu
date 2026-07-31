@@ -11,7 +11,8 @@
 program boundary_layer_cuda
 
   use param_mod,     only: read_input_parameters, check_supported,           &
-                           print_banner, param_summary, nsteps, random_init
+                           print_banner, param_summary, nsteps, random_init, &
+                           inflow_boundary_flag
   use grid_mod,      only: grid_generate, grid_to_device
   use field_mod,     only: fields_allocate, fields_to_device
   use ic_inflow_mod, only: generate_initial_condition,                       &
@@ -21,8 +22,10 @@ program boundary_layer_cuda
   use timestep_mod,  only: timestep_init, advance_one_step, t
   use bc_kernels,    only: bc_finalize
   use reductions,    only: reductions_finalize
+  use hit_inflow_mod, only: init_hit_inflow
   use io_mod,        only: io_init, read_restart,                            &
-                           output_stats, output_monitor, output_snapshot
+                           output_stats, output_monitor, output_snapshot,    &
+                           output_boxes
 
   implicit none
   integer :: istep
@@ -47,6 +50,10 @@ program boundary_layer_cuda
   call compute_blasius_solution_for_bc()  ! inlet/top profiles + mode tables
   call inflow_tables_to_device()
 
+  if (inflow_boundary_flag == 6) then
+     call init_hit_inflow()               ! HIT plane library (reads header,
+  end if                                  ! loads + uploads the first buffer)
+
   call poisson_init()                     ! operators, Thomas LU, cuFFT plans
   call timestep_init()                    ! RK tableaus, CFL spacing vectors
   call io_init()                          ! statistics arrays, wall clock
@@ -59,6 +66,7 @@ program boundary_layer_cuda
      call output_stats(istep)             ! self-gated: nstats or istep==1
      call output_monitor(istep)           ! self-gated: nmonitor
      call output_snapshot(istep)          ! self-gated: nsave (+ .restart link)
+     call output_boxes(istep)             ! self-gated: causal-campaign boxes
   end do
 
   ! ---- shutdown ----

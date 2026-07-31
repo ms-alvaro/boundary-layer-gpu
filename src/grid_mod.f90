@@ -34,7 +34,7 @@
 module grid_mod
 
   use precision_mod, only: dp
-  use param_mod,     only: nx_global, ny_global, nz_global, &
+  use param_mod,     only: nx_global, ny_global, nz_global, file_ygrid, &
                            Lx_rand, Ly_rand, Lz_rand, alpha_rand
   use cudafor
 
@@ -138,19 +138,26 @@ contains
     end do
     z = z/z(nz-1)*Lz_rand
 
-    ! ymesh: normalized coordinate stretched with sinh, then rescaled to Ly.
-    ! Note: delta99/x0 = 4.91/sqrt(Rex0) = 0.0155 for Rex0 = 1e5
-    do i = 1, ny
-       y(i) = real(i-1, dp)
-    end do
-    y = y - y(1)
-    y = y/maxval(y)
-    alpha = alpha_rand
-    do i = 1, ny
-       y(i) = sinh(alpha*y(i))/sinh(alpha)
-    end do
-    y = y - y(1)
-    y = y/maxval(y)*Ly_rand
+    ! ymesh: either read from a file ('ygrid_file', e.g. a blended-sinh grid
+    ! for HIT freestream resolution, inflow_flag=6 campaigns) or generated as
+    ! a sinh-stretched coordinate rescaled to Ly (the reference default).
+    ! (Port of the tbl-gpu init_flow branch, legacy/input_output.f90.)
+    if ( len_trim(file_ygrid) > 0 ) then
+       call read_ygrid_from_file()
+    else
+       ! Note: delta99/x0 = 4.91/sqrt(Rex0) = 0.0155 for Rex0 = 1e5
+       do i = 1, ny
+          y(i) = real(i-1, dp)
+       end do
+       y = y - y(1)
+       y = y/maxval(y)
+       alpha = alpha_rand
+       do i = 1, ny
+          y(i) = sinh(alpha*y(i))/sinh(alpha)
+       end do
+       y = y - y(1)
+       y = y/maxval(y)*Ly_rand
+    end if
 
     !------------------ center grids (initialization.f90:181-194) -------------
     do i = 1, nxm
@@ -213,6 +220,41 @@ contains
   ! Assignments of host arrays to device allocatables perform synchronous
   ! host-to-device copies (CUDA Fortran semantics).
   !----------------------------------------------------------------------------
+  !----------------------------------------------------------------------------
+  ! read_ygrid_from_file — custom wall-normal face grid from an ASCII file:
+  ! one value per line, blank lines and lines starting with '#' skipped
+  ! (port of legacy/input_output.f90 read_ygrid_from_file, verbatim behavior).
+  !----------------------------------------------------------------------------
+  subroutine read_ygrid_from_file()
+
+    integer            :: j, ios, unit_y
+    character(len=256) :: line
+
+    write(*,*) '   Reading y-grid from: ', trim(file_ygrid)
+
+    open(newunit=unit_y, file=trim(file_ygrid), form='formatted', &
+         action='read', status='old')
+    j = 0
+    do while ( j < ny )
+       read(unit_y, '(a)', iostat=ios) line
+       if ( ios /= 0 ) exit
+       line = adjustl(line)
+       if ( len_trim(line) == 0 .or. line(1:1) == '#' ) cycle
+       j = j + 1
+       read(line, *) y(j)
+    end do
+    close(unit_y)
+
+    if ( j /= ny ) then
+       write(*,*) 'ERROR: ygrid_file has ', j, ' values, need ny_global=', ny
+       stop 'ygrid_file size mismatch'
+    end if
+
+    write(*,*) '   y-grid: [', y(1), ',', y(ny), ']'
+    write(*,*) '   dy_wall = ', y(2)-y(1), ' dy_top = ', y(ny)-y(ny-1)
+
+  end subroutine read_ygrid_from_file
+
   subroutine grid_to_device()
 
     if (.not. allocated(x_d)) then

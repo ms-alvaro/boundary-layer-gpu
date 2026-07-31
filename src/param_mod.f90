@@ -72,6 +72,9 @@ module param_mod
 
   ! files
   public :: filein, fileout, file_inflow, file_temporal_inlet
+  public :: file_hit_planes, N_buffer_hit, file_ygrid
+  public :: boxout_every, boxout_start, n_boxout, dir_boxout
+  public :: boxout_i0, boxout_i1, boxout_is, boxout_jmax
 
   ! boundary conditions
   public :: inflow_boundary_flag, top_boundary_flag
@@ -138,6 +141,24 @@ module param_mod
   character(200) :: filein  = ' '            !< input flow field (restart)
   character(200) :: fileout = ' '            !< output flow-field prefix
   character(200) :: file_inflow = ' '        !< Blasius / mean-profile file
+  ! HIT plane inflow (inflow_flag=6): time-resolved y-z planes from a
+  ! precursor HIT simulation, preprocessed by preprocess_planes.py (v2).
+  ! (tbl-gpu working tree / legacy global.f90+params.f90 additions.)
+  character(200) :: file_hit_planes = ' ' !< binary planes file ('hit_file')
+  integer        :: N_buffer_hit = 1000   !< planes held on the GPU
+  character(200) :: file_ygrid = ' '      !< optional wall-normal grid file
+
+  ! Subvolume ("box") output for causal-analysis data campaigns: up to 8
+  ! boxes of u,v,w saved as float32 every boxout_every steps (absolute-step
+  ! gated so the cadence is continuous across chain restarts).
+  integer        :: boxout_every = 0      !< steps between box dumps (0 = off)
+  integer        :: boxout_start = 0      !< absolute step to begin output
+  integer        :: n_boxout = 0          !< number of boxes (<= 8)
+  character(200) :: dir_boxout = './boxout' !< output directory (must exist)
+  integer        :: boxout_i0(8) = 0, boxout_i1(8) = 0 !< x-index window
+  integer        :: boxout_is(8) = 0      !< x-index stride
+  integer        :: boxout_jmax(8) = 0    !< y-index cap (1..jmax)
+
   character(200) :: file_temporal_inlet = ' '!< temporal inflow modes file;
                                              !! '**TO DO**' placeholder means
                                              !! "none" (pure Blasius inflow)
@@ -334,6 +355,36 @@ contains
 
     call get_str('timeinflow_file', file_temporal_inlet, f)
 
+    ! HIT plane inflow (inflow_flag=6)
+    call get_str('hit_file'     , file_hit_planes , f)
+    if (.not. f) file_hit_planes = ''
+    call get_int('N_buffer_hit' , N_buffer_hit    , f)
+    if (.not. f) N_buffer_hit = 1000
+    ! optional wall-normal grid from file (blended-sinh)
+    call get_str('ygrid_file'   , file_ygrid      , f)
+    if (.not. f) file_ygrid = ''
+
+    ! subvolume (box) output for causal-analysis campaigns
+    call get_int('boxout_every' , boxout_every    , f)
+    if (.not. f) boxout_every = 0
+    call get_int('boxout_start' , boxout_start    , f)
+    if (.not. f) boxout_start = 0
+    call get_int('boxout_n'     , n_boxout        , f)
+    if (.not. f) n_boxout = 0
+    call get_str('boxout_dir'   , dir_boxout      , f)
+    if (.not. f) dir_boxout = './boxout'
+    if (n_boxout > 8) stop ' ERROR: boxout_n > 8'
+    if (n_boxout > 0) then
+       call get_int_arr('boxout_i0'  , boxout_i0  , n_boxout, f)
+       if (.not. f) stop ' ERROR: boxout_n>0 needs boxout_i0'
+       call get_int_arr('boxout_i1'  , boxout_i1  , n_boxout, f)
+       if (.not. f) stop ' ERROR: boxout_n>0 needs boxout_i1'
+       call get_int_arr('boxout_is'  , boxout_is  , n_boxout, f)
+       if (.not. f) stop ' ERROR: boxout_n>0 needs boxout_is'
+       call get_int_arr('boxout_jmax', boxout_jmax, n_boxout, f)
+       if (.not. f) stop ' ERROR: boxout_n>0 needs boxout_jmax'
+    end if
+
     call get_int('RKscheme'     , itime_step      , f)
 
     call get_dbl_arr('alphas'   , alphas, ndim+2  , f)
@@ -413,15 +464,21 @@ contains
       stop 'unsupported feature: wall-stress model'
     end if
 
-    if (inflow_boundary_flag /= 1) then
+    if (inflow_boundary_flag /= 1 .and. inflow_boundary_flag /= 6) then
       write(*,*) 'ERROR: inflow_flag = ', inflow_boundary_flag, &
-                 ' requested, but only inflow_flag = 1 (Blasius + temporal modes) is ported.'
+                 ' requested, but only inflow_flag = 1 (Blasius + temporal modes)', &
+                 ' and 6 (Blasius + HIT planes) are ported.'
       stop 'unsupported feature: inflow boundary condition'
     end if
+    if (inflow_boundary_flag == 6 .and. len_trim(file_hit_planes) == 0) then
+      write(*,*) 'ERROR: inflow_flag = 6 requires hit_file in the input.'
+      stop 'missing hit_file'
+    end if
 
-    if (top_boundary_flag /= 0) then
+    if (top_boundary_flag /= 0 .and. top_boundary_flag /= 4) then
       write(*,*) 'ERROR: top_flag = ', top_boundary_flag, &
-                 ' requested, but only top_flag = 0 (imposed velocity) is ported.'
+                 ' requested, but only top_flag = 0 (imposed velocity)', &
+                 ' and 4 (zero-shear tangential) are ported.'
       stop 'unsupported feature: top boundary condition'
     end if
 
