@@ -61,9 +61,13 @@ slow large-prime path).
 ```bash
 cd src && make          # -> ./boundary_layer_cuda at the repo root
 mpirun -np 1 ./boundary_layer_cuda -i laminar_test/laminar.turbb
-# multi-GPU (P5.1, experimental): correctness-validated, but slower than
-# one rank until the distributed Poisson (P5.2) lands — see docs:
-CUDA_VISIBLE_DEVICES=0,1 mpirun -np 2 ./boundary_layer_cuda -i case.turbb
+# multi-GPU (P5.2, experimental): correctness-validated (fields match
+# single-rank to 9e-15); buys grid CAPACITY beyond one card's 40 GB —
+# see docs/MULTI_GPU_DESIGN.md for honest performance notes. Use the
+# UCX CUDA transports:
+CUDA_VISIBLE_DEVICES=0,1 mpirun -np 2 --mca pml ucx \
+  -x UCX_TLS=self,sm,cuda_copy,cuda_ipc -x UCX_MEMTYPE_CACHE=n \
+  ./boundary_layer_cuda -i case.turbb
 ```
 
 (Launch through `mpirun` from the NVHPC `comm_libs` — OpenMPI singleton

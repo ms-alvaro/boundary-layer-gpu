@@ -1,5 +1,24 @@
 # Multi-GPU design (Phase 5 proposal — not yet implemented)
 
+Status update 2: **P5.2 implemented and validated** (2026-07-31): the
+distributed transpose Poisson is in (no gather; every rank x-FFTs its own
+z-slab, all-to-alls the REAL DCT coefficients — half the bytes — to x-mode
+slabs, runs z-FFT + its Thomas-factor slice locally, and transposes back).
+2-rank transition fields identical to single-rank (8.7e-15). The P5.1
+gathered path remains as a fallback via BL_POISSON_GATHER=1.
+
+Measured 2-rank timing on the transition grid (6.7M cells): 15 ms/step vs
+10 single-rank — i.e. **no speedup at P = 2 on PCIe at this size**, and
+UCX CUDA-IPC transports are REQUIRED to get even that (26.8 ms/step with
+the default ob1 transports; launch with
+`--mca pml ucx -x UCX_TLS=self,sm,cuda_copy,cuda_ipc -x UCX_MEMTYPE_CACHE=n`).
+The honest position: on tifa's PCIe-only A100s, multi-GPU buys CAPACITY
+(grids beyond one card's 40 GB, e.g. the 270M-cell fst_tbl_ctr config on
+4 ranks) rather than turnaround at test sizes; the compute does scale
+(RHS halves per rank), so larger per-rank grids and NVLink-class hardware
+both improve the ratio. Next levers if speed at small P matters: NCCL
+all-to-all, packed halo messages, comm/compute overlap.
+
 Status: **P5.1 implemented and validated** (2026-07-31): z-slab
 decomposition, device-direct halo/periodic exchanges, distributed
 RHS/advance/BCs and mass conservation, Poisson via rank-0 gather at global
