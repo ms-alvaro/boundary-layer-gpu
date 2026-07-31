@@ -1,0 +1,62 @@
+! Performance benchmark case: production-sized DNS grid, laminar Blasius
+! inflow (no temporal modes), short run for timing only.
+! Grid and domain identical to transition_test; physics is a developing
+! laminar BL, which is irrelevant here — this case exists to measure
+! ns/cell/step at a size where kernels (not launch latency) dominate.
+
+! Grid: nx=813, ny=125, nz=66 (6.7M cells)
+nxyz = 814 125 66
+
+! Fixed time step (negative CFL = fixed dt)
+CFL = -4e-5
+
+nu = 1e-5
+
+! Time integration: RK2
+RKscheme = 2
+
+! DNS, no wall model
+LES = 0
+WM = 0
+
+dPdx = 0.0
+dPdz = 0.0
+
+! Top BC: impose velocity (Blasius)
+top_flag = 0
+
+Vmax = 0.0
+x0 = 0.0
+sigma = 1.0
+phi = 0.0
+
+! nsteps is overridden by the harness (--nsteps); monitor every 50 steps
+! gives the per-interval clock used for timing. No snapshots/stats writes
+! inside the timed window.
+nsteps   = 500
+nsave    = 100000
+nstats   = 100000
+nmonitor = 50
+
+! Blasius IC
+init_rand = 1
+
+! Domain: Lx=2.0, Ly=0.41, Lz=0.1083
+boxsize = 2.0 0.41 0.1083 3.0
+
+init_step = 0
+
+fileout =./data/BL_bench
+
+! Inflow: generated Blasius, no temporal perturbations
+inflow_flag = 1
+inflow_file =blasius_solution.dat
+timeinflow_file =**TO DO**
+
+! Lund params (not used but needed by parser)
+Lund_ix = 10
+Lund_deltai = 0.03
+Lund_T = 0.5
+
+nutBC = 1
+TauwModel = 0

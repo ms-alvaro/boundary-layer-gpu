@@ -31,3 +31,4 @@ nohup.out
 # Python
 __pycache__/
 *.pyc
+validation/runs/
