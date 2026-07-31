@@ -91,6 +91,24 @@ turbulent Cf decorrelates progressively (5.6e-6 at t=3.4 to ~5% RMS at
 t=19.4) exactly as chaotic dynamics requires. Timing over the full run:
 CUDA 10.3 ms/step vs legacy 13.7 (1.33x).
 
+## Multi-GPU validation (2026-07-31, P5.1-P5.4)
+
+All multi-rank results vs the single-rank solver on the transition case
+(2000 steps, active TS modes, fields in U_inf units):
+- 2 ranks: max field diff 8.7e-15; 4 ranks: 8.9e-15
+- statistics files numerically identical (0.00) at 2 ranks
+- box files: identical headers/grids, payloads within one float32 ulp
+- restart chains: single-rank BITWISE-exact vs straight-through;
+  2-rank at 7.3e-15; snapshots interchange between any rank counts
+- capacity: the 3074x341x258 config (270M cells, ~65 GB state,
+  impossible on one A100-40GB) runs on 4 ranks, div ~3e-13,
+  ~700-800 ms/step
+
+Strong scaling on PCIe is NEGATIVE at test size (10.0 / 15.0 / 18.7
+ms/step at P = 1/2/4 on the 6.7M-cell grid) — multi-GPU on tifa is a
+capacity feature; see docs/MULTI_GPU_DESIGN.md. Multi-rank launches
+REQUIRE the UCX flags printed in the README.
+
 ## Transition-path validation (2026-07-30)
 
 The TS-mode temporal inflow path (unused by the laminar case) was

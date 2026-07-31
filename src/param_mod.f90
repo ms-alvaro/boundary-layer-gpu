@@ -503,10 +503,6 @@ contains
       if (mod(nx_global, 2) /= 0)          stop 'Error: nx must be even for MPI'
       if (mod(nz_global, 2) /= 0)          stop 'Error: nz must be even for MPI'
       if (mod(nz_global-2, nprocs) /= 0)   stop 'nz-2 should be divisible by nprocs'
-      if (random_init /= 1) &
-        stop 'P5.1: restart (init_rand = 0) not yet supported for nprocs > 1'
-      if (n_boxout > 0) &
-        stop 'P5.1: boxout not yet supported for nprocs > 1'
     end if
 
   end subroutine check_supported
