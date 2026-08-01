@@ -70,8 +70,10 @@ module timestep_mod
   use cudafor
   use iso_fortran_env, only: int64
   use precision_mod,   only: dp, ceil_div
-  use param_mod,       only: nu, CFL, itime_step, inflow_boundary_flag
+  use param_mod,       only: nu, CFL, itime_step, inflow_boundary_flag, &
+                             LES_model
   use lund_inflow_mod, only: lund_update_inlet
+  use les_mod,         only: compute_eddy_viscosity
   use grid_mod,        only: nx, ny, nz, nxg, nyg, nzg, xg, yg, zg, &
                              dxmin, dymin, dzmin
   use field_mod,       only: U_d, V_d, W_d, Uo_d, Vo_d, Wo_d, &
@@ -370,6 +372,11 @@ contains
     ! step 1
     rk_step = 1
 
+    ! LES: eddy viscosity from the step's base state (reference
+    ! time_integration.f90:34, compute_eddy_viscosity(Uo,...) — U_d
+    ! still holds Uo here, before the substep-1 advance)
+    if (LES_model > 0) call compute_eddy_viscosity()
+
     ! RHS, save+advance, BC, projection — all on GPU
     if (profiling) then
        istat = cudaDeviceSynchronize()       ! fence (reference: !$acc wait)
@@ -407,6 +414,9 @@ contains
 
     ! step 2
     rk_step = 2
+
+    ! LES: refresh nu_t from the substep-1 state (reference line 112)
+    if (LES_model > 0) call compute_eddy_viscosity()
 
     call compute_rhs_u(U_d, V_d, W_d, Fu2_d)
     call compute_rhs_v(U_d, V_d, W_d, Fv2_d)
@@ -454,6 +464,9 @@ contains
 
     ! step 1
     rk_step = 1
+
+    ! LES: eddy viscosity from the step's base state (reference line 34)
+    if (LES_model > 0) call compute_eddy_viscosity()
     if (profiling) then
        istat = cudaDeviceSynchronize()       ! fence (profiling, see header)
        call system_clock(c1)
@@ -489,6 +502,7 @@ contains
 
     ! step 2
     rk_step = 2
+    if (LES_model > 0) call compute_eddy_viscosity()
     call compute_rhs_u(U_d, V_d, W_d, Fu2_d)
     call compute_rhs_v(U_d, V_d, W_d, Fv2_d)
     call compute_rhs_w(U_d, V_d, W_d, Fw2_d)
@@ -502,6 +516,7 @@ contains
 
     ! step 3
     rk_step = 3
+    if (LES_model > 0) call compute_eddy_viscosity()
     call compute_rhs_u(U_d, V_d, W_d, Fu3_d)
     call compute_rhs_v(U_d, V_d, W_d, Fv3_d)
     call compute_rhs_w(U_d, V_d, W_d, Fw3_d)

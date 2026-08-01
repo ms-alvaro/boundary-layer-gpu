@@ -449,8 +449,10 @@ contains
   !! supported (io_mod), but requires a file name.
   subroutine check_supported()
 
-    if (LES_model > 0) then
-      write(*,*) 'ERROR: LES = ', LES_model, ' requested, but the CUDA port supports DNS only (LES = 0).'
+    if (LES_model /= 0 .and. LES_model /= 1) then
+      write(*,*) 'ERROR: LES = ', LES_model, ' requested; the CUDA port supports', &
+                 ' LES = 0 (DNS) and 1 (constant Smagorinsky). Dynamic', &
+                 ' Smagorinsky (2/3) is staged but not yet wired.'
       stop 'unsupported feature: LES model'
     end if
 
