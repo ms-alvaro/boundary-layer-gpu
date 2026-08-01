@@ -12,7 +12,11 @@ projection with an FFT-diagonalized Poisson solve (half-length real-DCT in
 x, Fourier in z, tridiagonal Thomas in y) — everything resident on the GPU;
 the host is touched only for gated statistics, monitoring, and I/O.
 
-![Bypass transition under freestream turbulence](docs/img/tbl_hit_transition.gif)
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/img/tbl_hit_transition_dark.gif">
+  <img alt="Bypass transition under freestream turbulence" src="docs/img/tbl_hit_transition.gif">
+</picture>
+
 *Bypass transition of a flat-plate boundary layer under 3% freestream
 turbulence (precursor-HIT inflow library), computed on two A100 z-slabs:
 $u'/U_\infty$ in a wall-normal $x$–$y$ plane at equal aspect ratio, axes in
@@ -57,7 +61,7 @@ CUDA_VISIBLE_DEVICES=0,1 mpirun -np 2 --mca pml ucx \
 them with small prime factors (2, 3, 5, 7). A large prime factor (e.g.
 `812 = 4*7*29`) forces cuFFT onto a slow path and costs ~10% per step.
 
-## Tests — try it
+## Tests
 
 The fastest end-to-end check (laminar Blasius case, ~8 s on an A100) and the
 harness that gates every solver change (see
@@ -82,7 +86,7 @@ python3 tests/validate.py bench   --exe ./boundary_layer_cuda --label my-run
 |---|---|
 | `cases/laminar` | Blasius flat plate; the correctness gate (~8 s on an A100) |
 | `cases/transition` | K-type transition from Tollmien-Schlichting inflow modes |
-| `cases/turbulent_lund` | turbulent BL with Lund recycling inflow (not yet in the CUDA solver; needs an external restart field) |
+| `cases/turbulent_lund` | turbulent BL with Lund recycling inflow — reference input + port checklist in [cases/turbulent_lund/README.md](cases/turbulent_lund/README.md) (CUDA port pending) |
 
 Input format: `key = value` text files (`.turbb`); see the commented
 examples in each case directory and the parameter table in
@@ -108,9 +112,14 @@ Speedup of one A100 GPU vs the original CPU solver (16-core MPI):
 
 | case | CPU solver (16-core MPI) | CUDA solver (1 GPU) |
 |---|---|---|
-| transition 814x125x66, production cadence | ~87 ms/step | **10.0 ms/step (8.7x)** |
-| laminar 302x64x8 | — | 0.83 ms/step |
-| capacity: 3074x341x258 (270M cells, ~65 GB) | does not fit | runs on 4 GPUs |
+| transition 814x125x66, production cadence | 87 ms/step | **10.0 ms/step (8.7x)** |
+| laminar 302x64x8 | not benchmarked* | 0.83 ms/step |
+| capacity: 3074x341x258 (270M cells, ~65 GB) | not feasible on one node | runs on 4 GPUs |
+
+*The CPU baseline was measured on the production transition case during the
+port. The archived CPU build is hardwired to that pipeline's input set, so a
+like-for-like CPU timing for the other rows is pending a rebuild of the CPU
+code from the `gpu-openacc` branch.*
 
 ## Credits
 
