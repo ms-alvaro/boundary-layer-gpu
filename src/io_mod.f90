@@ -441,6 +441,20 @@ contains
        last_snapshot_fname = fname
        have_snapshot       = .true.
        call write_restart()
+
+       ! (audit fix) Lund companion also in the multi-rank path
+       ! (reference output_data writes it for inflow_flag = 3 on root)
+       if ( inflow_boundary_flag == 3 ) then
+         block
+           integer :: unit_l
+           open(newunit=unit_l, file=trim(adjustl(fname))//'.mean.rescaling', &
+                access='stream', form='unformatted', action='write')
+           write(unit_l) nyg_global
+           write(unit_l) Umean_resc_T
+           write(unit_l) Vmean_resc_T
+           close(unit_l)
+         end block
+       end if
     end if
 
     deallocate (Ug, Vg, Wg, Pg)

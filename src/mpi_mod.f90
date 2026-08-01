@@ -40,7 +40,7 @@ module mpi_mod
   public :: mpi_initialize, mpi_finalize_run
   public :: myid, nprocs, is_root
   public :: halo_exchange_z, periodic_exchange_z
-  public :: allreduce_sum, allreduce_max
+  public :: allreduce_sum, allreduce_max, allreduce_min
   public :: gather_dev, scatter_dev
   public :: alltoall_dev
   public :: pressure_exchange_z
@@ -178,6 +178,14 @@ contains
     call MPI_Allreduce(v, r, 1, MPI_REAL8, MPI_MAX, MPI_COMM_WORLD, ierr)
     v = r
   end subroutine allreduce_max
+
+  subroutine allreduce_min(v)
+    real(dp), intent(inout) :: v
+    real(dp) :: r
+    if (nprocs == 1) return
+    call MPI_Allreduce(v, r, 1, MPI_REAL8, MPI_MIN, MPI_COMM_WORLD, ierr)
+    v = r
+  end subroutine allreduce_min
 
   !---------------------------------------------------------------------------
   ! gather_dev / scatter_dev — fixed-count root gather/scatter of DEVICE

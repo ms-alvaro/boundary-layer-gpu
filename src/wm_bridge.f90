@@ -120,6 +120,8 @@ contains
     frac_vis_wall_model = frac_vis_wall_model_p
     Dirichlet_nu_t = 0          ! reference hard-override
     penetration    = 1          ! reference initialization.f90:545
+    Ly = y_g(ny_g) - y_g(1)     ! (audit fix) reference init line 223;
+                                ! WM 4 uses dPdx*Ly/2 in the momentum balance
     alpha_mean_x = amx_p; alpha_mean_y = amy_p; alpha_mean_z = amz_p
     alpha_std    = astd_p; freq_mult = fmult_p
     int_len        = 0.0_dp     ! never assigned in the reference input path
@@ -167,6 +169,9 @@ contains
     allocate( V_bottom(nxm+2, nzm+2) ); V_bottom = 0.0_dp
     allocate( utau_model(nx_global), utau_wall(nx_global), &
               utau_wall_T(nx_global), utau_ref(nx_global) )
+    ! (audit fix) reference initialization.f90:526 — read by WM 13/14
+    allocate( dUmean_wall_T(nx_global), mtau_T(nx_global), UV_wall_T(nx_global) )
+    dUmean_wall_T = 0.0_dp; mtau_T = 0.0_dp; UV_wall_T = 0.0_dp
     utau_ref    = ( 0.5_dp*0.027_dp*(x_global/nu)**(-1.0_dp/7.0_dp) )**0.5_dp
     utau_model  = utau_ref
     utau_wall   = 0.0_dp
@@ -194,15 +199,17 @@ contains
   ! current substep state. first_substep: the step's base state is
   ! still in U_d/V_d/W_d (the fused Uo save has not happened yet).
   !--------------------------------------------------------------------
-  subroutine wm_update(dt_in, t_in, first_substep)
+  subroutine wm_update(dt_in, t_in, istep_in, first_substep)
 
     real(dp), intent(in) :: dt_in, t_in
+    integer,  intent(in) :: istep_in
     logical,  intent(in) :: first_substep
 
     if (.not. wm_active()) return
 
     dt = dt_in
     t  = t_in
+    istep = istep_in            ! (audit fix) WM 13/14 gate seeding on istep==1
 
     ! device -> vendored host state
     U = U_d; V = V_d; W = W_d

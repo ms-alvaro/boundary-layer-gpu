@@ -51,8 +51,6 @@ program boundary_layer_cuda
   call grid_to_device()
   call fields_allocate()
   call les_allocate()                     ! LES state (no-op for LES = 0)
-  call wm_allocate()                      ! vendored wall-model stack
-                                          ! (no-op for WM = 0, Tauw = 0)
   if (inflow_boundary_flag == 3 .or. inflow_boundary_flag == 5) then
      call lund_allocate()                 ! Lund EMA state + plane buffers
   end if                                  ! (before read_restart: the
@@ -65,6 +63,11 @@ program boundary_layer_cuda
      call grid_to_device()                ! grids may have been overwritten
   end if
   call fields_to_device()
+
+  ! (audit fix) the vendored wall-model stack captures grids and builds
+  ! utau_ref — must run AFTER read_restart may have replaced the grid,
+  ! matching the reference order (grids/utau built after read_input_data)
+  call wm_allocate()                      ! no-op for WM = 0, Tauw = 0
 
   if (random_init /= 1) then
      call sync_z_ghosts()                 ! rebuild the z-ghost planes the
