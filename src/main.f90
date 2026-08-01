@@ -21,7 +21,7 @@ program boundary_layer_cuda
                            compute_blowsuction_top,                          &
                            inflow_tables_to_device
   use lund_inflow_mod, only: lund_allocate, lund_init_means
-  use les_mod,       only: les_allocate
+  use les_mod,       only: les_allocate, les_dbg
   use poisson_mod,   only: poisson_init, poisson_finalize
   use timestep_mod,  only: timestep_init, advance_one_step, t
   use bc_kernels,    only: bc_finalize, sync_z_ghosts
@@ -39,6 +39,11 @@ program boundary_layer_cuda
   call mpi_initialize()                   ! rank/GPU binding (no-op alone)
   if (is_root()) call print_banner()
   call read_input_parameters()            ! every rank parses the input
+  block
+    character(16) :: envdbg
+    call get_environment_variable('BL_LES_DBG', envdbg)
+    if (len_trim(envdbg) > 0) les_dbg = .true.
+  end block
   call check_supported()
 
   call grid_generate()
