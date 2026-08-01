@@ -68,7 +68,7 @@ module io_mod
                              nyg_global, nzg_global,                           &
                              boxout_every, boxout_start, n_boxout,             &
                              dir_boxout, boxout_i0, boxout_i1, boxout_is,      &
-                             boxout_jmax, inflow_boundary_flag
+                             boxout_jmax, inflow_boundary_flag, LES_model
   use grid_mod,        only: nx, ny, nz, nxg, nyg, nzg,                        &
                              x, y, z, xm, ym, zm, yg,                          &
                              weight_y_0, weight_y_1,                           &
@@ -76,6 +76,7 @@ module io_mod
   use field_mod,       only: U, V, W, P, fields_from_device
   use lund_inflow_mod, only: Umean_resc_T, Vmean_resc_T, &
                              Umean_resc_To, Vmean_resc_To
+  use les_mod,         only: nu_t, les_nut_to_host
   use timestep_mod,    only: t, dt, dt_min_cfl
   use poisson_mod,     only: check_divergence
   use mpi_mod,         only: nprocs, myid, is_root, allreduce_max, &
@@ -320,11 +321,16 @@ contains
       ! nu_t — identically zero in this DNS-only port (the reference writes
       ! nu_t computed by compute_eddy_viscosity, which is 0 for LES_model=0);
       ! the block is written anyway so the file is byte-identical.
-      allocate ( nu_t_zero(nxg,nyg,nzg-1) )
-      nu_t_zero = 0.0_dp
       write(unit_s) nxg, nyg, nzg
-      write(unit_s) nu_t_zero
-      deallocate ( nu_t_zero )
+      if (LES_model > 0) then
+        call les_nut_to_host()
+        write(unit_s) nu_t(:,:,1:nzg-1)
+      else
+        allocate ( nu_t_zero(nxg,nyg,nzg-1) )
+        nu_t_zero = 0.0_dp
+        write(unit_s) nu_t_zero
+        deallocate ( nu_t_zero )
+      end if
 
       ! P — the reference writes the FULL array (all nzg planes)
       write(unit_s) nxg, nyg, nzg
@@ -371,21 +377,27 @@ contains
     character(8)   :: ext
     integer        :: unit_s
     real(dp), allocatable :: Ug(:,:,:), Vg(:,:,:), Wg(:,:,:), Pg(:,:,:)
-    real(dp), allocatable :: nu_t_zero(:,:,:)
+    real(dp), allocatable :: nu_t_zero(:,:,:), nutg(:,:,:)
 
     if (is_root()) then
        allocate ( Ug(nx,  nyg, nzg_global) )
        allocate ( Vg(nxg, ny,  nzg_global) )
        allocate ( Wg(nxg, nyg, nz_global ) )
        allocate ( Pg(nxg, nyg, nzg_global) )
+       if (LES_model > 0) allocate ( nutg(nxg, nyg, nzg_global) )
     else
        allocate ( Ug(1,1,1), Vg(1,1,1), Wg(1,1,1), Pg(1,1,1) )
+       if (LES_model > 0) allocate ( nutg(1,1,1) )
     end if
 
     call gather_slabs_host(U, nx,  nyg, nzg, kg1, Ug, nzg_global)
     call gather_slabs_host(V, nxg, ny,  nzg, kg1, Vg, nzg_global)
     call gather_slabs_host(W, nxg, nyg, nz,  k1,  Wg, nz_global )
     call gather_slabs_host(P, nxg, nyg, nzg, kg1, Pg, nzg_global)
+    if (LES_model > 0) then
+       call les_nut_to_host()
+       call gather_slabs_host(nu_t, nxg, nyg, nzg, kg1, nutg, nzg_global)
+    end if
 
     if (is_root()) then
        write(ext,'(I0.8)') istep + nstep_init
@@ -411,11 +423,15 @@ contains
        write(unit_s) nxg, nyg, nz_global
        write(unit_s) Wg(:,:,1:nz_global-1)
 
-       allocate ( nu_t_zero(nxg,nyg,nzg_global-1) )
-       nu_t_zero = 0.0_dp
        write(unit_s) nxg, nyg, nzg_global
-       write(unit_s) nu_t_zero
-       deallocate ( nu_t_zero )
+       if (LES_model > 0) then
+         write(unit_s) nutg(:,:,1:nzg_global-1)
+       else
+         allocate ( nu_t_zero(nxg,nyg,nzg_global-1) )
+         nu_t_zero = 0.0_dp
+         write(unit_s) nu_t_zero
+         deallocate ( nu_t_zero )
+       end if
 
        write(unit_s) nxg, nyg, nzg_global
        write(unit_s) Pg
@@ -428,6 +444,7 @@ contains
     end if
 
     deallocate (Ug, Vg, Wg, Pg)
+    if (LES_model > 0) deallocate (nutg)
 
   end subroutine snapshot_write_global
 
@@ -769,6 +786,7 @@ contains
     if ( mod(istep,nstats) == 0 .or. istep == 1 ) then
 
       call refresh_host_fields(istep)
+      if (LES_model > 0) call les_nut_to_host()
 
       ! interpolate W in x and y -> term
       call interp_x_avg(W, term_1)
@@ -798,8 +816,9 @@ contains
           Pmean (ii,jj) = sum( P(ii, jj, 2:nzg-1)        )
           P2mean(ii,jj) = sum( P(ii, jj, 2:nzg-1)**2.0_dp )
 
-          ! nu_t_mean would accumulate sum(nu_t(ii,jj,2:nzg-1)) here; the
-          ! DNS-only port has nu_t == 0 identically, so it stays 0.
+          if (LES_model > 0) then
+            nu_t_mean(ii,jj) = sum( nu_t(ii, jj, 2:nzg-1) )
+          end if
 
         end do
       end do
@@ -819,6 +838,7 @@ contains
          call allreduce_sum_arr(UVmean, nx*ny)
          call allreduce_sum_arr(Pmean,  nx*ny)
          call allreduce_sum_arr(P2mean, nx*ny)
+         if (LES_model > 0) call allreduce_sum_arr(nu_t_mean, nxg*nyg)
       end if
 
       ! z-averages (statistics.f90:122-135)
@@ -834,6 +854,8 @@ contains
 
       Pmean  = Pmean /real( nzg_global-2, dp )
       P2mean = P2mean/real( nzg_global-2, dp )
+
+      if (LES_model > 0) nu_t_mean = nu_t_mean/real( nzg_global-2, dp )
 
       ! mean derivative at the wall (statistics.f90:138-148)
       do ii = 1, nx

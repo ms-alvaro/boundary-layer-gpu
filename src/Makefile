@@ -35,6 +35,7 @@ SRC = precision_mod.f90 \
       reductions.cuf    \
       ic_inflow_mod.f90 \
       lund_inflow_mod.f90 \
+      les_mod.cuf       \
       hit_inflow_mod.cuf \
       rhs_kernels.cuf   \
       bc_kernels.cuf    \
@@ -73,19 +74,20 @@ reductions.o:     precision_mod.o
 ic_inflow_mod.o:  precision_mod.o param_mod.o grid_mod.o field_mod.o
 lund_inflow_mod.o: precision_mod.o param_mod.o grid_mod.o field_mod.o \
                   mpi_mod.o ic_inflow_mod.o
+les_mod.o:        precision_mod.o param_mod.o grid_mod.o field_mod.o
 hit_inflow_mod.o: precision_mod.o param_mod.o grid_mod.o ic_inflow_mod.o
-rhs_kernels.o:    precision_mod.o param_mod.o grid_mod.o field_mod.o
+rhs_kernels.o:    precision_mod.o param_mod.o grid_mod.o field_mod.o les_mod.o
 bc_kernels.o:     precision_mod.o param_mod.o grid_mod.o field_mod.o \
                   ic_inflow_mod.o hit_inflow_mod.o reductions.o mpi_mod.o
 poisson_mod.o:    precision_mod.o grid_mod.o field_mod.o reductions.o mpi_mod.o
 timestep_mod.o:   precision_mod.o param_mod.o grid_mod.o field_mod.o \
                   reductions.o rhs_kernels.o bc_kernels.o poisson_mod.o mpi_mod.o \
-                  lund_inflow_mod.o
+                  lund_inflow_mod.o les_mod.o
 io_mod.o:         precision_mod.o param_mod.o grid_mod.o field_mod.o \
-                  timestep_mod.o poisson_mod.o mpi_mod.o lund_inflow_mod.o
+                  timestep_mod.o poisson_mod.o mpi_mod.o lund_inflow_mod.o les_mod.o
 main.o:           param_mod.o grid_mod.o field_mod.o ic_inflow_mod.o mpi_mod.o \
                   hit_inflow_mod.o poisson_mod.o timestep_mod.o \
-                  bc_kernels.o reductions.o io_mod.o lund_inflow_mod.o
+                  bc_kernels.o reductions.o io_mod.o lund_inflow_mod.o les_mod.o
 
 clean:
 	rm -f $(OBJ) *.mod $(EXE)

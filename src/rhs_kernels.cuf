@@ -57,6 +57,7 @@ module rhs_kernels
                            Fu1_d, Fu2_d, Fu3_d,                    &
                            Fv1_d, Fv2_d, Fv3_d,                    &
                            Fw1_d, Fw2_d, Fw3_d
+  use les_mod,       only: nu_t_d
   use cudafor
 
   implicit none
@@ -90,13 +91,23 @@ contains
     tBlock = dim3(64, 4, 1)
     grid3  = dim3(ceil_div(nx-2, 64), ceil_div(nyg-2, 4), nzg-2)
 
-    call rhs_u_fused<<<grid3, tBlock>>>(U_, V_, W_, rhs_u,           &
+    if (LES_model > 0) then
+       call rhs_u_fused_les<<<grid3, tBlock>>>(U_, V_, W_, rhs_u, nu_t_d, &
+                                           x_d, xg_d, y_d, yg_d,        &
+                                           z_d, zg_d,                   &
+                                           weight_y_0_d, weight_y_1_d,  &
+                                           nu, dPdx,                    &
+                                           nx, ny, nz, nxg, nyg, nzg)
+       call debug_check('rhs_u_fused_les')
+    else
+       call rhs_u_fused<<<grid3, tBlock>>>(U_, V_, W_, rhs_u,           &
                                         x_d, xg_d, y_d, yg_d,        &
                                         z_d, zg_d,                   &
                                         weight_y_0_d, weight_y_1_d,  &
                                         nu, dPdx,                    &
                                         nx, ny, nz, nxg, nyg, nzg)
-    call debug_check('rhs_u_fused')
+       call debug_check('rhs_u_fused')
+    end if
 
   end subroutine compute_rhs_u
 
@@ -119,13 +130,23 @@ contains
     tBlock = dim3(64, 4, 1)
     grid3  = dim3(ceil_div(nxg-2, 64), ceil_div(ny-2, 4), nzg-2)
 
-    call rhs_v_fused<<<grid3, tBlock>>>(U_, V_, W_, rhs_v,           &
+    if (LES_model > 0) then
+       call rhs_v_fused_les<<<grid3, tBlock>>>(U_, V_, W_, rhs_v, nu_t_d, &
+                                           x_d, xg_d, y_d, yg_d,        &
+                                           z_d, zg_d,                   &
+                                           weight_y_0_d, weight_y_1_d,  &
+                                           nu,                          &
+                                           nx, ny, nz, nxg, nyg, nzg)
+       call debug_check('rhs_v_fused_les')
+    else
+       call rhs_v_fused<<<grid3, tBlock>>>(U_, V_, W_, rhs_v,           &
                                         x_d, xg_d, y_d, yg_d,        &
                                         z_d, zg_d,                   &
                                         weight_y_0_d, weight_y_1_d,  &
                                         nu,                          &
                                         nx, ny, nz, nxg, nyg, nzg)
-    call debug_check('rhs_v_fused')
+       call debug_check('rhs_v_fused')
+    end if
 
   end subroutine compute_rhs_v
 
@@ -148,13 +169,23 @@ contains
     tBlock = dim3(64, 4, 1)
     grid3  = dim3(ceil_div(nxg-2, 64), ceil_div(nyg-2, 4), nz-2)
 
-    call rhs_w_fused<<<grid3, tBlock>>>(U_, V_, W_, rhs_w,           &
+    if (LES_model > 0) then
+       call rhs_w_fused_les<<<grid3, tBlock>>>(U_, V_, W_, rhs_w, nu_t_d, &
+                                           x_d, xg_d, y_d, yg_d,        &
+                                           z_d, zg_d,                   &
+                                           weight_y_0_d, weight_y_1_d,  &
+                                           nu, dPdz,                    &
+                                           nx, ny, nz, nxg, nyg, nzg)
+       call debug_check('rhs_w_fused_les')
+    else
+       call rhs_w_fused<<<grid3, tBlock>>>(U_, V_, W_, rhs_w,           &
                                         x_d, xg_d, y_d, yg_d,        &
                                         z_d, zg_d,                   &
                                         weight_y_0_d, weight_y_1_d,  &
                                         nu, dPdz,                    &
                                         nx, ny, nz, nxg, nyg, nzg)
-    call debug_check('rhs_w_fused')
+       call debug_check('rhs_w_fused')
+    end if
 
   end subroutine compute_rhs_w
 
@@ -199,10 +230,8 @@ contains
   !----------------------------------------------------------------------------
   subroutine check_dns_only()
 
-    if (LES_model /= 0) then
-       write(*,*) 'rhs_kernels: LES branch not ported (LES_model /= 0)'
-       error stop 1
-    end if
+    ! LES (variable eddy viscosity) is handled by the *_les kernel
+    ! variants below; only the rotation branch remains unported.
     if (abs(Omega_z) > 1.0e-6_dp) then
        write(*,*) 'rhs_kernels: rotation branch not ported (Omega_z /= 0)'
        error stop 1
@@ -435,5 +464,260 @@ contains
     rhs_w(i,j,k) = r
 
   end subroutine rhs_w_fused
+
+  !===========================================================================
+  ! LES kernel variants — identical convective parts, viscous term in the
+  ! reference's variable-viscosity flux form (equations.f90 with nu_t):
+  ! per-face total viscosities nu_x1/2, nu_y1/2, nu_z1/2 interpolated from
+  ! the cell-centered nu_t exactly as written in the reference; the viscous
+  ! sum is added to the accumulator BEFORE the imposed pressure gradient,
+  ! matching the reference's addition order (rhs += visc; rhs += dPdx).
+  ! nu_t ghost/edge values are zero by construction (les_mod), reproducing
+  ! the reference's untouched allocation-zero ghosts.
+  !===========================================================================
+
+  !----------------------------------------------------------------------------
+  ! rhs_u_fused_les — equations.f90 compute_rhs_u with nu_t (visc lines
+  ! 105-161): du/dy at y-centers inlined as term_2(i,j,k) =
+  ! (U(i,j+1,k)-U(i,j,k))/(yg(j+1)-yg(j)).
+  !----------------------------------------------------------------------------
+  attributes(global) subroutine rhs_u_fused_les(U_, V_, W_, rhs_u, nut,   &
+                                            x, xg, y, yg, z, zg,          &
+                                            weight_y_0, weight_y_1,       &
+                                            nu, dPdx,                     &
+                                            nx, ny, nz, nxg, nyg, nzg)
+
+    integer, value :: nx, ny, nz, nxg, nyg, nzg
+    real(dp), value :: nu, dPdx
+    real(dp), intent(in)  :: U_(nx,  nyg, nzg)
+    real(dp), intent(in)  :: V_(nxg, ny,  nzg)
+    real(dp), intent(in)  :: W_(nxg, nyg, nz )
+    real(dp), intent(in)  :: nut(nxg, nyg, nzg)
+    real(dp), intent(out) :: rhs_u(2:nx-1, 2:nyg-1, 2:nzg-1)
+    real(dp), intent(in)  :: x(nx), xg(nxg), y(ny), yg(nyg), z(nz), zg(nzg)
+    real(dp), intent(in)  :: weight_y_0(ny), weight_y_1(ny)
+
+    integer  :: i, j, k
+    real(dp) :: r, dx_1, dx_2, dx_3, dy_3, dz_1, dz_2, dz_3
+    real(dp) :: nu_x1, nu_x2, nu_y1, nu_y2, nu_z1, nu_z2
+
+    i = 2 + (blockIdx%x - 1)*blockDim%x + threadIdx%x - 1
+    j = 2 + (blockIdx%y - 1)*blockDim%y + threadIdx%y - 1
+    k = 2 + (blockIdx%z - 1)*blockDim%z + threadIdx%z - 1
+    if (i > nx-1 .or. j > nyg-1 .or. k > nzg-1) return
+
+    if (i == nx-1) then
+       rhs_u(i,j,k) = 0.0_dp
+       return
+    end if
+
+    ! convection (identical to rhs_u_fused)
+    r = -( (0.5_dp*(U_(i,j,k)+U_(i+1,j,k)))**2 &
+          - (0.5_dp*(U_(i-1,j,k)+U_(i,j,k)))**2 ) / (xg(i+1)-xg(i))
+    r = r &
+       - ( (weight_y_0(j)*U_(i,j,k)+weight_y_1(j)*U_(i,j+1,k)) &
+           * 0.5_dp*(V_(i,j,k)+V_(i+1,j,k)) &
+         - (weight_y_0(j-1)*U_(i,j-1,k)+weight_y_1(j-1)*U_(i,j,k)) &
+           * 0.5_dp*(V_(i,j-1,k)+V_(i+1,j-1,k)) ) / (y(j)-y(j-1))
+    r = r &
+       - ( 0.5_dp*(U_(i,j,k)+U_(i,j,k+1)) * 0.5_dp*(W_(i,j,k)+W_(i+1,j,k)) &
+         - 0.5_dp*(U_(i,j,k-1)+U_(i,j,k)) * 0.5_dp*(W_(i,j,k-1)+W_(i+1,j,k-1)) ) / (z(k)-z(k-1))
+
+    ! viscous: div( (nu+nu_t) grad(u) ), reference lines 117-155
+    dx_1 = x(i) - x(i-1)
+    dx_2 = x(i+1) - x(i)
+    dx_3 = xg(i+1) - xg(i)
+    dy_3 = y(j) - y(j-1)
+    dz_1 = zg(k) - zg(k-1)
+    dz_2 = zg(k+1) - zg(k)
+    dz_3 = z(k) - z(k-1)
+
+    ! total viscosity at x locations
+    nu_x1 = nu + nut(i  ,j,k)
+    nu_x2 = nu + nut(i+1,j,k)
+    ! total viscosity at y locations
+    nu_y1 = nu + 0.5_dp*( weight_y_0(j-1)*nut(i,  j-1,k) + weight_y_1(j-1)*nut(i,  j  ,k) + &
+                          weight_y_0(j-1)*nut(i+1,j-1,k) + weight_y_1(j-1)*nut(i+1,j  ,k) )
+    nu_y2 = nu + 0.5_dp*( weight_y_0(j  )*nut(i,  j,  k) + weight_y_1(j  )*nut(i,  j+1,k) + &
+                          weight_y_0(j  )*nut(i+1,j,  k) + weight_y_1(j  )*nut(i+1,j+1,k) )
+    ! total viscosity at z locations
+    nu_z1 = nu + 0.25_dp*(nut(i,j,k)+nut(i,j,k-1)+nut(i+1,j,k)+nut(i+1,j,k-1))
+    nu_z2 = nu + 0.25_dp*(nut(i,j,k)+nut(i,j,k+1)+nut(i+1,j,k)+nut(i+1,j,k+1))
+
+    r = r + ( &
+        1.0_dp/dx_3*(nu_x2*1.0_dp/dx_2*(U_(i+1,j,k)-U_(i,j,k)) - nu_x1*1.0_dp/dx_1*(U_(i,j,k)-U_(i-1,j,k)) ) + &
+        1.0_dp/dy_3*(nu_y2*((U_(i,j+1,k)-U_(i,j,k))/(yg(j+1)-yg(j))) - nu_y1*((U_(i,j,k)-U_(i,j-1,k))/(yg(j)-yg(j-1))) ) + &
+        1.0_dp/dz_3*(nu_z2*1.0_dp/dz_2*(U_(i,j,k+1)-U_(i,j,k)) - nu_z1*1.0_dp/dz_1*(U_(i,j,k)-U_(i,j,k-1)) ) )
+
+    ! imposed pressure gradient (reference adds it after the viscous term)
+    r = r + dPdx
+
+    rhs_u(i,j,k) = r
+
+  end subroutine rhs_u_fused_les
+
+  !----------------------------------------------------------------------------
+  ! rhs_v_fused_les — equations.f90 compute_rhs_v with nu_t (visc lines
+  ! 281-328).
+  !----------------------------------------------------------------------------
+  attributes(global) subroutine rhs_v_fused_les(U_, V_, W_, rhs_v, nut,   &
+                                            x, xg, y, yg, z, zg,          &
+                                            weight_y_0, weight_y_1,       &
+                                            nu,                           &
+                                            nx, ny, nz, nxg, nyg, nzg)
+
+    integer, value :: nx, ny, nz, nxg, nyg, nzg
+    real(dp), value :: nu
+    real(dp), intent(in)  :: U_(nx,  nyg, nzg)
+    real(dp), intent(in)  :: V_(nxg, ny,  nzg)
+    real(dp), intent(in)  :: W_(nxg, nyg, nz )
+    real(dp), intent(in)  :: nut(nxg, nyg, nzg)
+    real(dp), intent(out) :: rhs_v(2:nxg-1, 2:ny-1, 2:nzg-1)
+    real(dp), intent(in)  :: x(nx), xg(nxg), y(ny), yg(nyg), z(nz), zg(nzg)
+    real(dp), intent(in)  :: weight_y_0(ny), weight_y_1(ny)
+
+    integer  :: i, j, k
+    real(dp) :: r, dx_1, dx_2, dx_3, dy_1, dy_2, dy_3, dz_1, dz_2, dz_3
+    real(dp) :: nu_x1, nu_x2, nu_y1, nu_y2, nu_z1, nu_z2
+
+    i = 2 + (blockIdx%x - 1)*blockDim%x + threadIdx%x - 1
+    j = 2 + (blockIdx%y - 1)*blockDim%y + threadIdx%y - 1
+    k = 2 + (blockIdx%z - 1)*blockDim%z + threadIdx%z - 1
+    if (i > nxg-1 .or. j > ny-1 .or. k > nzg-1) return
+
+    if (i == nxg-1) then
+       rhs_v(i,j,k) = 0.0_dp
+       return
+    end if
+
+    ! convection (identical to rhs_v_fused)
+    r = -( (0.5_dp*(V_(i,j,k)+V_(i,j+1,k)))**2 &
+          - (0.5_dp*(V_(i,j-1,k)+V_(i,j,k)))**2 ) / (yg(j+1)-yg(j))
+    r = r &
+       - ( (weight_y_0(j)*U_(i,j,k)+weight_y_1(j)*U_(i,j+1,k)) &
+           * 0.5_dp*(V_(i,j,k)+V_(i+1,j,k)) &
+         - (weight_y_0(j)*U_(i-1,j,k)+weight_y_1(j)*U_(i-1,j+1,k)) &
+           * 0.5_dp*(V_(i-1,j,k)+V_(i,j,k)) ) / (x(i)-x(i-1))
+    r = r &
+       - ( 0.5_dp*(V_(i,j,k)+V_(i,j,k+1)) &
+           * (weight_y_0(j)*W_(i,j,k)+weight_y_1(j)*W_(i,j+1,k)) &
+         - 0.5_dp*(V_(i,j,k-1)+V_(i,j,k)) &
+           * (weight_y_0(j)*W_(i,j,k-1)+weight_y_1(j)*W_(i,j+1,k-1)) ) / (z(k)-z(k-1))
+
+    ! viscous: div( (nu+nu_t) grad(v) ), reference lines 281-328
+    dx_1 = xg(i) - xg(i-1)
+    dx_2 = xg(i+1) - xg(i)
+    dx_3 = x(i) - x(i-1)
+    dy_1 = y(j) - y(j-1)
+    dy_2 = y(j+1) - y(j)
+    dy_3 = yg(j+1) - yg(j)
+    dz_1 = zg(k) - zg(k-1)
+    dz_2 = zg(k+1) - zg(k)
+    dz_3 = z(k) - z(k-1)
+
+    ! eddy viscosity at x locations
+    nu_x1 = nu + 0.5_dp*( weight_y_0(j)*nut(i-1,j,k) + weight_y_1(j)*nut(i-1,j+1,k) + &
+                          weight_y_0(j)*nut(i  ,j,k) + weight_y_1(j)*nut(i  ,j+1,k) )
+    nu_x2 = nu + 0.5_dp*( weight_y_0(j)*nut(i,  j,k) + weight_y_1(j)*nut(i,  j+1,k) + &
+                          weight_y_0(j)*nut(i+1,j,k) + weight_y_1(j)*nut(i+1,j+1,k) )
+    ! eddy viscosity at the centers
+    nu_y1 = nu + nut(i,j  ,k)
+    nu_y2 = nu + nut(i,j+1,k)
+    ! eddy viscosity at z locations
+    nu_z1 = nu + 0.5_dp*( weight_y_0(j)*nut(i,j,k-1) + weight_y_1(j)*nut(i,j+1,k-1) + &
+                          weight_y_0(j)*nut(i,j,k  ) + weight_y_1(j)*nut(i,j+1,k  ) )
+    nu_z2 = nu + 0.5_dp*( weight_y_0(j)*nut(i,j,  k) + weight_y_1(j)*nut(i,j+1,  k) + &
+                          weight_y_0(j)*nut(i,j,k+1) + weight_y_1(j)*nut(i,j+1,k+1) )
+
+    r = r + ( &
+        1.0_dp/dx_3*(nu_x2*1.0_dp/dx_2*(V_(i+1,j,k) - V_(i,j,k)) - nu_x1*1.0_dp/dx_1*(V_(i,j,k)-V_(i-1,j,k)) ) + &
+        1.0_dp/dy_3*(nu_y2*1.0_dp/dy_2*(V_(i,j+1,k) - V_(i,j,k)) - nu_y1*1.0_dp/dy_1*(V_(i,j,k)-V_(i,j-1,k)) ) + &
+        1.0_dp/dz_3*(nu_z2*1.0_dp/dz_2*(V_(i,j,k+1) - V_(i,j,k)) - nu_z1*1.0_dp/dz_1*(V_(i,j,k)-V_(i,j,k-1)) ) )
+
+    rhs_v(i,j,k) = r
+
+  end subroutine rhs_v_fused_les
+
+  !----------------------------------------------------------------------------
+  ! rhs_w_fused_les — equations.f90 compute_rhs_w with nu_t (visc lines
+  ! 436-496): dw/dy at y-centers inlined as term_2(i,j,k) =
+  ! (W(i,j+1,k)-W(i,j,k))/(yg(j+1)-yg(j)). (The reference's
+  ! interpolate_y(nu_t...) call there writes a scratch array that the loop
+  ! never reads — dead code, not reproduced.)
+  !----------------------------------------------------------------------------
+  attributes(global) subroutine rhs_w_fused_les(U_, V_, W_, rhs_w, nut,   &
+                                            x, xg, y, yg, z, zg,          &
+                                            weight_y_0, weight_y_1,       &
+                                            nu, dPdz,                     &
+                                            nx, ny, nz, nxg, nyg, nzg)
+
+    integer, value :: nx, ny, nz, nxg, nyg, nzg
+    real(dp), value :: nu, dPdz
+    real(dp), intent(in)  :: U_(nx,  nyg, nzg)
+    real(dp), intent(in)  :: V_(nxg, ny,  nzg)
+    real(dp), intent(in)  :: W_(nxg, nyg, nz )
+    real(dp), intent(in)  :: nut(nxg, nyg, nzg)
+    real(dp), intent(out) :: rhs_w(2:nxg-1, 2:nyg-1, 2:nz-1)
+    real(dp), intent(in)  :: x(nx), xg(nxg), y(ny), yg(nyg), z(nz), zg(nzg)
+    real(dp), intent(in)  :: weight_y_0(ny), weight_y_1(ny)
+
+    integer  :: i, j, k
+    real(dp) :: r, dx_1, dx_2, dx_3, dy_3, dz_1, dz_2, dz_3
+    real(dp) :: nu_x1, nu_x2, nu_y1, nu_y2, nu_z1, nu_z2
+
+    i = 2 + (blockIdx%x - 1)*blockDim%x + threadIdx%x - 1
+    j = 2 + (blockIdx%y - 1)*blockDim%y + threadIdx%y - 1
+    k = 2 + (blockIdx%z - 1)*blockDim%z + threadIdx%z - 1
+    if (i > nxg-1 .or. j > nyg-1 .or. k > nz-1) return
+
+    if (i == nxg-1) then
+       rhs_w(i,j,k) = 0.0_dp
+       return
+    end if
+
+    ! convection (identical to rhs_w_fused)
+    r = -( (0.5_dp*(W_(i,j,k)+W_(i,j,k+1)))**2 &
+          - (0.5_dp*(W_(i,j,k-1)+W_(i,j,k)))**2 ) / (zg(k+1)-zg(k))
+    r = r &
+       - ( 0.5_dp*(U_(i,j,k)+U_(i,j,k+1)) * 0.5_dp*(W_(i,j,k)+W_(i+1,j,k)) &
+         - 0.5_dp*(U_(i-1,j,k)+U_(i-1,j,k+1)) * 0.5_dp*(W_(i-1,j,k)+W_(i,j,k)) ) / (x(i)-x(i-1))
+    r = r &
+       - ( 0.5_dp*(V_(i,j,k)+V_(i,j,k+1)) &
+           * (weight_y_0(j)*W_(i,j,k)+weight_y_1(j)*W_(i,j+1,k)) &
+         - 0.5_dp*(V_(i,j-1,k)+V_(i,j-1,k+1)) &
+           * (weight_y_0(j-1)*W_(i,j-1,k)+weight_y_1(j-1)*W_(i,j,k)) ) / (y(j)-y(j-1))
+
+    ! viscous: div( (nu+nu_t) grad(w) ), reference lines 451-496
+    dx_1 = xg(i) - xg(i-1)
+    dx_2 = xg(i+1) - xg(i)
+    dx_3 = x(i) - x(i-1)
+    dy_3 = y(j) - y(j-1)
+    dz_1 = z(k) - z(k-1)
+    dz_2 = z(k+1) - z(k)
+    dz_3 = zg(k+1) - zg(k)
+
+    ! eddy viscosity at x locations
+    nu_x1 = nu + 0.25_dp*(nut(i,j,k)+nut(i,j,k+1)+nut(i-1,j,k)+nut(i-1,j,k+1))
+    nu_x2 = nu + 0.25_dp*(nut(i,j,k)+nut(i,j,k+1)+nut(i+1,j,k)+nut(i+1,j,k+1))
+    ! eddy viscosity at y locations
+    nu_y1 = nu + 0.5_dp*( weight_y_0(j-1)*nut(i,j-1,  k) + weight_y_1(j-1)*nut(i,j  ,  k) + &
+                          weight_y_0(j-1)*nut(i,j-1,k+1) + weight_y_1(j-1)*nut(i,j  ,k+1) )
+    nu_y2 = nu + 0.5_dp*( weight_y_0(j  )*nut(i,j  ,  k) + weight_y_1(j  )*nut(i,j+1,  k) + &
+                          weight_y_0(j  )*nut(i,j  ,k+1) + weight_y_1(j  )*nut(i,j+1,k+1) )
+    ! eddy viscosity at z locations
+    nu_z1 = nu + nut(i,j,k)
+    nu_z2 = nu + nut(i,j,k+1)
+
+    r = r + ( &
+        1.0_dp/dx_3*(nu_x2*1.0_dp/dx_2*(W_(i+1,j,k) - W_(i,j,k)) - nu_x1*1.0_dp/dx_1*(W_(i,j,k) - W_(i-1,j,k)) ) + &
+        1.0_dp/dy_3*(nu_y2*((W_(i,j+1,k)-W_(i,j,k))/(yg(j+1)-yg(j))) - nu_y1*((W_(i,j,k)-W_(i,j-1,k))/(yg(j)-yg(j-1))) ) + &
+        1.0_dp/dz_3*(nu_z2*1.0_dp/dz_2*(W_(i,j,k+1) - W_(i,j,k)) - nu_z1*1.0_dp/dz_1*(W_(i,j,k) - W_(i,j,k-1)) ) )
+
+    ! imposed spanwise pressure gradient (added after the viscous term)
+    r = r + dPdz
+
+    rhs_w(i,j,k) = r
+
+  end subroutine rhs_w_fused_les
 
 end module rhs_kernels
