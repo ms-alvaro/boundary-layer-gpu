@@ -91,6 +91,7 @@ module bc_kernels
   use param_mod,     only: inflow_boundary_flag, top_boundary_flag, i_rescale, &
                            iwall_model
   use wm_bridge,     only: alpha_x_d, alpha_y_d, alpha_z_d, V_bottom_d
+  use global,        only: beta_y_legacy => beta_y
   use ic_inflow_mod, only: n_modes_inlet, m_modes_inlet, U_top, &
                            U_inlet_d, V_inlet_d, W_inlet_d, &
                            U_top_d, V_top_d, W_top_d, Vbs_top_d, &
@@ -819,6 +820,10 @@ contains
        call bc_top_zeroshear_kernel<<<gridS, tBlock>>>(W_d, nxg, nyg, nz)
        call debug_check('bc_top_zeroshear_kernel(W,bs)')
 
+       ! (audit fix: i_rescale may be 0 outside the Lund flags; the
+       ! reference loop Do i=1,i_rescale is then a no-op, but a zero grid
+       ! dimension is an invalid CUDA launch)
+       if (i_rescale > 0) then
        ! re-impose the inlet-region Dirichlet top up to i_rescale — U and
        ! W ghosts only. The reference's V line writes V_(i,nyg,:), one row
        ! PAST V's y extent (V has ny rows): an out-of-bounds write that
@@ -834,6 +839,7 @@ contains
        call bc_top_upto_kernel<<<gridS, tBlock>>>(W_d, nxg, nyg, nz, &
             W_top_d, i_rescale)
        call debug_check('bc_top_upto_kernel(W)')
+       end if
     else if (top_boundary_flag == 3) then
        !---------------------------------------------------------------
        ! Falkner-Skan top (apply_top_bc_y_Falkner_Skan): U top row from
@@ -936,6 +942,9 @@ contains
          call bc_wall_subtract_kernel<<<gridS, tBlock>>>(V_d, nxg, ny, &
               nzg, beta_y)
          call debug_check('bc_wall_subtract_kernel(V)')
+         ! (audit fix) the reference stores beta_y in the global module,
+         ! where compute_alpha_v_from_Cf (iwall_model = 9) reads it
+         beta_y_legacy = beta_y
        end block
     end if
 

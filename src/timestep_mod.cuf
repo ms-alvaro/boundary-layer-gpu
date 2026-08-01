@@ -83,7 +83,7 @@ module timestep_mod
                              Fv1_d, Fv2_d, Fv3_d, &
                              Fw1_d, Fw2_d, Fw3_d
   use reductions,      only: device_max_ratio3
-  use mpi_mod,         only: allreduce_max
+  use mpi_mod,         only: allreduce_max, allreduce_min
   ! Modules written in parallel (assumed public APIs — see doc comments at
   ! the call sites and the integration notes in the module header):
   use rhs_kernels,     only: compute_rhs_u, compute_rhs_v, compute_rhs_w
@@ -311,11 +311,9 @@ contains
     lWmax = device_max_ratio3(W_d, nxg, nyg, nz , 2, nxg-1, 2, nyg-1, &
                               2, nzg-1, dzg_d, nzg-1, 3)
 
-    ! P5.1: global maxima across z-slabs (legacy MPI_Allreduce equivalent)
-    call allreduce_max(lUmax)
-    call allreduce_max(lVmax)
-    call allreduce_max(lWmax)
-
+    ! (audit fix) the reference reduces dt_local with MPI_MIN across
+    ! ranks AFTER forming min(dt_conv, dt_vis) per rank
+    ! (time_integration.f90:303-306); the ratios stay rank-local here.
     dt_conv_u = CFLa*lUmax
     dt_conv_v = CFLa*lVmax
     dt_conv_w = CFLa*lWmax
@@ -329,8 +327,9 @@ contains
 
     dt_vis = minval( (/ dt_vis_u, dt_vis_v, dt_vis_w /) )
 
-    ! time step (single rank: the reference MPI_Allreduce(min) is dropped)
+    ! time step; multi-rank: global minimum, as the reference
     dt_local = min ( dt_conv, dt_vis )
+    call allreduce_min(dt_local)
     dt       = dt_local
 
     dt_min_cfl = dt / CFLa ! save min dt for monitor output
@@ -378,7 +377,7 @@ contains
     rk_step        = 3
 
     if (LES_model > 0) call compute_eddy_viscosity()
-    if (wm_active()) call wm_update(dt, t, .true.)
+    if (wm_active()) call wm_update(dt, t, istep, .true.)
 
     call compute_rhs_u(U_d, V_d, W_d, Fu1_d)
     call compute_rhs_v(U_d, V_d, W_d, Fv1_d)
@@ -413,7 +412,7 @@ contains
     ! still holds Uo here, before the substep-1 advance)
     if (LES_model > 0) call compute_eddy_viscosity()
     ! wall model (reference line 36; host, vendored reference code)
-    if (wm_active()) call wm_update(dt, t, .true.)
+    if (wm_active()) call wm_update(dt, t, istep, .true.)
 
     ! RHS, save+advance, BC, projection — all on GPU
     if (profiling) then
@@ -455,7 +454,7 @@ contains
 
     ! LES: refresh nu_t from the substep-1 state (reference line 112)
     if (LES_model > 0) call compute_eddy_viscosity()
-    if (wm_active()) call wm_update(dt, t, .false.)
+    if (wm_active()) call wm_update(dt, t, istep, .false.)
 
     call compute_rhs_u(U_d, V_d, W_d, Fu2_d)
     call compute_rhs_v(U_d, V_d, W_d, Fv2_d)
@@ -506,7 +505,7 @@ contains
 
     ! LES: eddy viscosity from the step's base state (reference line 34)
     if (LES_model > 0) call compute_eddy_viscosity()
-    if (wm_active()) call wm_update(dt, t, .true.)
+    if (wm_active()) call wm_update(dt, t, istep, .true.)
     if (profiling) then
        istat = cudaDeviceSynchronize()       ! fence (profiling, see header)
        call system_clock(c1)
@@ -543,7 +542,7 @@ contains
     ! step 2
     rk_step = 2
     if (LES_model > 0) call compute_eddy_viscosity()
-    if (wm_active()) call wm_update(dt, t, .false.)
+    if (wm_active()) call wm_update(dt, t, istep, .false.)
     call compute_rhs_u(U_d, V_d, W_d, Fu2_d)
     call compute_rhs_v(U_d, V_d, W_d, Fv2_d)
     call compute_rhs_w(U_d, V_d, W_d, Fw2_d)
@@ -558,7 +557,7 @@ contains
     ! step 3
     rk_step = 3
     if (LES_model > 0) call compute_eddy_viscosity()
-    if (wm_active()) call wm_update(dt, t, .false.)
+    if (wm_active()) call wm_update(dt, t, istep, .false.)
     call compute_rhs_u(U_d, V_d, W_d, Fu3_d)
     call compute_rhs_v(U_d, V_d, W_d, Fv3_d)
     call compute_rhs_w(U_d, V_d, W_d, Fw3_d)
