@@ -74,6 +74,7 @@ module timestep_mod
                              LES_model
   use lund_inflow_mod, only: lund_update_inlet
   use les_mod,         only: compute_eddy_viscosity
+  use wm_bridge,       only: wm_active, wm_update
   use grid_mod,        only: nx, ny, nz, nxg, nyg, nzg, xg, yg, zg, &
                              dxmin, dymin, dzmin
   use field_mod,       only: U_d, V_d, W_d, Uo_d, Vo_d, Wo_d, &
@@ -376,6 +377,8 @@ contains
     ! time_integration.f90:34, compute_eddy_viscosity(Uo,...) — U_d
     ! still holds Uo here, before the substep-1 advance)
     if (LES_model > 0) call compute_eddy_viscosity()
+    ! wall model (reference line 36; host, vendored reference code)
+    if (wm_active()) call wm_update(dt, t, .true.)
 
     ! RHS, save+advance, BC, projection — all on GPU
     if (profiling) then
@@ -417,6 +420,7 @@ contains
 
     ! LES: refresh nu_t from the substep-1 state (reference line 112)
     if (LES_model > 0) call compute_eddy_viscosity()
+    if (wm_active()) call wm_update(dt, t, .false.)
 
     call compute_rhs_u(U_d, V_d, W_d, Fu2_d)
     call compute_rhs_v(U_d, V_d, W_d, Fv2_d)
@@ -467,6 +471,7 @@ contains
 
     ! LES: eddy viscosity from the step's base state (reference line 34)
     if (LES_model > 0) call compute_eddy_viscosity()
+    if (wm_active()) call wm_update(dt, t, .true.)
     if (profiling) then
        istat = cudaDeviceSynchronize()       ! fence (profiling, see header)
        call system_clock(c1)
@@ -503,6 +508,7 @@ contains
     ! step 2
     rk_step = 2
     if (LES_model > 0) call compute_eddy_viscosity()
+    if (wm_active()) call wm_update(dt, t, .false.)
     call compute_rhs_u(U_d, V_d, W_d, Fu2_d)
     call compute_rhs_v(U_d, V_d, W_d, Fv2_d)
     call compute_rhs_w(U_d, V_d, W_d, Fw2_d)
@@ -517,6 +523,7 @@ contains
     ! step 3
     rk_step = 3
     if (LES_model > 0) call compute_eddy_viscosity()
+    if (wm_active()) call wm_update(dt, t, .false.)
     call compute_rhs_u(U_d, V_d, W_d, Fu3_d)
     call compute_rhs_v(U_d, V_d, W_d, Fv3_d)
     call compute_rhs_w(U_d, V_d, W_d, Fw3_d)

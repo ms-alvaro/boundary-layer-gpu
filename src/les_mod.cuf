@@ -206,7 +206,13 @@ contains
     call debug_check('k_avg_nut')
 
     ! reference sgs_Smagorinsky fills only row i = 1 of avg_nu_t(nxg,nyg,1)
-    avg_nu_t(1,:) = avg_nu_t_d
+    ! (contiguous host staging first: a direct strided-row device->host
+    ! assignment generates a Memcpy2D that fails under the MPI/UCX stack)
+    block
+      real(dp) :: colbuf(nyg)
+      colbuf = avg_nu_t_d
+      avg_nu_t(1,:) = colbuf
+    end block
 
     ! clipping negative values (reference: on the whole average array)
     avg_nu_t = max( avg_nu_t, 0.0_dp )
