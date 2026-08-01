@@ -104,13 +104,13 @@ the solver stops with a clear message if one is requested.
 
 ## Performance summary (A100-PCIE-40GB, nvfortran 24.3)
 
-Speedup of one A100 GPU vs the earlier implementations of the same solver:
+Speedup of one A100 GPU vs the original CPU solver (16-core MPI):
 
-| case | CPU solver (16-core MPI) | OpenACC (1 GPU) | CUDA solver (1 GPU) |
-|---|---|---|---|
-| laminar 302x64x8 | — | 2.35 ms/step | **0.83 ms/step (2.8x vs OpenACC)** |
-| transition 814x125x66, production cadence | ~87 ms/step | 13.2 ms/step | **10.0 ms/step (8.7x vs 16-core CPU)** |
-| capacity: 3074x341x258 (270M cells, ~65 GB) | does not fit | does not fit | runs on 4 GPUs |
+| case | CPU solver (16-core MPI) | CUDA solver (1 GPU) |
+|---|---|---|
+| transition 814x125x66, production cadence | ~87 ms/step | **10.0 ms/step (8.7x)** |
+| laminar 302x64x8 | — | 0.83 ms/step |
+| capacity: 3074x341x258 (270M cells, ~65 GB) | does not fit | runs on 4 GPUs |
 
 ## Credits
 
