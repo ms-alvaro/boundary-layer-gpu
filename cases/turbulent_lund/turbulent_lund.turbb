@@ -9,7 +9,7 @@ nu = 2.2726e-06 ! (*) viscosity of the flow
 RKscheme = 2 ! (*) RK2
 
 ! Define subgrid scale model LES model 
-LES = 0 ! LES is not ported (CUDA solver is DNS-only); the original study used LES = 1 (cte Smagorinsky)
+LES = 1 ! (*) cte smagorinsky (ported to the CUDA solver)
 
 ! Define the wall model
 WM = 0 ! (*) no wall model

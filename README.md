@@ -91,11 +91,14 @@ python3 tests/validate.py bench   --exe ./boundary_layer_cuda --label my-run
 Input format: `key = value` text files (`.turbb`); see the commented
 examples in each case directory and the parameter table in
 [docs/input_parameters.turbb](docs/input_parameters.turbb). The CUDA solver
-covers the DNS path (RK2/RK3, Blasius/TS-mode/Lund-recycling/HIT inflows,
-Dirichlet, blowing-suction or zero-shear top, no-slip wall, restart, box
-output); LES and wall models are not ported (they exist in the pre-port MPI
-code, `gpu-openacc` branch) and the solver stops with a clear message if
-one is requested.
+covers the FULL feature set of the reference: Euler/RK2/RK3 stepping, all
+inflows (Blasius + temporal modes, Blasius from file, Lund recycling,
+Blasius + random, HIT planes), all top BCs (Dirichlet, blowing/suction,
+Falkner-Skan, zero-shear), LES (constant + dynamic Smagorinsky, on the
+GPU), all 15 wall models and the log-law wall-stress model (the reference
+wall-model stack runs verbatim on the host, bridged per substep), restart
+and box output. Two memory-corruption bugs found in the reference wall
+models during the port are repaired (see the commit history).
 
 ## Documentation
 

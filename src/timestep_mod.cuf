@@ -73,6 +73,7 @@ module timestep_mod
   use param_mod,       only: nu, CFL, itime_step, inflow_boundary_flag, &
                              LES_model
   use lund_inflow_mod, only: lund_update_inlet
+  use ic_inflow_mod,   only: random_inflow_update
   use les_mod,         only: compute_eddy_viscosity
   use wm_bridge,       only: wm_active, wm_update
   use grid_mod,        only: nx, ny, nz, nxg, nyg, nzg, xg, yg, zg, &
@@ -249,8 +250,14 @@ contains
        call lund_update_inlet(dt)
     end if
 
+    ! inflow_flag = 4: fresh Blasius + random perturbation planes, once
+    ! per step (reference step_beginning guard)
+    if (inflow_boundary_flag == 4) call random_inflow_update()
+
     ! time step
-    if     ( itime_step == 2 ) then
+    if     ( itime_step == 1 ) then
+       call compute_time_step_euler()
+    elseif ( itime_step == 2 ) then
        call compute_time_step_rk2()
     elseif ( itime_step == 3 ) then
        call compute_time_step_rk3()
@@ -358,6 +365,34 @@ contains
   ! 'copy=' field is retained but counts only the (now empty) pre-RHS
   ! section.
   !----------------------------------------------------------------------------
+  subroutine compute_time_step_euler()
+
+    ! Port of compute_time_step_Euler (time_integration.f90:23-67):
+    ! one forward-Euler stage, executed as "the last RK step" —
+    ! rk_step = 3 so the BCs scale the convective outflow with
+    ! rk_t(3)*dt and the projection uses the substep-3 coefficients,
+    ! exactly like the reference. U = Uo + dt*RHS via the fused
+    ! save+advance with unit coefficient.
+
+    step_beginning = 1
+    rk_step        = 3
+
+    if (LES_model > 0) call compute_eddy_viscosity()
+    if (wm_active()) call wm_update(dt, t, .true.)
+
+    call compute_rhs_u(U_d, V_d, W_d, Fu1_d)
+    call compute_rhs_v(U_d, V_d, W_d, Fv1_d)
+    call compute_rhs_w(U_d, V_d, W_d, Fw1_d)
+
+    call save_advance_stage1(1.0_dp)         ! U = Uo + dt*F, Uo = U fused
+    t = t + dt
+
+    call apply_boundary_conditions_gpu(t, rk_t(rk_step)*dt)
+    call compute_projection_step(rk_step, dt)
+    call apply_boundary_conditions_gpu(t, rk_t(rk_step)*dt)
+
+  end subroutine compute_time_step_euler
+
   subroutine compute_time_step_rk2()
 
     real(dp) :: to
