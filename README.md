@@ -12,38 +12,12 @@ projection with an FFT-diagonalized Poisson solve (half-length real-DCT in
 x, Fourier in z, tridiagonal Thomas in y) — everything resident on the GPU;
 the host is touched only for gated statistics, monitoring, and I/O.
 
-![TBL with HIT freestream-turbulence inflow](docs/img/hit_tbl_snapshot.png)
-*Boundary layer under 3% freestream turbulence from a precursor-HIT inflow
-library, running on two A100 z-slabs: near-wall Klebanoff streaks (top)
-and freestream eddies over the growing layer (bottom).*
-
-## Highlights
-
-- **Native CUDA Fortran** (no OpenACC, no FFTW, no LAPACK — just nvfortran
-  + cuFFT), tuned for A100 (`cc80`), fused stencil/transform kernels,
-  half-length real-DCT Poisson pipeline.
-- **Bitwise-deterministic**: no atomics; fixed-order reductions. Two runs
-  of the same case produce identical bits — which is also how the code is
-  validated: field-level comparisons at 1e-15 tolerances.
-- **Validated against its reference implementation** at machine precision
-  (max relative field difference ~1e-14 across laminar, TS-transition and
-  HIT-inflow cases), and at the physics level over a full 500k-step
-  transition run (identical transition-onset location at every checkpoint):
-
-  ![Transition physics validation](docs/img/validation_transition_physics.png)
-
-- **Fast**: 2.8x the OpenACC reference on the laminar case, 1.33x at
-  production cadence on the transition grid, on A100-PCIE-40GB.
-- **Multi-GPU (z-slab decomposition, CUDA-aware MPI)**: distributed
-  transpose Poisson, halos, statistics, box output and restart — validated
-  to ~1e-14 against single-GPU at 2 and 4 ranks. On PCIe-only nodes this
-  buys grid *capacity* (270M-cell cases that cannot fit on one 40 GB card),
-  not turnaround; see the honest analysis in
-  [docs/MULTI_GPU_DESIGN.md](docs/MULTI_GPU_DESIGN.md).
-- **Production features**: time-resolved HIT plane-library inflow with
-  no-recycling guard, custom wall-normal grids, zero-shear top boundary,
-  float32 subvolume ("box") output for data campaigns, exact chain
-  restarts (bitwise on one GPU; snapshots interchange across rank counts).
+![Bypass transition under freestream turbulence](docs/img/tbl_hit_transition.gif)
+*Bypass transition of a flat-plate boundary layer under 3% freestream
+turbulence (precursor-HIT inflow library), computed on two A100 z-slabs:
+$u'/U_\infty$ in a near-wall plane (top) and in a wall-normal plane
+(bottom); axes in inlet-$\delta_{99}$ units. Streaks form, break down
+into turbulent spots, and the layer becomes turbulent.*
 
 ## Repository layout
 

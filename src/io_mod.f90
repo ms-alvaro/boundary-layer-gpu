@@ -460,7 +460,10 @@ contains
 
     integer, intent(in) :: istep
 
-    integer, parameter :: NKB = 256          ! z planes saved (one period)
+    ! z planes saved: one full period when the grid has it, else all
+    ! interior planes (the header's npz field makes the format
+    ! self-describing, so readers adapt automatically)
+    integer :: NKB
     integer :: b, i, j, k, ii, absstep, npx, jm
     integer :: g0, g1, nploc, pl
     character(300) :: fname
@@ -472,6 +475,7 @@ contains
     real(4), allocatable, save :: glb4(:,:,:,:)   ! (npx, jm, NKB, 3) root
 
     if ( boxout_every <= 0 .or. n_boxout <= 0 ) return
+    NKB = min( 256, nz_global - 2 )
     absstep = istep + nstep_init
     if ( absstep < boxout_start ) return
     if ( mod(absstep, boxout_every) /= 0 ) return
