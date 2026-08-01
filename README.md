@@ -1,7 +1,7 @@
 # boundary-layer-gpu
 
 **A GPU-native incompressible boundary-layer DNS solver in CUDA Fortran** —
-single-GPU by default, multi-GPU capable, with a validation harness that
+single-GPU by default, multi-GPU capable, with a test harness that
 gates every change on *same physics, measured speedup*.
 
 The solver computes spatially-developing flat-plate boundary layers:
@@ -23,12 +23,15 @@ into turbulent spots, and the layer becomes turbulent.*
 
 ```
 src/          the CUDA Fortran solver          -> boundary_layer_cuda
-legacy/       OpenACC + MPI reference implementation (validation baseline)
 cases/        runnable cases: laminar/, transition/, turbulent_lund/,
               profiles/ (mean-profile data used by inflow generators)
-validation/   the harness: physics pass/fail, field-level diffs, timing
-docs/         design documents and validation records
+tests/        try the code + the gating harness: physics pass/fail,
+              field-level diffs, timing
+docs/         design documents, parameter reference, validation records
 ```
+
+The earlier CPU (MPI) and OpenACC implementations are kept in git history
+(`gpu-openacc` branch) — `main` is CUDA-only.
 
 ## Build and run
 
@@ -50,23 +53,21 @@ CUDA_VISIBLE_DEVICES=0,1 mpirun -np 2 --mca pml ucx \
   ./boundary_layer_cuda -i case.turbb
 ```
 
-The legacy OpenACC build (`cd legacy && make`) additionally needs MPI,
-FFTW built with nvfortran, and LAPACK; it is kept as the harness baseline.
-
 **Grid-size tip:** the Poisson FFT lengths are `nx-2` and `nz-2` — choose
 them with small prime factors (2, 3, 5, 7). A large prime factor (e.g.
 `812 = 4*7*29`) forces cuFFT onto a slow path and costs ~10% per step.
 
-## Validation
+## Tests — try it
 
-Every change is gated by the harness (see
-[validation/README.md](validation/README.md) for the method and the full
+The fastest end-to-end check (laminar Blasius case, ~8 s on an A100) and the
+harness that gates every solver change (see
+[tests/README.md](tests/README.md) for the method and the full
 baseline/result tables):
 
 ```bash
-python3 validation/validate.py laminar --exe ./boundary_layer_cuda --label my-change
-python3 validation/validate.py compare --a openacc-ref --b my-change
-python3 validation/validate.py bench   --exe ./boundary_layer_cuda --label my-change
+python3 tests/validate.py laminar --exe ./boundary_layer_cuda --label my-run
+python3 tests/validate.py compare --a openacc-ref --b my-run
+python3 tests/validate.py bench   --exe ./boundary_layer_cuda --label my-run
 ```
 
 - `laminar`: Blasius case with numeric checks (Cf vs the similarity
@@ -81,14 +82,15 @@ python3 validation/validate.py bench   --exe ./boundary_layer_cuda --label my-ch
 |---|---|
 | `cases/laminar` | Blasius flat plate; the correctness gate (~8 s on an A100) |
 | `cases/transition` | K-type transition from Tollmien-Schlichting inflow modes |
-| `cases/turbulent_lund` | turbulent BL with Lund recycling inflow (legacy solver only; needs an external restart field) |
+| `cases/turbulent_lund` | turbulent BL with Lund recycling inflow (not yet in the CUDA solver; needs an external restart field) |
 
 Input format: `key = value` text files (`.turbb`); see the commented
 examples in each case directory and the parameter table in
-`legacy/input_parameters.turbb`. The CUDA solver covers the DNS path
-(RK2/RK3, Blasius/TS-mode/HIT inflows, Dirichlet or zero-shear top,
-no-slip wall, restart, box output); LES and wall models currently run only
-in `legacy/` and the solver stops with a clear message if one is requested.
+[docs/input_parameters.turbb](docs/input_parameters.turbb). The CUDA solver
+covers the DNS path (RK2/RK3, Blasius/TS-mode/HIT inflows, Dirichlet or
+zero-shear top, no-slip wall, restart, box output); LES and wall models are
+not ported (they exist in the pre-port MPI code, `gpu-openacc` branch) and
+the solver stops with a clear message if one is requested.
 
 ## Documentation
 
@@ -97,16 +99,18 @@ in `legacy/` and the solver stops with a clear message if one is requested.
 - [docs/MULTI_GPU_DESIGN.md](docs/MULTI_GPU_DESIGN.md) — the multi-GPU
   architecture, implementation status, and measured scaling (including
   what does *not* scale on PCIe and why).
-- [validation/README.md](validation/README.md) — validation methodology
+- [tests/README.md](tests/README.md) — test/validation methodology
   and the complete record of baselines and results.
 
 ## Performance summary (A100-PCIE-40GB, nvfortran 24.3)
 
-| case | legacy OpenACC | CUDA solver |
-|---|---|---|
-| laminar 302x64x8 | 2.35 ms/step | **0.83 ms/step (2.8x)** |
-| transition 814x125x66, production cadence | 13.2 ms/step | **10.0 ms/step (1.33x)** |
-| capacity: 3074x341x258 (270M cells, ~65 GB) | does not fit | runs on 4 GPUs |
+Speedup of one A100 GPU vs the earlier implementations of the same solver:
+
+| case | CPU solver (16-core MPI) | OpenACC (1 GPU) | CUDA solver (1 GPU) |
+|---|---|---|---|
+| laminar 302x64x8 | — | 2.35 ms/step | **0.83 ms/step (2.8x vs OpenACC)** |
+| transition 814x125x66, production cadence | ~87 ms/step | 13.2 ms/step | **10.0 ms/step (8.7x vs 16-core CPU)** |
+| capacity: 3074x341x258 (270M cells, ~65 GB) | does not fit | does not fit | runs on 4 GPUs |
 
 ## Credits
 

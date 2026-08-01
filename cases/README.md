@@ -16,7 +16,7 @@ mpirun -np 1 ../../boundary_layer_cuda -i laminar.turbb
 python3 postprocess.py                          # figures vs Blasius
 ```
 
-The automated version of this check is `validation/validate.py laminar`.
+The automated version of this check is `tests/validate.py laminar`.
 
 ## transition/ — K-type transition from TS inflow modes
 

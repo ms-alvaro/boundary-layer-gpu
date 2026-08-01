@@ -1,0 +1,55 @@
+{
+  "label": "cuda-v6b",
+  "exe": "/home/alvaroms/boundary-layer-gpu/boundary_layer_cuda",
+  "case": "laminar",
+  "passed": true,
+  "checks": {
+    "mean_cf_vs_golden": {
+      "value": 0.0009741043957588252,
+      "pass": true,
+      "detail": "(golden 9.741075e-04, rtol 0.0001)"
+    },
+    "max_divergence": {
+      "value": 1.56732916575808e-13,
+      "pass": true,
+      "detail": "(< 1e-12)"
+    },
+    "freestream_overshoot": {
+      "value": 7.47482256602261e-06,
+      "pass": true,
+      "detail": "(< 0.0001)"
+    },
+    "cf_vs_blasius_maxrelerr": {
+      "value": 0.0002911552098204766,
+      "pass": true,
+      "detail": "(< 0.03)"
+    }
+  },
+  "timing": {
+    "median_s_per_step": 0.0007753300000000002,
+    "ns_per_cell_per_step": 5.014292735927153,
+    "intervals_s": [
+      0.1092739,
+      0.110302,
+      0.07753300000000002,
+      0.06809709999999997,
+      0.1226361,
+      0.0855939,
+      0.06664079999999994,
+      0.06789489999999998,
+      0.06726509999999997,
+      0.119236,
+      0.08835889999999991,
+      0.06837699999999991,
+      0.06755899999999992,
+      0.0676949,
+      0.1105098999999998,
+      0.09583399999999997,
+      0.06800819999999996,
+      0.0668350000000002,
+      0.06886790000000009,
+      0.1023409
+    ]
+  },
+  "profile_substep1_ms": null
+}
