@@ -15,9 +15,9 @@ the host is touched only for gated statistics, monitoring, and I/O.
 ![Bypass transition under freestream turbulence](docs/img/tbl_hit_transition.gif)
 *Bypass transition of a flat-plate boundary layer under 3% freestream
 turbulence (precursor-HIT inflow library), computed on two A100 z-slabs:
-$u'/U_\infty$ in a near-wall plane (top) and in a wall-normal plane
-(bottom); axes in inlet-$\delta_{99}$ units. Streaks form, break down
-into turbulent spots, and the layer becomes turbulent.*
+$u'/U_\infty$ in a wall-normal $x$–$y$ plane at equal aspect ratio, axes in
+inlet-$\delta_{99}$ units. Freestream turbulence above drives streaks and
+turbulent spots in the layer below.*
 
 ## Repository layout
 
