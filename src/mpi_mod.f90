@@ -276,8 +276,16 @@ contains
     end if
     istat_mpi = 0
 
+    ! OWNED-plane attribution (matches the legacy multi-rank writer,
+    ! input_output.f90 output_data): rank 0 contributes local planes
+    ! 1..n3loc-1, interior ranks 2..n3loc-1, the last rank 2..n3loc.
+    ! Previously every rank sent its FULL slab and later ranks' GHOST
+    ! planes overwrote earlier ranks' owned planes — invisible while
+    ! ghosts were halo-synced copies, but wrong whenever a BC stamps
+    ! rank-dependent values after the last exchange (e.g. the wall
+    ! models' per-rank slip lengths).
     if (myid == 0) then
-       glob(:,:,start:start+n3loc-1) = loc
+       glob(:,:,start:start+n3loc-2) = loc(:,:,1:n3loc-1)
        do r = 1, nprocs-1
           call MPI_Recv(meta, 2, MPI_INTEGER, r, 900, MPI_COMM_WORLD, &
                         istat_mpi, ierr)
@@ -287,10 +295,16 @@ contains
           glob(:,:,meta(1):meta(1)+meta(2)-1) = buf
           deallocate (buf)
        end do
-    else
-       meta = [start, n3loc]
+    else if (myid < nprocs-1) then
+       meta = [start+1, n3loc-2]
        call MPI_Send(meta, 2, MPI_INTEGER, 0, 900, MPI_COMM_WORLD, ierr)
-       call MPI_Send(loc, n1*n2*n3loc, MPI_REAL8, 0, 901, MPI_COMM_WORLD, ierr)
+       call MPI_Send(loc(:,:,2:n3loc-1), n1*n2*(n3loc-2), MPI_REAL8, 0, &
+                     901, MPI_COMM_WORLD, ierr)
+    else
+       meta = [start+1, n3loc-1]
+       call MPI_Send(meta, 2, MPI_INTEGER, 0, 900, MPI_COMM_WORLD, ierr)
+       call MPI_Send(loc(:,:,2:n3loc), n1*n2*(n3loc-1), MPI_REAL8, 0, &
+                     901, MPI_COMM_WORLD, ierr)
     end if
   end subroutine gather_slabs_host
 
