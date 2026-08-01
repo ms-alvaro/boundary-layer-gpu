@@ -82,6 +82,8 @@ grid) cuda-v4 runs 10.0 ms/step vs 13.2 for the OpenACC reference
 
 ## Full transition physics validation (2026-07-31)
 
+![Transition physics validation](../docs/img/validation_transition_physics.png)
+
 Complete 500k-step transition runs (cases/transition, 10 flow-throughs)
 on both builds: transition-onset location (x where Cf > 1.5 Cf_lam)
 IDENTICAL to 4 decimals at every 5000-step checkpoint over 20 time
