@@ -1,0 +1,23 @@
+{
+  "label": "cuda-v4c",
+  "exe": "/home/alvaroms/boundary-layer-gpu/boundary_layer_cuda",
+  "case": "bench_dns (814x125x66)",
+  "timing": {
+    "median_s_per_step": 0.014125600000000009,
+    "ns_per_cell_per_step": 2.103432357977814,
+    "intervals_s": [
+      0.7345090000000001,
+      0.7346301,
+      0.6856138,
+      0.7096301,
+      0.6557551000000004,
+      0.6781921999999998,
+      0.7062800000000005,
+      0.6948690000000006,
+      0.6747088000000003,
+      0.730519000000001
+    ]
+  },
+  "profile_substep1_ms": null,
+  "max_div_final": 8.957675299756628e-14
+}

@@ -1,0 +1,24 @@
+{
+  "a": "cuda-v5-dct",
+  "b": "cuda-v6c",
+  "tol": 1e-15,
+  "passed": true,
+  "field_diffs": {
+    "U": {
+      "max_abs": 0.0,
+      "max_rel": 0.0,
+      "rms": 0.0
+    },
+    "V": {
+      "max_abs": 0.0,
+      "max_rel": 0.0,
+      "rms": 0.0
+    },
+    "W": {
+      "max_abs": 0.0,
+      "max_rel": 0.0,
+      "rms": 0.0
+    }
+  },
+  "speedup_b_over_a": 0.7974707347579182
+}
