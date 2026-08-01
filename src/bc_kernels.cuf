@@ -62,7 +62,7 @@ module bc_kernels
   use cudafor
   use precision_mod, only: dp, ceil_div
   use grid_mod,      only: nx, ny, nz, nxg, nyg, nzg, &   ! sizes
-                           x, y, xg,                  &   ! host grids
+                           x, y, xg, yg, dx,          &   ! host grids
                            z_d, zg_d                      ! device z coords
   use field_mod,     only: U_d, V_d, W_d, Uo_d, Vo_d, Wo_d
   !--------------------------------------------------------------------
@@ -88,10 +88,10 @@ module bc_kernels
   ! statement (and nothing else in the file) needs updating.
   !--------------------------------------------------------------------
   use hit_inflow_mod, only: update_hit_inlet
-  use param_mod,     only: inflow_boundary_flag, top_boundary_flag
+  use param_mod,     only: inflow_boundary_flag, top_boundary_flag, i_rescale
   use ic_inflow_mod, only: n_modes_inlet, m_modes_inlet, U_top, &
                            U_inlet_d, V_inlet_d, W_inlet_d, &
-                           U_top_d, V_top_d, W_top_d, &
+                           U_top_d, V_top_d, W_top_d, Vbs_top_d, &
                            Ut_inlet_d, Vt_inlet_d, Wt_inlet_d, &
                            qu_inlet_d, qv_inlet_d, qw_inlet_d, &
                            zmode_inlet_d, tmode_inlet_d
@@ -379,6 +379,49 @@ contains
   end subroutine bc_top_zeroshear_kernel
 
   !--------------------------------------------------------------------
+  ! bc_top_zerowz_kernel — zero-spanwise-vorticity top for U under the
+  ! blowing/suction lid (top_boundary_flag = 1/2; reference zero_wz_top,
+  ! boundary_conditions.f90:135-138):
+  !
+  !   U(i,nyu,k) = (dy/dx)*( V(i+1,nyv,k) - V(i,nyv,k) ) + U(i,nyu-1,k)
+  !
+  ! for i = 1..nu1 (= nxg-1), where dydx = (yg(nyg)-yg(nyg-1))/dx is
+  ! precomputed on the host. U is (nu1,nyu,n3), V is (nv1,nyv,n3).
+  !--------------------------------------------------------------------
+  attributes(global) subroutine bc_top_zerowz_kernel(U, V, nu1, nyu, &
+       n3, nv1, nyv, dydx)
+    integer,  value         :: nu1, nyu, n3, nv1, nyv
+    real(dp), value         :: dydx
+    real(dp), intent(inout) :: U(nu1, nyu, n3)
+    real(dp), intent(in)    :: V(nv1, nyv, n3)
+    integer :: i, k
+
+    i = (blockIdx%x - 1)*blockDim%x + threadIdx%x
+    k = (blockIdx%y - 1)*blockDim%y + threadIdx%y
+    if (i > nu1 .or. k > n3) return
+
+    U(i,nyu,k) = dydx*( V(i+1,nyv,k) - V(i,nyv,k) ) + U(i,nyu-1,k)
+  end subroutine bc_top_zerowz_kernel
+
+  !--------------------------------------------------------------------
+  ! bc_top_upto_kernel — Dirichlet top limited to i <= imax (reference
+  ! zero_wz_top lines 142-146: the inlet region up to i_rescale keeps
+  ! the imposed free-stream/top profile under the blowing/suction lid).
+  !--------------------------------------------------------------------
+  attributes(global) subroutine bc_top_upto_kernel(F, n1, n2, n3, Ftop, imax)
+    integer,  value         :: n1, n2, n3, imax
+    real(dp), intent(inout) :: F(n1, n2, n3)
+    real(dp), intent(in)    :: Ftop(n1)
+    integer :: i, k
+
+    i = (blockIdx%x - 1)*blockDim%x + threadIdx%x
+    k = (blockIdx%y - 1)*blockDim%y + threadIdx%y
+    if (i > imax .or. k > n3) return
+
+    F(i,n2,k) = Ftop(i)
+  end subroutine bc_top_upto_kernel
+
+  !--------------------------------------------------------------------
   ! bc_wall_antisym_kernel — no-slip wall for a y-CENTERED array
   ! (U, W; boundary_conditions.f90:230-232, 235-236): antisymmetric
   ! ghost so the wall-face interpolant vanishes:
@@ -530,7 +573,7 @@ contains
     real(dp), intent(in) :: rk_tdt  ! rk_t(rk_step)*dt (see header)
 
     type(dim3) :: tBlock, gridS
-    real(dp)   :: Uc, coef, dxo_u, dxo_vw
+    real(dp)   :: Uc, coef, dxo_u, dxo_vw, dywz
     integer    :: nbA, nbB, nbC, nbD
 
     if (.not. bc_initialized) call bc_setup()
@@ -637,7 +680,45 @@ contains
     !    displacement V_top. V_top identical in both -> top pressure BC
     !    unchanged. (Port of the gpu-openacc branch dispatch.)
     !------------------------------------------------------------------
-    if (top_boundary_flag == 4) then
+    if (top_boundary_flag == 1 .or. top_boundary_flag == 2) then
+       !---------------------------------------------------------------
+       ! Blowing/suction top (Coleman 2018 / Abe 2017; reference
+       ! boundary_conditions.f90:65-69): V(i,ny,:) = Vbs_top(i) (the
+       ! precomputed Gaussian profile), then zero_wz_top (lines
+       ! 129-148): U from zero spanwise vorticity at the lid, dw/dy = 0
+       ! for W, and Dirichlet re-imposition for i <= i_rescale.
+       !---------------------------------------------------------------
+       gridS = dim3(ceil_div(nxg, BX), ceil_div(nzg, BY), 1)
+       call bc_top_kernel<<<gridS, tBlock>>>(V_d, nxg, ny, nzg, Vbs_top_d)
+       call debug_check('bc_top_kernel(V,bs)')
+
+       ! U(i,nyg,k) = (dy/dx)*( V(i+1,ny,k) - V(i,ny,k) ) + U(i,nyg-1,k)
+       dywz = yg(nyg) - yg(nyg-1)
+       gridS = dim3(ceil_div(nx, BX), ceil_div(nzg, BY), 1)
+       call bc_top_zerowz_kernel<<<gridS, tBlock>>>(U_d, V_d, nx, nyg, &
+            nzg, nxg, ny, dywz/dx)
+       call debug_check('bc_top_zerowz_kernel(U)')
+
+       gridS = dim3(ceil_div(nxg, BX), ceil_div(nz, BY), 1)
+       call bc_top_zeroshear_kernel<<<gridS, tBlock>>>(W_d, nxg, nyg, nz)
+       call debug_check('bc_top_zeroshear_kernel(W,bs)')
+
+       ! re-impose the inlet-region Dirichlet top up to i_rescale — U and
+       ! W ghosts only. The reference's V line writes V_(i,nyg,:), one row
+       ! PAST V's y extent (V has ny rows): an out-of-bounds write that
+       ! lands on the wall row of the neighboring z-plane and is then
+       ! overwritten by the wall Dirichlet BC. Its EFFECTIVE semantics —
+       ! V keeps the blowing/suction profile over the whole lid — are
+       ! reproduced here without the memory corruption.
+       gridS = dim3(ceil_div(i_rescale, BX), ceil_div(nzg, BY), 1)
+       call bc_top_upto_kernel<<<gridS, tBlock>>>(U_d, nx, nyg, nzg, &
+            U_top_d, i_rescale)
+       call debug_check('bc_top_upto_kernel(U)')
+       gridS = dim3(ceil_div(i_rescale, BX), ceil_div(nz, BY), 1)
+       call bc_top_upto_kernel<<<gridS, tBlock>>>(W_d, nxg, nyg, nz, &
+            W_top_d, i_rescale)
+       call debug_check('bc_top_upto_kernel(W)')
+    else if (top_boundary_flag == 4) then
        gridS = dim3(ceil_div(nx, BX), ceil_div(nzg, BY), 1)
        call bc_top_zeroshear_kernel<<<gridS, tBlock>>>(U_d, nx, nyg, nzg)
        call debug_check('bc_top_zeroshear_kernel(U)')

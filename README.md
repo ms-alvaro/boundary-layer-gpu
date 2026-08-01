@@ -86,15 +86,16 @@ python3 tests/validate.py bench   --exe ./boundary_layer_cuda --label my-run
 |---|---|
 | `cases/laminar` | Blasius flat plate; the correctness gate (~8 s on an A100) |
 | `cases/transition` | K-type transition from Tollmien-Schlichting inflow modes |
-| `cases/turbulent_lund` | turbulent BL with Lund recycling inflow — reference input + port checklist in [cases/turbulent_lund/README.md](cases/turbulent_lund/README.md) (CUDA port pending) |
+| `cases/turbulent_lund` | turbulent BL with Lund recycling inflow (`inflow_flag = 3/5`) — ported and validated to machine precision vs the CPU solver; see [cases/turbulent_lund/README.md](cases/turbulent_lund/README.md) |
 
 Input format: `key = value` text files (`.turbb`); see the commented
 examples in each case directory and the parameter table in
 [docs/input_parameters.turbb](docs/input_parameters.turbb). The CUDA solver
-covers the DNS path (RK2/RK3, Blasius/TS-mode/HIT inflows, Dirichlet or
-zero-shear top, no-slip wall, restart, box output); LES and wall models are
-not ported (they exist in the pre-port MPI code, `gpu-openacc` branch) and
-the solver stops with a clear message if one is requested.
+covers the DNS path (RK2/RK3, Blasius/TS-mode/Lund-recycling/HIT inflows,
+Dirichlet, blowing-suction or zero-shear top, no-slip wall, restart, box
+output); LES and wall models are not ported (they exist in the pre-port MPI
+code, `gpu-openacc` branch) and the solver stops with a clear message if
+one is requested.
 
 ## Documentation
 
@@ -110,16 +111,17 @@ the solver stops with a clear message if one is requested.
 
 Speedup of one A100 GPU vs the original CPU solver (16-core MPI):
 
-| case | CPU solver (16-core MPI) | CUDA solver (1 GPU) |
-|---|---|---|
-| transition 814x125x66, production cadence | 87 ms/step | **10.0 ms/step (8.7x)** |
-| laminar 302x64x8 | not benchmarked* | 0.83 ms/step |
-| capacity: 3074x341x258 (270M cells, ~65 GB) | not feasible on one node | runs on 4 GPUs |
+| case | CPU solver (MPI) | CUDA solver | speedup |
+|---|---|---|---|
+| transition 814x125x66, production cadence | 87 ms/step (16 cores) | **10.0 ms/step** (1 GPU) | 8.7x |
+| laminar 302x64x8 | 25.5 ms/step (6 cores*) | 0.83 ms/step (1 GPU) | 31x |
+| capacity: 3074x341x258 (270M cells, ~65 GB) | 28.1 s/step (16 cores) | 0.7-0.8 s/step (4 GPUs) | ~35-40x |
 
-*The CPU baseline was measured on the production transition case during the
-port. The archived CPU build is hardwired to that pipeline's input set, so a
-like-for-like CPU timing for the other rows is pending a rebuild of the CPU
-code from the `gpu-openacc` branch.*
+*The z-slab decomposition requires `nz-2` divisible by the rank count, so
+the laminar case (nz = 8) caps at 6 ranks. CPU numbers are median
+per-monitor-interval timings of the pre-port MPI solver rebuilt from this
+repository's history (gfortran -O2 + FFTW 3.3.10), same machine as the
+GPU runs (dual-socket 28-core Xeon host of the A100s).*
 
 ## Credits
 

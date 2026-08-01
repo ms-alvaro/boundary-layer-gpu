@@ -12,12 +12,15 @@ program boundary_layer_cuda
 
   use param_mod,     only: read_input_parameters, check_supported,           &
                            print_banner, param_summary, nsteps, random_init, &
-                           inflow_boundary_flag
+                           inflow_boundary_flag, top_boundary_flag
   use grid_mod,      only: grid_generate, grid_to_device
   use field_mod,     only: fields_allocate, fields_to_device
   use ic_inflow_mod, only: generate_initial_condition,                       &
                            compute_blasius_solution_for_bc,                  &
+                           compute_turbulent_solution_for_bc,                &
+                           compute_blowsuction_top,                          &
                            inflow_tables_to_device
+  use lund_inflow_mod, only: lund_allocate, lund_init_means
   use poisson_mod,   only: poisson_init, poisson_finalize
   use timestep_mod,  only: timestep_init, advance_one_step, t
   use bc_kernels,    only: bc_finalize, sync_z_ghosts
@@ -40,6 +43,10 @@ program boundary_layer_cuda
   call grid_generate()
   call grid_to_device()
   call fields_allocate()
+  if (inflow_boundary_flag == 3 .or. inflow_boundary_flag == 5) then
+     call lund_allocate()                 ! Lund EMA state + plane buffers
+  end if                                  ! (before read_restart: the
+                                          ! companion read fills Umean_resc_To)
 
   if (random_init == 1) then
      call generate_initial_condition(t)   ! Blasius IC into host mirrors, t=0
@@ -54,8 +61,23 @@ program boundary_layer_cuda
   end if                                  ! snapshot does not store (legacy
                                           ! 'force periodicity in z' fixup)
 
-  call compute_blasius_solution_for_bc()  ! inlet/top profiles + mode tables
+  if (inflow_boundary_flag == 3 .or. inflow_boundary_flag == 5) then
+     call compute_turbulent_solution_for_bc() ! Lund inlet/top profiles
+  else
+     call compute_blasius_solution_for_bc()   ! inlet/top profiles + modes
+  end if
+  if (top_boundary_flag == 1 .or. top_boundary_flag == 2) then
+     call compute_blowsuction_top()       ! V_bs(i) table for the lid BC
+  end if
   call inflow_tables_to_device()
+
+  if (inflow_boundary_flag == 3 .or. inflow_boundary_flag == 5) then
+     ! io_mod::read_restart filled Umean_resc_To from the '.mean.rescaling'
+     ! companion when it exists (inflow_flag = 3 restart); the copy into
+     ! the live EMA state (or the IC-mean fallback) happens here, after
+     ! the fields are resident on the device.
+     call lund_init_means()
+  end if
 
   if (inflow_boundary_flag == 6) then
      call init_hit_inflow()               ! HIT plane library (reads header,

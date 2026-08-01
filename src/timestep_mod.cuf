@@ -70,7 +70,8 @@ module timestep_mod
   use cudafor
   use iso_fortran_env, only: int64
   use precision_mod,   only: dp, ceil_div
-  use param_mod,       only: nu, CFL, itime_step
+  use param_mod,       only: nu, CFL, itime_step, inflow_boundary_flag
+  use lund_inflow_mod, only: lund_update_inlet
   use grid_mod,        only: nx, ny, nz, nxg, nyg, nzg, xg, yg, zg, &
                              dxmin, dymin, dzmin
   use field_mod,       only: U_d, V_d, W_d, Uo_d, Vo_d, Wo_d, &
@@ -234,6 +235,16 @@ contains
 
     ! compute dt based on CFL
     call compute_dt()
+
+    ! Lund recycling inflow: recompute the inlet planes once per step
+    ! from the step's base state (U_d before substep 1 = the reference's
+    ! Uo/Vo/Wo; reference guard step_beginning == 1 in
+    ! apply_inflow_bc_x_rescaling / _Turbulent_rescaled_flu). The planes
+    ! persist on the device and bc_inflow_kernel applies them every
+    ! substep, exactly like the reference's persistent Ut/Vt/Wt_inlet.
+    if (inflow_boundary_flag == 3 .or. inflow_boundary_flag == 5) then
+       call lund_update_inlet(dt)
+    end if
 
     ! time step
     if     ( itime_step == 2 ) then

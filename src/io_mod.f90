@@ -65,15 +65,17 @@ module io_mod
                              filein, fileout,                                  &
                              nx_global, ny_global, nz_global,                  &
                              nxm_global, nym_global, nzm_global,               &
-                             nzg_global,                                       &
+                             nyg_global, nzg_global,                           &
                              boxout_every, boxout_start, n_boxout,             &
                              dir_boxout, boxout_i0, boxout_i1, boxout_is,      &
-                             boxout_jmax
+                             boxout_jmax, inflow_boundary_flag
   use grid_mod,        only: nx, ny, nz, nxg, nyg, nzg,                        &
                              x, y, z, xm, ym, zm, yg,                          &
                              weight_y_0, weight_y_1,                           &
                              z_global, zm_global, k1, k2, kg1, nzm
   use field_mod,       only: U, V, W, P, fields_from_device
+  use lund_inflow_mod, only: Umean_resc_T, Vmean_resc_T, &
+                             Umean_resc_To, Vmean_resc_To
   use timestep_mod,    only: t, dt, dt_min_cfl
   use poisson_mod,     only: check_divergence
   use mpi_mod,         only: nprocs, myid, is_root, allreduce_max, &
@@ -335,6 +337,21 @@ contains
       have_snapshot       = .true.
       call write_restart()
 
+      ! save means for Lund's rescaling (reference input_output.f90:733-741,
+      ! root only, inflow_flag = 3; NATIVE endianness — the reference's
+      ! writer was native too, its big-endian read matched Intel-era files)
+      if ( myid == 0 .and. inflow_boundary_flag == 3 ) then
+        block
+          integer :: unit_l
+          open(newunit=unit_l, file=trim(adjustl(fname))//'.mean.rescaling', &
+               access='stream', form='unformatted', action='write')
+          write(unit_l) nyg_global
+          write(unit_l) Umean_resc_T
+          write(unit_l) Vmean_resc_T
+          close(unit_l)
+        end block
+      end if
+
     end if
 
   end subroutine output_snapshot
@@ -564,7 +581,7 @@ contains
   ! read_restart — read a binary snapshot (grids, U, V, W, time, init step)
   ! from 'filein' into the HOST arrays. Port of read_input_data
   ! (input_output.f90:288-487) at nprocs = 1, minus MPI, minus the Lund
-  ! '.mean.rescaling' companion file (inflow_flag = 3 is not ported).
+  ! '.mean.rescaling' companion file (read back for inflow_flag = 3).
   !
   ! Reads: t; the -73 marker + step number (taken as nstep_init when the
   ! input file gave no init_step, i.e. nstep_init_input == -45); the six
@@ -681,6 +698,36 @@ contains
     if ( any( ieee_is_nan(U) ) ) stop 'Error U NaNs!'
     if ( any( ieee_is_nan(V) ) ) stop 'Error V NaNs!'
     if ( any( ieee_is_nan(W) ) ) stop 'Error W NaNs!'
+
+    ! read Umean/Vmean for Lund recycling if the companion snapshot exists
+    ! (reference input_output.f90:505-527, inflow_flag = 3). Missing file
+    ! -> zeros, and lund_init_means falls back to the IC spanwise means.
+    ! Every rank reads (no bcast needed; y is undecomposed). NATIVE
+    ! endianness: matches this port's writer above.
+    if ( inflow_boundary_flag == 3 ) then
+      block
+        integer :: unit_l, ios_l, nyg_resc
+        logical :: have_resc
+        inquire(file=trim(adjustl(filein))//'.mean.rescaling', exist=have_resc)
+        if ( have_resc ) then
+          write(*,*) 'reading ', trim(adjustl(filein))//'.mean.rescaling', '...'
+          open(newunit=unit_l, file=trim(adjustl(filein))//'.mean.rescaling', &
+               access='stream', form='unformatted', action='read', &
+               status='old', iostat=ios_l)
+          read(unit_l) nyg_resc
+          if ( nyg_resc /= nyg_global ) then
+            write(*,*) nyg_resc, nyg_global
+            stop 'Error! nyg_resc/=nyg_global'
+          end if
+          read(unit_l) Umean_resc_To
+          read(unit_l) Vmean_resc_To
+          close(unit_l)
+        else
+          Umean_resc_To = 0.0_dp
+          Vmean_resc_To = 0.0_dp
+        end if
+      end block
+    end if
 
   end subroutine read_restart
 
