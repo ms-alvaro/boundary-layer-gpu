@@ -45,6 +45,8 @@ module les_mod
   use grid_mod,      only: nx, ny, nz, nxg, nyg, nzg, x, y, z, xg, yg, zg, &
                            dx, dz, x_d, y_d, z_d, xg_d, yg_d, zg_d
   use field_mod,     only: U_d, V_d, W_d
+  use mpi_mod,       only: nprocs, halo_exchange_z, periodic_exchange_z, &
+                           STAG_CENTER, STAG_FACE
   use cudafor
 
   implicit none
@@ -58,8 +60,10 @@ module les_mod
   real(dp), device, allocatable, public :: nu_t_d(:,:,:)
   real(dp),         allocatable, public :: nu_t(:,:,:)
 
-  ! wall-parallel average of nu_t (host column; reference avg_nu_t(1,j,1))
-  real(dp), allocatable, public :: avg_nu_t(:)
+  ! wall-parallel average (reference avg_nu_t(nxg,nyg,1): the constant-
+  ! Smagorinsky model fills only row i = 1; the z-averaged dynamic model
+  ! fills the interior; wall models read the 2-D array)
+  real(dp), allocatable, public :: avg_nu_t(:,:)
 
   ! edge-located off-diagonal Sij scratch (components 4, 5, 6)
   real(dp), device, allocatable :: S4e_d(:,:,:), S5e_d(:,:,:), S6e_d(:,:,:)
@@ -68,8 +72,22 @@ module les_mod
   real(dp), allocatable         :: coef_smag(:)
   real(dp), device, allocatable :: coef_smag_d(:)
 
-  ! device buffer for the per-j averages
+  logical, public :: les_dbg = .false.
+
+  ! device buffer for the per-j averages (constant-Smagorinsky path)
   real(dp), device, allocatable :: avg_nu_t_d(:)
+
+  ! ----- dynamic-Smagorinsky (LES = 2/3) device scratch -----
+  ! shapes mirror the reference scratch (full arrays; only the documented
+  ! index windows are ever read)
+  real(dp), device, allocatable :: termc_d(:,:,:), term1c_d(:,:,:), term2c_d(:,:,:)
+  real(dp), device, allocatable :: Sc_d(:,:,:,:)          ! Sij / placeholder (nxg,nyg,nzg,6)
+  real(dp), device, allocatable :: Ss_d(:,:,:)            ! |S| at centers
+  real(dp), device, allocatable :: Lw_d(:,:,:,:), Mw_d(:,:,:,:) ! Lij/Mij windows
+  real(dp), device, allocatable :: tb_d(:,:,:,:)          ! ten_buf
+  real(dp), device, allocatable :: Uf_d(:,:,:), Vf_d(:,:,:), Wf_d(:,:,:)
+  real(dp), device, allocatable :: fv1_d(:,:,:), fv2_d(:,:,:), fv3_d(:,:,:) ! filtered centers
+  real(dp), device, allocatable :: avgLM_d(:,:), avgMM_d(:,:), avg2d_d(:,:)
 
 contains
 
@@ -95,8 +113,28 @@ contains
     allocate( S4e_d(nxg, nyg, nzg) );   S4e_d  = 0.0_dp
     allocate( S5e_d(nxg, nyg, nzg) );   S5e_d  = 0.0_dp
     allocate( S6e_d(nxg, nyg, nzg) );   S6e_d  = 0.0_dp
-    allocate( avg_nu_t(nyg) );          avg_nu_t = 0.0_dp
+    allocate( avg_nu_t(nxg,nyg) );      avg_nu_t = 0.0_dp
     allocate( avg_nu_t_d(nyg) );        avg_nu_t_d = 0.0_dp
+
+    if ( LES_model >= 2 ) then
+       allocate( termc_d (nxg,nyg,nzg) ); termc_d  = 0.0_dp
+       allocate( term1c_d(nxg,nyg,nzg) ); term1c_d = 0.0_dp
+       allocate( term2c_d(nxg,nyg,nzg) ); term2c_d = 0.0_dp
+       allocate( Sc_d(nxg,nyg,nzg,6) );   Sc_d     = 0.0_dp
+       allocate( Ss_d(nxg,nyg,nzg) );     Ss_d     = 0.0_dp
+       allocate( Lw_d(nxg,nyg,nzg,6) );   Lw_d     = 0.0_dp
+       allocate( Mw_d(nxg,nyg,nzg,6) );   Mw_d     = 0.0_dp
+       allocate( tb_d(nxg,nyg,nzg,6) );   tb_d     = 0.0_dp
+       allocate( Uf_d(nx,nyg,nzg) );      Uf_d     = 0.0_dp
+       allocate( Vf_d(nxg,ny,nzg) );      Vf_d     = 0.0_dp
+       allocate( Wf_d(nxg,nyg,nz) );      Wf_d     = 0.0_dp
+       allocate( fv1_d(nxg,nyg,nzg) );    fv1_d    = 0.0_dp
+       allocate( fv2_d(nxg,nyg,nzg) );    fv2_d    = 0.0_dp
+       allocate( fv3_d(nxg,nyg,nzg) );    fv3_d    = 0.0_dp
+       allocate( avgLM_d(nxg,nyg) );      avgLM_d  = 0.0_dp
+       allocate( avgMM_d(nxg,nyg) );      avgMM_d  = 0.0_dp
+       allocate( avg2d_d(nxg,nyg) );      avg2d_d  = 0.0_dp
+    end if
     allocate( coef_smag(nyg) );         coef_smag = 0.0_dp
 
     ! Smagorinsky constant coefficient (reference: Cs = 0.11d0)
@@ -129,8 +167,10 @@ contains
 
     if     ( LES_model == 1 ) then
        call sgs_smagorinsky_gpu()
-    elseif ( LES_model == 2 .or. LES_model == 3 ) then
-       stop 'LES = 2/3 (dynamic Smagorinsky) not yet wired in the CUDA port'
+    elseif ( LES_model == 2 ) then
+       call sgs_dynamic_gpu(.true.)
+    elseif ( LES_model == 3 ) then
+       call sgs_dynamic_gpu(.false.)
     end if
 
   end subroutine compute_eddy_viscosity
@@ -165,20 +205,19 @@ contains
          nxg, nyg, nzg)
     call debug_check('k_avg_nut')
 
-    avg_nu_t = avg_nu_t_d
+    ! reference sgs_Smagorinsky fills only row i = 1 of avg_nu_t(nxg,nyg,1)
+    avg_nu_t(1,:) = avg_nu_t_d
 
-    ! clipping negative values (reference: on the average only)
-    do j = 1, nyg
-       avg_nu_t(j) = max( avg_nu_t(j), 0.0_dp )
-    end do
+    ! clipping negative values (reference: on the whole average array)
+    avg_nu_t = max( avg_nu_t, 0.0_dp )
 
     ! ghost rows (apply_Dirichlet_bc_y / apply_Neumann_bc_y, id = 2)
     if ( Dirichlet_nu_t == 1 ) then
-       avg_nu_t(1)   = -avg_nu_t(2)
-       avg_nu_t(nyg) = -avg_nu_t(nyg-1)
+       avg_nu_t(:,1)   = -avg_nu_t(:,2)
+       avg_nu_t(:,nyg) = -avg_nu_t(:,nyg-1)
     else
-       avg_nu_t(1)   = avg_nu_t(2)
-       avg_nu_t(nyg) = avg_nu_t(nyg-1)
+       avg_nu_t(:,1)   = avg_nu_t(:,2)
+       avg_nu_t(:,nyg) = avg_nu_t(:,nyg-1)
     end if
 
   end subroutine sgs_smagorinsky_gpu
@@ -189,6 +228,686 @@ contains
   subroutine les_nut_to_host()
     if (LES_model > 0) nu_t = nu_t_d
   end subroutine les_nut_to_host
+
+  !--------------------------------------------------------------------
+  ! sgs_dynamic_gpu — dynamic Smagorinsky, port of
+  ! sgs_dynamic_Smagorinsky (zavg = .true., LES = 2: Germano ratio
+  ! z-averaged over the LOCAL slab, reference lines 261-414) and
+  ! sgs_dynamic_Smagorinsky_noaverage (zavg = .false., LES = 3:
+  ! pointwise ratio, lines 436-583). Differences preserved verbatim:
+  !   * LES=2 uses Neumann-x fixups, LES=3 periodic-x;
+  !   * LES=2 z-averages Lij*Mij and Mij*Mij over k = 2:nzg-2 (LOCAL,
+  !     divisor nzg-3) before the ratio; LES=3 divides pointwise;
+  !   * LES=2 leaves nu_t x/z ghosts at zero (only the interior z-halo
+  !     is exchanged); LES=3 periodicizes nu_t in x and z;
+  !   * avg_nu_t: LES=2 stores the raw (unclipped) Germano ratio;
+  !     LES=3 zeroes it.
+  ! fil_size = 2 (filter_xzy), so the Mij prefactor fil_size**2 = 4.
+  !--------------------------------------------------------------------
+  subroutine sgs_dynamic_gpu(zavg)
+
+    logical, intent(in) :: zavg
+
+    type(dim3) :: tb, gr, gr2
+    integer    :: c
+
+    tb = dim3(64, 4, 1)
+
+    !------------------------------------------------------------------
+    ! Part 1: Leonard term Lij = hat(ui*uj) - hat(ui)*hat(uj)
+    !------------------------------------------------------------------
+    ! velocities interpolated to cell centers
+    gr = dim3( ceil_div(nxg, 64), ceil_div(nyg, 4), nzg )
+    call k_interp_cx<<<gr, tb>>>(termc_d,  U_d, nx,  nxg, nyg, nzg)
+    call k_interp_cy<<<gr, tb>>>(term1c_d, V_d, ny,  nxg, nyg, nzg)
+    call k_interp_cz<<<gr, tb>>>(term2c_d, W_d, nz,  nxg, nyg, nzg)
+    call debug_check('k_interp_c*')
+
+    ! fixups (reference lines 282-284 / 457-459)
+    call fix_x(termc_d, nxg, nyg, nzg, .false., zavg)
+    call fix_z_center(term2c_d, nxg, nyg, 61)
+
+    ! ui*uj products into the Sij placeholder (window 2:nxg,2:nyg-1,2:nzg)
+    gr = dim3( ceil_div(nxg-1, 64), ceil_div(nyg-2, 4), nzg-1 )
+    call k_products6<<<gr, tb>>>(Sc_d, termc_d, term1c_d, term2c_d, &
+         nxg, nyg, nzg)
+    call debug_check('k_products6')
+
+    ! ten_buf = Sij window; fixups per component; filter -> Lij
+    do c = 1, 6
+       gr = dim3( ceil_div(nxg-1, 64), ceil_div(nyg-2, 4), nzg-1 )
+       call k_copy_win<<<gr, tb>>>(tb_d(:,:,:,c), Sc_d(:,:,:,c), nxg, nyg, nzg)
+       call fix_x(tb_d(:,:,:,c), nxg, nyg, nzg, .false., zavg)
+       call fix_z_center(tb_d(:,:,:,c), nxg, nyg, 62)
+       call filt(tb_d(:,:,:,c), Lw_d(:,:,:,c), nxg, nyg, nzg, &
+                 2, nxg-1, 2, nyg-1, 2, nzg-1)
+    end do
+
+    ! filtered center velocities
+    call filt(termc_d,  fv1_d, nxg, nyg, nzg, 2, nxg-1, 2, nyg-1, 2, nzg-1)
+    call filt(term1c_d, fv2_d, nxg, nyg, nzg, 2, nxg-1, 2, nyg-1, 2, nzg-1)
+    call filt(term2c_d, fv3_d, nxg, nyg, nzg, 2, nxg-1, 2, nyg-1, 2, nzg-1)
+
+    ! Lij -= hat(ui)*hat(uj) (window 2:nxg-1,2:nyg-1,2:nzg-1)
+    gr = dim3( ceil_div(nxg-2, 64), ceil_div(nyg-2, 4), nzg-2 )
+    call k_lij_sub<<<gr, tb>>>(Lw_d, fv1_d, fv2_d, fv3_d, nxg, nyg, nzg)
+    call debug_check('k_lij_sub')
+
+    !------------------------------------------------------------------
+    ! Part 2: Mij = fil_size^2*|hat(S)|*hat(Sij) - hat(|S|*Sij)
+    !------------------------------------------------------------------
+    ! filtered velocities on their native grids
+    call filt(U_d, Uf_d, nx,  nyg, nzg, 2, nx-1,  1, nyg, 2, nzg-1)
+    call filt(V_d, Vf_d, nxg, ny,  nzg, 2, nxg-1, 1, ny,  2, nzg-1)
+    call filt(W_d, Wf_d, nxg, nyg, nz,  2, nxg-1, 1, nyg, 2, nz-1)
+
+    ! fixups (reference lines 326-337 / 505-516)
+    call fix_x(Uf_d, nx,  nyg, nzg, .true.,  zavg)
+    call fix_z_center(Uf_d, nx, nyg, 63)
+    call fix_x(Vf_d, nxg, ny,  nzg, .false., zavg)
+    call fix_z_center(Vf_d, nxg, ny, 64)
+    call fix_x(Wf_d, nxg, nyg, nz,  .false., zavg)
+    call fix_z_face(Wf_d, nxg, nyg, 65)
+
+    ! hat(Sij), |hat(S)|
+    call sij_store(Uf_d, Vf_d, Wf_d)
+
+    ! Mij = fil_size^2 * |hat(S)| * hat(Sij)
+    gr = dim3( ceil_div(nxg-2, 64), ceil_div(nyg-2, 4), nzg-2 )
+    call k_mij_hat<<<gr, tb>>>(Mw_d, Ss_d, Sc_d, nxg, nyg, nzg)
+    call debug_check('k_mij_hat')
+
+    ! Sij, |S| with unfiltered velocities (|S| stays in Ss_d for Part 3)
+    call sij_store(U_d, V_d, W_d)
+
+    ! Mij -= hat(|S|*Sij)
+    do c = 1, 6
+       gr = dim3( ceil_div(nxg-2, 64), ceil_div(nyg-2, 4), nzg-2 )
+       call k_ssij<<<gr, tb>>>(termc_d, Ss_d, Sc_d(:,:,:,c), nxg, nyg, nzg)
+       call debug_check('k_ssij')
+       call fix_x(termc_d, nxg, nyg, nzg, .false., zavg)
+       call fix_z_center(termc_d, nxg, nyg, 66)
+       call filt(termc_d, fv1_d, nxg, nyg, nzg, 2, nxg-1, 2, nyg-1, 2, nzg-1)
+       gr = dim3( ceil_div(nxg-2, 64), ceil_div(nyg-2, 4), nzg-2 )
+       call k_mij_sub<<<gr, tb>>>(Mw_d(:,:,:,c), fv1_d, nxg, nyg, nzg)
+       call debug_check('k_mij_sub')
+    end do
+
+    !------------------------------------------------------------------
+    ! Part 3: nu_t
+    !------------------------------------------------------------------
+    block
+      real(dp) :: dbgL(6), dbgM(6)
+      integer  :: cdbg
+      if (les_dbg) then
+         do cdbg = 1, 6
+            dbgL(cdbg) = Lw_d(2,43,2,cdbg)
+            dbgM(cdbg) = Mw_d(2,43,2,cdbg)
+         end do
+         write(*,'(A,6E24.16)') 'DBGL', dbgL
+         write(*,'(A,6E24.16)') 'DBGM', dbgM
+      end if
+    end block
+
+    nu_t_d = 0.0_dp
+
+    ! Lij*Mij contraction (component order and 2x off-diagonal weights
+    ! exactly as the reference loop)
+    gr = dim3( ceil_div(nxg-2, 64), ceil_div(nyg-2, 4), nzg-2 )
+    call k_lm_sum<<<gr, tb>>>(nu_t_d, Mw_d, Lw_d, nxg, nyg, nzg)
+    call debug_check('k_lm_sum')
+
+    gr2 = dim3( ceil_div(nxg-2, 64), ceil_div(nyg-2, 4), 1 )
+    if (zavg) then
+       ! z-average over the LOCAL 2:nzg-2 planes (divisor nzg-3)
+       call k_avg_z2<<<gr2, tb>>>(avgLM_d, nu_t_d, nxg, nyg, nzg)
+       call debug_check('k_avg_z2(LM)')
+
+       call k_mm_sum<<<gr, tb>>>(nu_t_d, Mw_d, nxg, nyg, nzg)
+       call debug_check('k_mm_sum')
+       call k_avg_z2<<<gr2, tb>>>(avgMM_d, nu_t_d, nxg, nyg, nzg)
+       call debug_check('k_avg_z2(MM)')
+
+       call k_ratio2<<<gr2, tb>>>(avg2d_d, avgLM_d, avgMM_d, nxg, nyg)
+       call debug_check('k_ratio2')
+
+       ! nu_t(i,j,2:nzg-1) = -0.5 * <LM>/<MM> * |S|
+       gr = dim3( ceil_div(nxg-2, 64), ceil_div(nyg-2, 4), nzg-2 )
+       call k_nut_avg<<<gr, tb>>>(nu_t_d, avg2d_d, Ss_d, nxg, nyg, nzg)
+       call debug_check('k_nut_avg')
+
+       ! interior z-halo only (update_ghost_interior_planes(nu_t,4))
+       call halo_exchange_z(nu_t_d, nxg, nyg, nzg, 67)
+
+       ! wall models read the raw ratio
+       avg_nu_t = avg2d_d
+    else
+       ! pointwise ratio, then -0.5 * ratio * |S|
+       call k_div_mm<<<gr, tb>>>(nu_t_d, Mw_d, nxg, nyg, nzg)
+       call debug_check('k_div_mm')
+       call k_nut_scale<<<gr, tb>>>(nu_t_d, Ss_d, nxg, nyg, nzg)
+       call debug_check('k_nut_scale')
+
+       ! periodicity in x and z + interior halo (reference 565-568)
+       call fix_x(nu_t_d, nxg, nyg, nzg, .false., .false.)
+       call fix_z_center(nu_t_d, nxg, nyg, 68)
+
+       avg_nu_t = 0.0_dp
+    end if
+
+    ! clipping negative values (whole array, reference 404-405 / 570-571)
+    gr = dim3( ceil_div(nxg, 64), ceil_div(nyg, 4), nzg )
+    call k_clip<<<gr, tb>>>(nu_t_d, nxg, nyg, nzg)
+    call debug_check('k_clip')
+
+    ! y ghost rows after clipping (Dirichlet_nu_t forced 0 -> Neumann)
+    gr = dim3( ceil_div(nxg, 64), ceil_div(nzg, 4), 1 )
+    if ( Dirichlet_nu_t == 1 ) then
+       call k_ybc<<<gr, tb>>>(nu_t_d, nxg, nyg, nzg, -1.0_dp)
+    else
+       call k_ybc<<<gr, tb>>>(nu_t_d, nxg, nyg, nzg,  1.0_dp)
+    end if
+    call debug_check('k_ybc')
+
+  end subroutine sgs_dynamic_gpu
+
+  !--------------------------------------------------------------------
+  ! fix_x — Neumann-x (LES=2) or periodic-x (LES=3) ghost fill for a
+  ! device array; faces flag selects the x-face (nx) index convention.
+  ! (apply_Neumann_bc_x / apply_periodic_bc_x.)
+  !--------------------------------------------------------------------
+  subroutine fix_x(F, n1, n2, n3, faces, neumann)
+    integer, intent(in) :: n1, n2, n3
+    real(dp), device, intent(inout) :: F(n1,n2,n3)
+    logical, intent(in) :: faces, neumann
+    type(dim3) :: tb, gr
+    tb = dim3(64, 4, 1)
+    gr = dim3( ceil_div(n2, 64), ceil_div(n3, 4), 1 )
+    if (neumann) then
+       call k_neumann_x<<<gr, tb>>>(F, n1, n2, n3)
+       call debug_check('k_neumann_x')
+    else
+       call k_periodic_x<<<gr, tb>>>(F, n1, n2, n3, merge(1,0,faces))
+       call debug_check('k_periodic_x')
+    end if
+  end subroutine fix_x
+
+  !--------------------------------------------------------------------
+  ! fix_z_center / fix_z_face — periodic wrap + interior halo for a
+  ! z-decomposed device array (apply_periodic_bc_z ids 1/2/4 and 3 +
+  ! update_ghost_interior_planes). nprocs = 1: local copies.
+  !--------------------------------------------------------------------
+  subroutine fix_z_center(F, n1, n2, tag)
+    integer, intent(in) :: n1, n2, tag
+    real(dp), device, intent(inout) :: F(n1,n2,nzg)
+    type(dim3) :: tb, gr
+    tb = dim3(64, 4, 1)
+    if (nprocs == 1) then
+       gr = dim3( ceil_div(n1, 64), ceil_div(n2, 4), 1 )
+       call k_periodic_z_center<<<gr, tb>>>(F, n1, n2, nzg)
+       call debug_check('k_periodic_z_center')
+    else
+       call periodic_exchange_z(F, n1, n2, nzg, STAG_CENTER, tag)
+       call halo_exchange_z(F, n1, n2, nzg, tag+100)
+    end if
+  end subroutine fix_z_center
+
+  subroutine fix_z_face(F, n1, n2, tag)
+    integer, intent(in) :: n1, n2, tag
+    real(dp), device, intent(inout) :: F(n1,n2,nz)
+    type(dim3) :: tb, gr
+    tb = dim3(64, 4, 1)
+    if (nprocs == 1) then
+       gr = dim3( ceil_div(n1, 64), ceil_div(n2, 4), 1 )
+       call k_periodic_z_face<<<gr, tb>>>(F, n1, n2, nz)
+       call debug_check('k_periodic_z_face')
+    else
+       call periodic_exchange_z(F, n1, n2, nz, STAG_FACE, tag)
+       call halo_exchange_z(F, n1, n2, nz, tag+100)
+    end if
+  end subroutine fix_z_face
+
+  !--------------------------------------------------------------------
+  ! filt — Simpson filter_xzy on a device array, output window in
+  ! GLOBAL indices (iw0:iw1, jw0:jw1, kw0:kw1). One-sided y blends at
+  ! the window's own first/last rows, exactly like the reference (the
+  ! reference passes either the full y range or the 2:nyg-1 slice; in
+  ! both cases the boundary rows of the WINDOW get the (2/3,1/3) and
+  ! (1/3,2/3) blends).
+  !--------------------------------------------------------------------
+  subroutine filt(In, Out, n1, n2, n3, iw0, iw1, jw0, jw1, kw0, kw1)
+    integer, intent(in) :: n1, n2, n3, iw0, iw1, jw0, jw1, kw0, kw1
+    real(dp), device, intent(in)  :: In(n1,n2,n3)
+    real(dp), device, intent(out) :: Out(n1,n2,n3)
+    type(dim3) :: tb, gr
+    tb = dim3(64, 4, 1)
+    gr = dim3( ceil_div(iw1-iw0+1, 64), ceil_div(jw1-jw0+1, 4), kw1-kw0+1 )
+    call k_filter_xzy<<<gr, tb>>>(In, Out, n1, n2, n3, iw0, iw1, jw0, jw1, &
+                                  kw0, kw1)
+    call debug_check('k_filter_xzy')
+  end subroutine filt
+
+  !--------------------------------------------------------------------
+  ! sij_store — compute_Sij storing the six center components into Sc_d
+  ! and |S| into Ss_d (edges via the shared k_sij_edges).
+  !--------------------------------------------------------------------
+  subroutine sij_store(Ua, Va, Wa)
+    real(dp), device, intent(in) :: Ua(nx,nyg,nzg), Va(nxg,ny,nzg), Wa(nxg,nyg,nz)
+    type(dim3) :: tb, gr
+    tb = dim3(64, 4, 1)
+    gr = dim3( ceil_div(nxg-1, 64), ceil_div(nyg-1, 4), nzg-1 )
+    call k_sij_edges<<<gr, tb>>>(S4e_d, S5e_d, S6e_d, Ua, Va, Wa, &
+         x_d, y_d, z_d, xg_d, yg_d, zg_d, nx, ny, nz, nxg, nyg, nzg)
+    call debug_check('k_sij_edges(store)')
+    gr = dim3( ceil_div(nxg-2, 64), ceil_div(nyg-2, 4), nzg-2 )
+    call k_sij_center_store<<<gr, tb>>>(Sc_d, Ss_d, S4e_d, S5e_d, S6e_d, &
+         Ua, Va, Wa, x_d, y_d, z_d, nx, ny, nz, nxg, nyg, nzg)
+    call debug_check('k_sij_center_store')
+  end subroutine sij_store
+
+  !====================================================================
+  ! dynamic-Smagorinsky kernels
+  !====================================================================
+
+  ! interpolate_x(U,term(2:nxg-1,:,:),1): term(i) = 0.5*(U(i-1)+U(i))
+  attributes(global) subroutine k_interp_cx(T, U, nxu, n1, n2, n3)
+    integer, value :: nxu, n1, n2, n3
+    real(dp), intent(out) :: T(n1,n2,n3)
+    real(dp), intent(in)  :: U(nxu,n2,n3)
+    integer :: i, j, k
+    i = (blockIdx%x-1)*blockDim%x + threadIdx%x
+    j = (blockIdx%y-1)*blockDim%y + threadIdx%y
+    k = blockIdx%z
+    if (i < 2 .or. i > n1-1 .or. j > n2 .or. k > n3) return
+    T(i,j,k) = 0.5_dp*( U(i-1,j,k) + U(i,j,k) )
+  end subroutine k_interp_cx
+
+  ! interpolate_y(V,term_1(:,2:nyg-1,:),1): term1(:,j,:) = 0.5*(V(j-1)+V(j))
+  attributes(global) subroutine k_interp_cy(T, V, nyv, n1, n2, n3)
+    integer, value :: nyv, n1, n2, n3
+    real(dp), intent(out) :: T(n1,n2,n3)
+    real(dp), intent(in)  :: V(n1,nyv,n3)
+    integer :: i, j, k
+    i = (blockIdx%x-1)*blockDim%x + threadIdx%x
+    j = (blockIdx%y-1)*blockDim%y + threadIdx%y
+    k = blockIdx%z
+    if (i > n1 .or. j < 2 .or. j > n2-1 .or. k > n3) return
+    T(i,j,k) = 0.5_dp*( V(i,j-1,k) + V(i,j,k) )
+  end subroutine k_interp_cy
+
+  ! interpolate_z(W,term_2(:,:,2:nzg),1): term2(:,:,k) = 0.5*(W(k-1)+W(k)),
+  ! k = 2..nz (k = nzg is filled later by the periodic fixup)
+  attributes(global) subroutine k_interp_cz(T, W, nzw, n1, n2, n3)
+    integer, value :: nzw, n1, n2, n3
+    real(dp), intent(out) :: T(n1,n2,n3)
+    real(dp), intent(in)  :: W(n1,n2,nzw)
+    integer :: i, j, k
+    i = (blockIdx%x-1)*blockDim%x + threadIdx%x
+    j = (blockIdx%y-1)*blockDim%y + threadIdx%y
+    k = blockIdx%z
+    if (i > n1 .or. j > n2 .or. k < 2 .or. k > nzw) return
+    T(i,j,k) = 0.5_dp*( W(i,j,k-1) + W(i,j,k) )
+  end subroutine k_interp_cz
+
+  ! apply_Neumann_bc_x (both id conventions collapse to the same rows)
+  attributes(global) subroutine k_neumann_x(F, n1, n2, n3)
+    integer, value :: n1, n2, n3
+    real(dp), intent(inout) :: F(n1,n2,n3)
+    integer :: j, k
+    j = (blockIdx%x-1)*blockDim%x + threadIdx%x
+    k = (blockIdx%y-1)*blockDim%y + threadIdx%y
+    if (j > n2 .or. k > n3) return
+    F(1, j,k) = F(2,   j,k)
+    F(n1,j,k) = F(n1-1,j,k)
+  end subroutine k_neumann_x
+
+  ! apply_periodic_bc_x: faces (id=1) or centers (id=2/4)
+  attributes(global) subroutine k_periodic_x(F, n1, n2, n3, faces)
+    integer, value :: n1, n2, n3, faces
+    real(dp), intent(inout) :: F(n1,n2,n3)
+    integer :: j, k
+    j = (blockIdx%x-1)*blockDim%x + threadIdx%x
+    k = (blockIdx%y-1)*blockDim%y + threadIdx%y
+    if (j > n2 .or. k > n3) return
+    if (faces == 1) then
+       F(1, j,k) = F(n1-1,j,k)
+       F(n1,j,k) = F(2,   j,k)
+    else
+       F(1,   j,k) = F(n1-2,j,k)
+       F(n1-1,j,k) = F(2,   j,k)
+       F(n1,  j,k) = F(3,   j,k)
+    end if
+  end subroutine k_periodic_x
+
+  ! apply_periodic_bc_z single-rank, z-centered (ids 1/2/4)
+  attributes(global) subroutine k_periodic_z_center(F, n1, n2, n3)
+    integer, value :: n1, n2, n3
+    real(dp), intent(inout) :: F(n1,n2,n3)
+    integer :: i, j
+    i = (blockIdx%x-1)*blockDim%x + threadIdx%x
+    j = (blockIdx%y-1)*blockDim%y + threadIdx%y
+    if (i > n1 .or. j > n2) return
+    F(i,j,1)    = F(i,j,n3-2)
+    F(i,j,n3-1) = F(i,j,2)
+    F(i,j,n3)   = F(i,j,3)
+  end subroutine k_periodic_z_center
+
+  ! apply_periodic_bc_z single-rank, z-faced (id 3)
+  attributes(global) subroutine k_periodic_z_face(F, n1, n2, n3)
+    integer, value :: n1, n2, n3
+    real(dp), intent(inout) :: F(n1,n2,n3)
+    integer :: i, j
+    i = (blockIdx%x-1)*blockDim%x + threadIdx%x
+    j = (blockIdx%y-1)*blockDim%y + threadIdx%y
+    if (i > n1 .or. j > n2) return
+    F(i,j,1)  = F(i,j,n3-1)
+    F(i,j,n3) = F(i,j,2)
+  end subroutine k_periodic_z_face
+
+  ! ui*uj products (Sij placeholder; window 2:nxg, 2:nyg-1, 2:nzg)
+  attributes(global) subroutine k_products6(Sc, tc, t1, t2, n1, n2, n3)
+    integer, value :: n1, n2, n3
+    real(dp), intent(out) :: Sc(n1,n2,n3,6)
+    real(dp), intent(in)  :: tc(n1,n2,n3), t1(n1,n2,n3), t2(n1,n2,n3)
+    integer :: i, j, k
+    i = 2 + (blockIdx%x-1)*blockDim%x + threadIdx%x - 1
+    j = 2 + (blockIdx%y-1)*blockDim%y + threadIdx%y - 1
+    k = 2 + blockIdx%z - 1
+    if (i > n1 .or. j > n2-1 .or. k > n3) return
+    Sc(i,j,k,1) = tc(i,j,k)*tc(i,j,k)
+    Sc(i,j,k,2) = t1(i,j,k)*t1(i,j,k)
+    Sc(i,j,k,3) = t2(i,j,k)*t2(i,j,k)
+    Sc(i,j,k,4) = tc(i,j,k)*t1(i,j,k)
+    Sc(i,j,k,5) = tc(i,j,k)*t2(i,j,k)
+    Sc(i,j,k,6) = t1(i,j,k)*t2(i,j,k)
+  end subroutine k_products6
+
+  ! copy the product window into ten_buf (rest stays zero)
+  attributes(global) subroutine k_copy_win(T, S, n1, n2, n3)
+    integer, value :: n1, n2, n3
+    real(dp), intent(out) :: T(n1,n2,n3)
+    real(dp), intent(in)  :: S(n1,n2,n3)
+    integer :: i, j, k
+    i = 2 + (blockIdx%x-1)*blockDim%x + threadIdx%x - 1
+    j = 2 + (blockIdx%y-1)*blockDim%y + threadIdx%y - 1
+    k = 2 + blockIdx%z - 1
+    if (i > n1 .or. j > n2-1 .or. k > n3) return
+    T(i,j,k) = S(i,j,k)
+  end subroutine k_copy_win
+
+  ! Simpson filter (filter_xzy): x/z 3x3 stencil {1/36,1/9,4/9}, y blend
+  ! (1/6,2/3,1/6) interior, one-sided (2/3,1/3)/(1/3,2/3) at the window's
+  ! first/last row. Tap accumulation order i = -1..1 outer, k inner
+  ! (reference loop order).
+  attributes(global) subroutine k_filter_xzy(A, Out, n1, n2, n3, &
+       iw0, iw1, jw0, jw1, kw0, kw1)
+    integer, value :: n1, n2, n3, iw0, iw1, jw0, jw1, kw0, kw1
+    real(dp), intent(in)  :: A(n1,n2,n3)
+    real(dp), intent(out) :: Out(n1,n2,n3)
+    integer  :: io, jo, ko, i, k
+    real(dp) :: acc, ytap, fil
+    io = iw0 + (blockIdx%x-1)*blockDim%x + threadIdx%x - 1
+    jo = jw0 + (blockIdx%y-1)*blockDim%y + threadIdx%y - 1
+    ko = kw0 + blockIdx%z - 1
+    if (io > iw1 .or. jo > jw1 .or. ko > kw1) return
+
+    acc = 0.0_dp
+    do i = -1, 1
+       do k = -1, 1
+          if (abs(i)+abs(k) == 2) then
+             fil = 1.0_dp/36.0_dp
+          else if (abs(i)+abs(k) == 1) then
+             fil = 1.0_dp/9.0_dp
+          else
+             fil = 4.0_dp/9.0_dp
+          end if
+          if (jo == jw0) then
+             ytap = 2.0_dp/3.0_dp*A(io+i,jo,ko+k) + 1.0_dp/3.0_dp*A(io+i,jo+1,ko+k)
+          else if (jo == jw1) then
+             ytap = 1.0_dp/3.0_dp*A(io+i,jo-1,ko+k) + 2.0_dp/3.0_dp*A(io+i,jo,ko+k)
+          else
+             ytap = 1.0_dp/6.0_dp*A(io+i,jo-1,ko+k) + 2.0_dp/3.0_dp*A(io+i,jo,ko+k) &
+                  + 1.0_dp/6.0_dp*A(io+i,jo+1,ko+k)
+          end if
+          acc = acc + ytap*fil
+       end do
+    end do
+    Out(io,jo,ko) = acc
+  end subroutine k_filter_xzy
+
+  ! Lij -= hat(ui)*hat(uj)
+  attributes(global) subroutine k_lij_sub(L, f1, f2, f3, n1, n2, n3)
+    integer, value :: n1, n2, n3
+    real(dp), intent(inout) :: L(n1,n2,n3,6)
+    real(dp), intent(in)    :: f1(n1,n2,n3), f2(n1,n2,n3), f3(n1,n2,n3)
+    integer :: i, j, k
+    i = 2 + (blockIdx%x-1)*blockDim%x + threadIdx%x - 1
+    j = 2 + (blockIdx%y-1)*blockDim%y + threadIdx%y - 1
+    k = 2 + blockIdx%z - 1
+    if (i > n1-1 .or. j > n2-1 .or. k > n3-1) return
+    L(i,j,k,1) = L(i,j,k,1) - f1(i,j,k)*f1(i,j,k)
+    L(i,j,k,2) = L(i,j,k,2) - f2(i,j,k)*f2(i,j,k)
+    L(i,j,k,3) = L(i,j,k,3) - f3(i,j,k)*f3(i,j,k)
+    L(i,j,k,4) = L(i,j,k,4) - f1(i,j,k)*f2(i,j,k)
+    L(i,j,k,5) = L(i,j,k,5) - f1(i,j,k)*f3(i,j,k)
+    L(i,j,k,6) = L(i,j,k,6) - f2(i,j,k)*f3(i,j,k)
+  end subroutine k_lij_sub
+
+  ! diagonal Sij + edge->center + |S|, STORING components (compute_Sij)
+  attributes(global) subroutine k_sij_center_store(Sc, Ss, S4, S5, S6, &
+       U, V, W, x, y, z, nx, ny, nz, nxg, nyg, nzg)
+    integer, value :: nx, ny, nz, nxg, nyg, nzg
+    real(dp), intent(out) :: Sc(nxg,nyg,nzg,6), Ss(nxg,nyg,nzg)
+    real(dp), intent(in)  :: S4(nxg,nyg,nzg), S5(nxg,nyg,nzg), S6(nxg,nyg,nzg)
+    real(dp), intent(in)  :: U(nx,nyg,nzg), V(nxg,ny,nzg), W(nxg,nyg,nz)
+    real(dp), intent(in)  :: x(nx), y(ny), z(nz)
+    integer  :: i, j, k
+    real(dp) :: s1, s2, s3, s4c, s5c, s6c, smag
+    i = 2 + (blockIdx%x-1)*blockDim%x + threadIdx%x - 1
+    j = 2 + (blockIdx%y-1)*blockDim%y + threadIdx%y - 1
+    k = 2 + blockIdx%z - 1
+    if (i > nxg-1 .or. j > nyg-1 .or. k > nzg-1) return
+    s1 = (U(i,j,k) - U(i-1,j,k))/(x(i)-x(i-1))
+    s2 = (V(i,j,k) - V(i,j-1,k))/(y(j)-y(j-1))
+    s3 = (W(i,j,k) - W(i,j,k-1))/(z(k)-z(k-1))
+    s4c = 0.25_dp * (S4(i,j,k) + S4(i+1,j,k) + S4(i,j+1,k) + S4(i+1,j+1,k))
+    s5c = 0.25_dp * (S5(i,j,k) + S5(i+1,j,k) + S5(i,j,k+1) + S5(i+1,j,k+1))
+    s6c = 0.25_dp * (S6(i,j,k) + S6(i,j+1,k) + S6(i,j,k+1) + S6(i,j+1,k+1))
+    Sc(i,j,k,1) = s1
+    Sc(i,j,k,2) = s2
+    Sc(i,j,k,3) = s3
+    Sc(i,j,k,4) = s4c
+    Sc(i,j,k,5) = s5c
+    Sc(i,j,k,6) = s6c
+    smag = 2.0_dp*s1*s1
+    smag = smag + 2.0_dp*s2*s2
+    smag = smag + 2.0_dp*s3*s3
+    smag = smag + 4.0_dp*s4c*s4c
+    smag = smag + 4.0_dp*s5c*s5c
+    smag = smag + 4.0_dp*s6c*s6c
+    ! sqrt, not pow: gfortran contracts x**0.5d0 to the correctly-
+    ! rounded sqrt; the device pow differs by ~1 ulp, which the Germano
+    ! ratio amplifies at ill-conditioned points
+    Ss(i,j,k) = sqrt(smag)
+  end subroutine k_sij_center_store
+
+  ! Mij = fil_size^2 * |hat(S)| * hat(Sij), fil_size = 2
+  attributes(global) subroutine k_mij_hat(M, Ss, Sc, n1, n2, n3)
+    integer, value :: n1, n2, n3
+    real(dp), intent(out) :: M(n1,n2,n3,6)
+    real(dp), intent(in)  :: Ss(n1,n2,n3), Sc(n1,n2,n3,6)
+    integer :: i, j, k, c
+    i = 2 + (blockIdx%x-1)*blockDim%x + threadIdx%x - 1
+    j = 2 + (blockIdx%y-1)*blockDim%y + threadIdx%y - 1
+    k = 2 + blockIdx%z - 1
+    if (i > n1-1 .or. j > n2-1 .or. k > n3-1) return
+    do c = 1, 6
+       M(i,j,k,c) = 2.0_dp**2.0_dp * Ss(i,j,k) * Sc(i,j,k,c)
+    end do
+  end subroutine k_mij_hat
+
+  ! term = |S| * Sij(c) on the interior window
+  attributes(global) subroutine k_ssij(T, Ss, Sc, n1, n2, n3)
+    integer, value :: n1, n2, n3
+    real(dp), intent(out) :: T(n1,n2,n3)
+    real(dp), intent(in)  :: Ss(n1,n2,n3), Sc(n1,n2,n3)
+    integer :: i, j, k
+    i = 2 + (blockIdx%x-1)*blockDim%x + threadIdx%x - 1
+    j = 2 + (blockIdx%y-1)*blockDim%y + threadIdx%y - 1
+    k = 2 + blockIdx%z - 1
+    if (i > n1-1 .or. j > n2-1 .or. k > n3-1) return
+    T(i,j,k) = Ss(i,j,k) * Sc(i,j,k)
+  end subroutine k_ssij
+
+  ! Mij(c) -= hat(|S|*Sij)(c)
+  attributes(global) subroutine k_mij_sub(M, f, n1, n2, n3)
+    integer, value :: n1, n2, n3
+    real(dp), intent(inout) :: M(n1,n2,n3)
+    real(dp), intent(in)    :: f(n1,n2,n3)
+    integer :: i, j, k
+    i = 2 + (blockIdx%x-1)*blockDim%x + threadIdx%x - 1
+    j = 2 + (blockIdx%y-1)*blockDim%y + threadIdx%y - 1
+    k = 2 + blockIdx%z - 1
+    if (i > n1-1 .or. j > n2-1 .or. k > n3-1) return
+    M(i,j,k) = M(i,j,k) - f(i,j,k)
+  end subroutine k_mij_sub
+
+  ! Lij*Mij contraction, reference component order and weights
+  attributes(global) subroutine k_lm_sum(NT, M, L, n1, n2, n3)
+    integer, value :: n1, n2, n3
+    real(dp), intent(inout) :: NT(n1,n2,n3)
+    real(dp), intent(in)    :: M(n1,n2,n3,6), L(n1,n2,n3,6)
+    integer :: i, j, k, c
+    real(dp) :: acc
+    i = 2 + (blockIdx%x-1)*blockDim%x + threadIdx%x - 1
+    j = 2 + (blockIdx%y-1)*blockDim%y + threadIdx%y - 1
+    k = 2 + blockIdx%z - 1
+    if (i > n1-1 .or. j > n2-1 .or. k > n3-1) return
+    acc = 0.0_dp
+    do c = 1, 3
+       acc = acc + M(i,j,k,c)*L(i,j,k,c)
+    end do
+    do c = 4, 6
+       acc = acc + 2.0_dp*M(i,j,k,c)*L(i,j,k,c)
+    end do
+    NT(i,j,k) = acc
+  end subroutine k_lm_sum
+
+  ! Mij*Mij contraction (single reference expression)
+  attributes(global) subroutine k_mm_sum(NT, M, n1, n2, n3)
+    integer, value :: n1, n2, n3
+    real(dp), intent(out) :: NT(n1,n2,n3)
+    real(dp), intent(in)  :: M(n1,n2,n3,6)
+    integer :: i, j, k
+    i = 2 + (blockIdx%x-1)*blockDim%x + threadIdx%x - 1
+    j = 2 + (blockIdx%y-1)*blockDim%y + threadIdx%y - 1
+    k = 2 + blockIdx%z - 1
+    if (i > n1-1 .or. j > n2-1 .or. k > n3-1) return
+    NT(i,j,k) = ( M(i,j,k,1)*M(i,j,k,1)  +      &
+                  M(i,j,k,2)*M(i,j,k,2)  +      &
+                  M(i,j,k,3)*M(i,j,k,3)  +      &
+            2.0_dp*( M(i,j,k,4)*M(i,j,k,4)  +   &
+                  M(i,j,k,5)*M(i,j,k,5)  +      &
+                  M(i,j,k,6)*M(i,j,k,6) ) )
+  end subroutine k_mm_sum
+
+  ! pointwise NT /= Mij*Mij (LES = 3)
+  attributes(global) subroutine k_div_mm(NT, M, n1, n2, n3)
+    integer, value :: n1, n2, n3
+    real(dp), intent(inout) :: NT(n1,n2,n3)
+    real(dp), intent(in)    :: M(n1,n2,n3,6)
+    integer :: i, j, k
+    i = 2 + (blockIdx%x-1)*blockDim%x + threadIdx%x - 1
+    j = 2 + (blockIdx%y-1)*blockDim%y + threadIdx%y - 1
+    k = 2 + blockIdx%z - 1
+    if (i > n1-1 .or. j > n2-1 .or. k > n3-1) return
+    NT(i,j,k) = NT(i,j,k) / ( M(i,j,k,1)*M(i,j,k,1)  +   &
+                  M(i,j,k,2)*M(i,j,k,2)  +               &
+                  M(i,j,k,3)*M(i,j,k,3)  +               &
+            2.0_dp*( M(i,j,k,4)*M(i,j,k,4)  +            &
+                  M(i,j,k,5)*M(i,j,k,5)  +               &
+                  M(i,j,k,6)*M(i,j,k,6) ) )
+  end subroutine k_div_mm
+
+  ! nu_t = -0.5 * NT * |S|  (LES = 3 final scaling, j interior)
+  attributes(global) subroutine k_nut_scale(NT, Ss, n1, n2, n3)
+    integer, value :: n1, n2, n3
+    real(dp), intent(inout) :: NT(n1,n2,n3)
+    real(dp), intent(in)    :: Ss(n1,n2,n3)
+    integer :: i, j, k
+    i = 2 + (blockIdx%x-1)*blockDim%x + threadIdx%x - 1
+    j = 2 + (blockIdx%y-1)*blockDim%y + threadIdx%y - 1
+    k = 2 + blockIdx%z - 1
+    if (i > n1-1 .or. j > n2-1 .or. k > n3-1) return
+    NT(i,j,k) = -0.5_dp * NT(i,j,k) * Ss(i,j,k)
+  end subroutine k_nut_scale
+
+  ! z-average over local 2:nzg-2 (divisor nzg-3), serial per (i,j)
+  attributes(global) subroutine k_avg_z2(avg, F, n1, n2, n3)
+    integer, value :: n1, n2, n3
+    real(dp), intent(out) :: avg(n1,n2)
+    real(dp), intent(in)  :: F(n1,n2,n3)
+    integer  :: i, j, k
+    real(dp) :: s
+    i = 2 + (blockIdx%x-1)*blockDim%x + threadIdx%x - 1
+    j = 2 + (blockIdx%y-1)*blockDim%y + threadIdx%y - 1
+    if (i > n1-1 .or. j > n2-1) return
+    s = 0.0_dp
+    do k = 2, n3-2
+       s = s + F(i,j,k)
+    end do
+    avg(i,j) = s / real(n3-3, dp)
+  end subroutine k_avg_z2
+
+  ! Germano ratio <LM>/<MM>
+  attributes(global) subroutine k_ratio2(r, a, b, n1, n2)
+    integer, value :: n1, n2
+    real(dp), intent(out) :: r(n1,n2)
+    real(dp), intent(in)  :: a(n1,n2), b(n1,n2)
+    integer :: i, j
+    i = 2 + (blockIdx%x-1)*blockDim%x + threadIdx%x - 1
+    j = 2 + (blockIdx%y-1)*blockDim%y + threadIdx%y - 1
+    if (i > n1-1 .or. j > n2-1) return
+    r(i,j) = a(i,j) / b(i,j)
+  end subroutine k_ratio2
+
+  ! nu_t(i,j,2:nzg-1) = -0.5 * ratio(i,j) * |S| (LES = 2 final)
+  attributes(global) subroutine k_nut_avg(NT, r, Ss, n1, n2, n3)
+    integer, value :: n1, n2, n3
+    real(dp), intent(out) :: NT(n1,n2,n3)
+    real(dp), intent(in)  :: r(n1,n2), Ss(n1,n2,n3)
+    integer :: i, j, k
+    i = 2 + (blockIdx%x-1)*blockDim%x + threadIdx%x - 1
+    j = 2 + (blockIdx%y-1)*blockDim%y + threadIdx%y - 1
+    k = 2 + blockIdx%z - 1
+    if (i > n1-1 .or. j > n2-1 .or. k > n3-1) return
+    NT(i,j,k) = -0.5_dp * r(i,j) * Ss(i,j,k)
+  end subroutine k_nut_avg
+
+  ! clipping (whole array)
+  attributes(global) subroutine k_clip(F, n1, n2, n3)
+    integer, value :: n1, n2, n3
+    real(dp), intent(inout) :: F(n1,n2,n3)
+    integer :: i, j, k
+    i = (blockIdx%x-1)*blockDim%x + threadIdx%x
+    j = (blockIdx%y-1)*blockDim%y + threadIdx%y
+    k = blockIdx%z
+    if (i > n1 .or. j > n2 .or. k > n3) return
+    F(i,j,k) = max( F(i,j,k), 0.0_dp )
+  end subroutine k_clip
+
+  ! y ghost rows: sgn = +1 Neumann copy, -1 Dirichlet mirror (id = 2)
+  attributes(global) subroutine k_ybc(F, n1, n2, n3, sgn)
+    integer, value :: n1, n2, n3
+    real(dp), value :: sgn
+    real(dp), intent(inout) :: F(n1,n2,n3)
+    integer :: i, k
+    i = (blockIdx%x-1)*blockDim%x + threadIdx%x
+    k = (blockIdx%y-1)*blockDim%y + threadIdx%y
+    if (i > n1 .or. k > n3) return
+    F(i,1, k) = sgn*F(i,2,   k)
+    F(i,n2,k) = sgn*F(i,n2-1,k)
+  end subroutine k_ybc
 
   !--------------------------------------------------------------------
   ! k_sij_edges — compute_Sij off-diagonal loop (edge locations):
@@ -262,7 +981,7 @@ contains
     SS = SS + 4.0_dp*s4c*s4c
     SS = SS + 4.0_dp*s5c*s5c
     SS = SS + 4.0_dp*s6c*s6c
-    SS = SS**0.5_dp
+    SS = sqrt(SS)   ! = x**0.5 under gfortran (correctly rounded)
 
     nut(i,j,k) = coef(j) * SS
 

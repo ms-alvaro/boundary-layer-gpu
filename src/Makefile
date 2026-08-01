@@ -59,6 +59,13 @@ io_mod.o: io_mod.f90
 %.o: %.f90
 	$(FC) $(FFLAGS) -c $< -o $@
 
+# les_mod: FMA off — the dynamic-Smagorinsky Germano ratio amplifies
+# FMA-vs-serial rounding differences at ill-conditioned (near-laminar)
+# points to O(1) local nu_t differences vs the CPU reference; nofma
+# restores bit-level agreement with the gfortran baseline.
+les_mod.o: les_mod.cuf
+	$(FC) $(FFLAGS) -gpu=cc80,nofma -c $< -o $@
+
 %.o: %.cuf
 	$(FC) $(FFLAGS) -c $< -o $@
 
