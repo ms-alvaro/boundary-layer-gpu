@@ -1,0 +1,24 @@
+{
+  "a": "openacc-ref",
+  "b": "openacc-ref2",
+  "tol": 1e-12,
+  "passed": true,
+  "field_diffs": {
+    "U": {
+      "max_abs": 0.0,
+      "max_rel": 0.0,
+      "rms": 0.0
+    },
+    "V": {
+      "max_abs": 0.0,
+      "max_rel": 0.0,
+      "rms": 0.0
+    },
+    "W": {
+      "max_abs": 0.0,
+      "max_rel": 0.0,
+      "rms": 0.0
+    }
+  },
+  "speedup_b_over_a": 0.9858110361113009
+}

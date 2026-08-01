@@ -1,0 +1,55 @@
+{
+  "label": "cuda-p52",
+  "exe": "/home/alvaroms/boundary-layer-gpu/boundary_layer_cuda",
+  "case": "laminar",
+  "passed": true,
+  "checks": {
+    "mean_cf_vs_golden": {
+      "value": 0.0009741043957588252,
+      "pass": true,
+      "detail": "(golden 9.741075e-04, rtol 0.0001)"
+    },
+    "max_divergence": {
+      "value": 1.56732916575808e-13,
+      "pass": true,
+      "detail": "(< 1e-12)"
+    },
+    "freestream_overshoot": {
+      "value": 7.47482256602261e-06,
+      "pass": true,
+      "detail": "(< 0.0001)"
+    },
+    "cf_vs_blasius_maxrelerr": {
+      "value": 0.0002911552098204766,
+      "pass": true,
+      "detail": "(< 0.03)"
+    }
+  },
+  "timing": {
+    "median_s_per_step": 0.0008136169999999998,
+    "ns_per_cell_per_step": 5.261906301738409,
+    "intervals_s": [
+      0.1247158,
+      0.1224451,
+      0.08136169999999998,
+      0.069112,
+      0.1197582,
+      0.09425300000000003,
+      0.07002400000000009,
+      0.06907389999999991,
+      0.07009910000000008,
+      0.129479,
+      0.1149659000000001,
+      0.07040620000000009,
+      0.06996099999999994,
+      0.06919089999999994,
+      0.1491929999999999,
+      0.1131799,
+      0.06897400000000009,
+      0.07296989999999992,
+      0.06958890000000006,
+      0.135221
+    ]
+  },
+  "profile_substep1_ms": null
+}
