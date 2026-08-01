@@ -36,6 +36,14 @@ SRC = precision_mod.f90 \
       ic_inflow_mod.f90 \
       lund_inflow_mod.f90 \
       les_mod.cuf       \
+      legacy_mpi.f90    \
+      legacy_global.f90 \
+      legacy_interpolation.f90 \
+      legacy_bc.f90     \
+      legacy_subgrid.f90 \
+      legacy_newton.f90 \
+      legacy_wallmodel.f90 \
+      wm_bridge.f90     \
       hit_inflow_mod.cuf \
       rhs_kernels.cuf   \
       bc_kernels.cuf    \
@@ -82,10 +90,21 @@ ic_inflow_mod.o:  precision_mod.o param_mod.o grid_mod.o field_mod.o
 lund_inflow_mod.o: precision_mod.o param_mod.o grid_mod.o field_mod.o \
                   mpi_mod.o ic_inflow_mod.o
 les_mod.o:        precision_mod.o param_mod.o grid_mod.o field_mod.o
+legacy_global.o:  legacy_mpi.o
+legacy_interpolation.o: legacy_global.o
+legacy_bc.o:      legacy_global.o legacy_mpi.o
+legacy_subgrid.o: legacy_global.o legacy_interpolation.o legacy_bc.o legacy_mpi.o
+legacy_newton.o:  legacy_global.o
+legacy_wallmodel.o: legacy_global.o legacy_interpolation.o legacy_subgrid.o \
+                  legacy_bc.o legacy_newton.o
+wm_bridge.o:      precision_mod.o param_mod.o grid_mod.o field_mod.o \
+                  mpi_mod.o les_mod.o legacy_global.o legacy_mpi.o \
+                  legacy_wallmodel.o
 hit_inflow_mod.o: precision_mod.o param_mod.o grid_mod.o ic_inflow_mod.o
 rhs_kernels.o:    precision_mod.o param_mod.o grid_mod.o field_mod.o les_mod.o
 bc_kernels.o:     precision_mod.o param_mod.o grid_mod.o field_mod.o \
-                  ic_inflow_mod.o hit_inflow_mod.o reductions.o mpi_mod.o
+                  ic_inflow_mod.o hit_inflow_mod.o reductions.o mpi_mod.o \
+                  wm_bridge.o
 poisson_mod.o:    precision_mod.o grid_mod.o field_mod.o reductions.o mpi_mod.o
 timestep_mod.o:   precision_mod.o param_mod.o grid_mod.o field_mod.o \
                   reductions.o rhs_kernels.o bc_kernels.o poisson_mod.o mpi_mod.o \

@@ -22,6 +22,7 @@ program boundary_layer_cuda
                            inflow_tables_to_device
   use lund_inflow_mod, only: lund_allocate, lund_init_means
   use les_mod,       only: les_allocate, les_dbg
+  use wm_bridge,     only: wm_allocate
   use poisson_mod,   only: poisson_init, poisson_finalize
   use timestep_mod,  only: timestep_init, advance_one_step, t
   use bc_kernels,    only: bc_finalize, sync_z_ghosts
@@ -50,6 +51,8 @@ program boundary_layer_cuda
   call grid_to_device()
   call fields_allocate()
   call les_allocate()                     ! LES state (no-op for LES = 0)
+  call wm_allocate()                      ! vendored wall-model stack
+                                          ! (no-op for WM = 0, Tauw = 0)
   if (inflow_boundary_flag == 3 .or. inflow_boundary_flag == 5) then
      call lund_allocate()                 ! Lund EMA state + plane buffers
   end if                                  ! (before read_restart: the

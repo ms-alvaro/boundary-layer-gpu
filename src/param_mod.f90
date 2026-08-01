@@ -456,14 +456,15 @@ contains
       stop 'unsupported feature: LES model'
     end if
 
-    if (iwall_model > 0) then
-      write(*,*) 'ERROR: WM = ', iwall_model, ' requested, but wall models are not ported (WM = 0).'
+    if (iwall_model < 0 .or. iwall_model == 10 .or. iwall_model > 15) then
+      write(*,*) 'ERROR: WM = ', iwall_model, ' is not a defined wall model', &
+                 ' (supported: 0-9, 11-15; the reference dispatcher has no 10).'
       stop 'unsupported feature: wall model'
     end if
 
-    if (istress_model /= 0) then
+    if (istress_model /= 0 .and. istress_model /= 1) then
       write(*,*) 'ERROR: TauwModel = ', istress_model, &
-                 ' requested, but wall-stress models are not ported (TauwModel = 0).'
+                 ' requested; supported: 0 (utau_ref) and 1 (log law).'
       stop 'unsupported feature: wall-stress model'
     end if
 
