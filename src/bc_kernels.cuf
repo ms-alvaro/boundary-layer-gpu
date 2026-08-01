@@ -368,6 +368,16 @@ contains
   !   F(i,n2,k) = F(i,n2-1,k)          i = 1..n1, k = 1..n3
   ! (du/dy = 0 at the lid for U on centers; dw/dy = 0 for W).
   !--------------------------------------------------------------------
+  attributes(global) subroutine bc_top_zero_kernel(F, n1, n2, n3)
+    integer,  value         :: n1, n2, n3
+    real(dp), intent(inout) :: F(n1, n2, n3)
+    integer :: i, k
+    i = (blockIdx%x - 1)*blockDim%x + threadIdx%x
+    k = (blockIdx%y - 1)*blockDim%y + threadIdx%y
+    if (i > n1 .or. k > n3) return
+    F(i,n2,k) = 0.0_dp
+  end subroutine bc_top_zero_kernel
+
   attributes(global) subroutine bc_top_zeroshear_kernel(F, n1, n2, n3)
     integer,  value         :: n1, n2, n3
     real(dp), intent(inout) :: F(n1, n2, n3)
@@ -824,6 +834,23 @@ contains
        call bc_top_upto_kernel<<<gridS, tBlock>>>(W_d, nxg, nyg, nz, &
             W_top_d, i_rescale)
        call debug_check('bc_top_upto_kernel(W)')
+    else if (top_boundary_flag == 3) then
+       !---------------------------------------------------------------
+       ! Falkner-Skan top (apply_top_bc_y_Falkner_Skan): U top row from
+       ! the precomputed U_top profile (time-invariant; ic_inflow_mod),
+       ! V(:,ny,:) = 0, dw/dy = 0 for W.
+       !---------------------------------------------------------------
+       gridS = dim3(ceil_div(nx, BX), ceil_div(nzg, BY), 1)
+       call bc_top_kernel<<<gridS, tBlock>>>(U_d, nx, nyg, nzg, U_top_d)
+       call debug_check('bc_top_kernel(U,FS)')
+
+       gridS = dim3(ceil_div(nxg, BX), ceil_div(nzg, BY), 1)
+       call bc_top_zero_kernel<<<gridS, tBlock>>>(V_d, nxg, ny, nzg)
+       call debug_check('bc_top_zero_kernel(V,FS)')
+
+       gridS = dim3(ceil_div(nxg, BX), ceil_div(nz, BY), 1)
+       call bc_top_zeroshear_kernel<<<gridS, tBlock>>>(W_d, nxg, nyg, nz)
+       call debug_check('bc_top_zeroshear_kernel(W,FS)')
     else if (top_boundary_flag == 4) then
        gridS = dim3(ceil_div(nx, BX), ceil_div(nzg, BY), 1)
        call bc_top_zeroshear_kernel<<<gridS, tBlock>>>(U_d, nx, nyg, nzg)

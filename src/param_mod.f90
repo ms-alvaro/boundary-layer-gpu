@@ -80,6 +80,7 @@ module param_mod
   ! boundary conditions
   public :: inflow_boundary_flag, top_boundary_flag
   public :: Amplitude_perturbations
+  public :: beta_hartree
   public :: Vbs_max, x_bs, sigma_bs, phi_bs
 
   ! Lund rescaling inflow (parsed, not ported — see check_supported)
@@ -172,6 +173,9 @@ module param_mod
                                       !! 3 Falkner-Skan
 
   real(dp) :: Amplitude_perturbations = 0.0_dp !< 'Amplitude' (inflow_flag=4)
+  real(dp) :: beta_hartree = 0.0_dp !< Falkner-Skan Hartree parameter (top_flag=3;
+                                    !! UNPARSED in the reference — implicitly 0 =
+                                    !! flat plate; the port reads 'beta_hartree')
 
   ! blowing/suction top-BC shape parameters (top_flag = 1 or 2)
   real(dp) :: Vbs_max  = 0.0_dp !< 'Vmax'  maximum vertical velocity
@@ -314,6 +318,7 @@ contains
     call get_dbl('WMnut'        , frac_vis_wall_model, f)
 
     call get_dbl('Amplitude'    , Amplitude_perturbations, f)
+    call get_dbl('beta_hartree' , beta_hartree    , f)
 
     call get_int('init_step'    , nstep_init_input, f)
     call get_int('init_rand'    , random_init     , f)
@@ -468,11 +473,11 @@ contains
       stop 'unsupported feature: wall-stress model'
     end if
 
-    if (inflow_boundary_flag /= 1 .and. inflow_boundary_flag /= 3 .and. &
-        inflow_boundary_flag /= 5 .and. inflow_boundary_flag /= 6) then
+    if (inflow_boundary_flag < 1 .or. inflow_boundary_flag > 6) then
       write(*,*) 'ERROR: inflow_flag = ', inflow_boundary_flag, &
-                 ' requested, but only inflow_flag = 1 (Blasius + temporal modes),', &
-                 ' 3/5 (Lund rescaling) and 6 (Blasius + HIT planes) are ported.'
+                 ' requested; supported: 1 (Blasius + temporal modes),', &
+                 ' 2 (Blasius from file), 3/5 (Lund rescaling),', &
+                 ' 4 (Blasius + random), 6 (Blasius + HIT planes).'
       stop 'unsupported feature: inflow boundary condition'
     end if
     if (inflow_boundary_flag == 3 .or. inflow_boundary_flag == 5) then
@@ -498,8 +503,7 @@ contains
       stop 'missing hit_file'
     end if
 
-    if (top_boundary_flag /= 0 .and. top_boundary_flag /= 1 .and. &
-        top_boundary_flag /= 2 .and. top_boundary_flag /= 4) then
+    if (top_boundary_flag < 0 .or. top_boundary_flag > 4) then
       write(*,*) 'ERROR: top_flag = ', top_boundary_flag, &
                  ' requested, but only top_flag = 0 (imposed velocity),', &
                  ' 1/2 (blowing-suction lid) and 4 (zero-shear tangential) are ported.'
@@ -511,12 +515,8 @@ contains
       stop 'invalid sigma for blowing/suction top'
     end if
 
-    if (itime_step == 1) then
-      write(*,*) 'ERROR: RKscheme = 1 (Euler) is not supported by the CUDA port; use RKscheme = 2 or 3.'
-      stop 'unsupported feature: Euler time stepping'
-    end if
-    if (itime_step /= 2 .and. itime_step /= 3) then
-      write(*,*) 'ERROR: RKscheme = ', itime_step, ' is invalid; use RKscheme = 2 or 3.'
+    if (itime_step < 1 .or. itime_step > 3) then
+      write(*,*) 'ERROR: RKscheme = ', itime_step, ' is invalid; use 1 (Euler), 2 or 3.'
       stop 'invalid RKscheme'
     end if
 

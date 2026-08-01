@@ -58,6 +58,7 @@ module ic_inflow_mod
   use param_mod,     only: nu, CFL, file_inflow, file_temporal_inlet, &
                            inflow_boundary_flag, top_boundary_flag, &
                            Vbs_max, x_bs, sigma_bs, phi_bs, ny_global, &
+                           beta_hartree, Amplitude_perturbations, &
                            Lx_rand, Ly_rand, Lz_rand, alpha_rand
   use grid_mod,      only: nx, ny, nz, nxm, nym, nxg, nyg, nzg, x, y, xg, yg
   use field_mod,     only: U, V, W
@@ -72,6 +73,7 @@ module ic_inflow_mod
   public :: compute_turbulent_solution_for_bc ! Lund inlet/top (inflow 3/5)
   public :: compute_blowsuction_top       ! V_bs profile (top_flag = 1/2)
   public :: inflow_tables_to_device       ! host tables -> device copies
+  public :: random_inflow_update          ! inflow_flag = 4: new noise plane
 
   !------------------- inlet / top boundary profiles (host) ------------------
   ! (reference names, global.f90; allocated by compute_blasius_solution_for_bc)
@@ -369,9 +371,32 @@ contains
 
     else if ( inflow_boundary_flag==2 ) then
 
-       ! reference: read Blasius profile from a binary file. Not ported
-       ! (check_supported rejects inflow_flag /= 1 before reaching here).
-       stop 'inflow_flag = 2 (Blasius profile from file) is not ported'
+       ! Read Blasius from file (reference boundary_conditions.f90:
+       ! 1380-1397: stream binary int32 ny, U_inlet(nyg), V_inlet(ny)).
+       ! Endianness auto-detected: Intel-era files are big-endian, newer
+       ! ones native (the reference's behavior depended on the build).
+       block
+         integer :: funit2, ios2, ny_blasius
+         write(*,*) 'Reading Blasius for inlet from file'
+         open(newunit=funit2, file=file_inflow, form='unformatted', &
+              action='read', access='stream', iostat=ios2)
+         if ( ios2 /= 0 ) stop 'missing inflow_file for inflow_flag = 2'
+         read(funit2) ny_blasius
+         if ( ny_blasius /= ny_global ) then
+            close(funit2)
+            open(newunit=funit2, file=file_inflow, form='unformatted', &
+                 action='read', access='stream', convert='big_endian')
+            read(funit2) ny_blasius
+         end if
+         if ( ny_blasius /= ny_global ) then
+            write(*,*) 'Blasius doesnt match dimensions', ny_blasius, ny_global
+            stop
+         end if
+         read(funit2) U_inlet
+         read(funit2) V_inlet
+         close(funit2)
+         W_inlet = 0.0_dp
+       end block
 
     else
        stop 'Error! inflow_boundary_flag unknown'
@@ -390,6 +415,23 @@ contains
     end do
     ! W
     W_top = 0.0_dp
+
+    ! Falkner-Skan top (top_flag = 3, apply_top_bc_y_Falkner_Skan): the
+    ! U_top profile is time-invariant — precompute it here (x_falkner =
+    ! -1, C matched to Uinf = 1 at the inlet), overriding the Blasius
+    ! U_top = 1. beta_hartree = 0 (the reference never parses it)
+    ! degenerates to a flat plate.
+    if ( top_boundary_flag == 3 ) then
+       block
+         real(dp) :: C_falkner, x_falkner
+         integer  :: ifs
+         x_falkner = -1.0_dp
+         C_falkner = 1.0_dp / ( ( x(1)-x_falkner )**( beta_hartree/(2.0_dp-beta_hartree) ) )
+         do ifs = 1, nx
+            U_top(ifs) = C_falkner*(xg(ifs)-x_falkner)**( beta_hartree/(2.0_dp-beta_hartree) )
+         end do
+       end block
+    end if
 
     deallocate(eta_source, f_source, df_source)
 
@@ -650,6 +692,48 @@ contains
   end subroutine compute_blowsuction_top
 
   !----------------------------------------------------------------------------
+  ! random_inflow_update — inflow_flag = 4: draw the Blasius + random
+  ! perturbation planes (apply_inflow_bc_x_Blasius_random, once per step:
+  ! step_beginning guard in the reference). The perturbation is weighted
+  ! by (1 - U_inlet) to stay inside the boundary layer; draw order (U
+  ! rows, then W, then V; k inner) mirrors the reference loops. RNG
+  ! sequences are NOT reproducible across builds — the reference used the
+  ! gfortran rand() extension; this port uses random_number.
+  !----------------------------------------------------------------------------
+  subroutine random_inflow_update()
+
+    integer  :: j, k
+    real(dp) :: Amp_loc, r
+
+    do j = 1, nyg
+       Amp_loc = Amplitude_perturbations * (1.0_dp - U_inlet(j))
+       do k = 1, nzg
+          call random_number(r)
+          Ut_inlet(j,k) = Amp_loc*(r-0.5_dp)
+       end do
+    end do
+    do j = 1, nyg
+       Amp_loc = Amplitude_perturbations * (1.0_dp - U_inlet(j))
+       do k = 1, nz
+          call random_number(r)
+          Wt_inlet(j,k) = Amp_loc*(r-0.5_dp)
+       end do
+    end do
+    do j = 1, ny
+       Amp_loc = Amplitude_perturbations * (1.0_dp - U_inlet(min(j,nyg)))
+       do k = 1, nzg
+          call random_number(r)
+          Vt_inlet(j,k) = Amp_loc*(r-0.5_dp)
+       end do
+    end do
+
+    Ut_inlet_d = Ut_inlet
+    Vt_inlet_d = Vt_inlet
+    Wt_inlet_d = Wt_inlet
+
+  end subroutine random_inflow_update
+
+  !----------------------------------------------------------------------------
   ! inflow_tables_to_device — allocate the device copies (first call) and copy
   ! all inflow/top tables host -> device. Call once after
   ! compute_blasius_solution_for_bc(); the tables are time-invariant (the
@@ -716,11 +800,19 @@ contains
     real(dp), allocatable, intent(out) :: eta_source(:), f_source(:), df_source(:)
 
     integer :: funit, ios
+    character(200) :: table_file
 
-    open(newunit=funit, file=file_inflow, form='formatted', action='read', &
+    ! inflow_flag = 2: file_inflow is the BINARY mean profile — the
+    ! self-similar table then comes from 'blasius_solution.dat' in the
+    ! working directory (the reference opened file_inflow for BOTH the
+    ! formatted table and the binary profile, which cannot work).
+    table_file = file_inflow
+    if ( inflow_boundary_flag == 2 ) table_file = 'blasius_solution.dat'
+
+    open(newunit=funit, file=table_file, form='formatted', action='read', &
          iostat=ios)
     if ( ios /= 0 ) then
-       write(*,*) 'ERROR: cannot open inflow_file: ', trim(file_inflow)
+       write(*,*) 'ERROR: cannot open Blasius table: ', trim(table_file)
        stop 'missing Blasius profile file'
     end if
     read(funit,*) n_source

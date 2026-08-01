@@ -67,7 +67,6 @@ long laminar-to-turbulent transient. Two practical routes:
    onto this grid, and hand the result to `filein`.
 
 The original study ran this case with `LES = 1` (constant-coefficient
-Smagorinsky). LES is **not** ported — the CUDA solver covers the DNS
-path only, so the reference input here sets `LES = 0`; on this grid
-(1156x192x34) that makes it a coarse DNS, adequate for exercising the
-recycling machinery, not for publication-grade statistics.
+Smagorinsky), which the CUDA solver now supports (validated to machine
+precision against the CPU reference); the reference input keeps
+`LES = 1`.
