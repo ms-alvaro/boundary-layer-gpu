@@ -56,7 +56,8 @@ module ic_inflow_mod
 
   use precision_mod, only: dp, pi
   use param_mod,     only: nu, CFL, file_inflow, file_temporal_inlet, &
-                           inflow_boundary_flag, &
+                           inflow_boundary_flag, top_boundary_flag, &
+                           Vbs_max, x_bs, sigma_bs, phi_bs, ny_global, &
                            Lx_rand, Ly_rand, Lz_rand, alpha_rand
   use grid_mod,      only: nx, ny, nz, nxm, nym, nxg, nyg, nzg, x, y, xg, yg
   use field_mod,     only: U, V, W
@@ -68,6 +69,8 @@ module ic_inflow_mod
   !----------------------------- public API ----------------------------------
   public :: generate_initial_condition    ! Blasius IC (random_init == 1)
   public :: compute_blasius_solution_for_bc ! inlet/top profiles + mode tables
+  public :: compute_turbulent_solution_for_bc ! Lund inlet/top (inflow 3/5)
+  public :: compute_blowsuction_top       ! V_bs profile (top_flag = 1/2)
   public :: inflow_tables_to_device       ! host tables -> device copies
 
   !------------------- inlet / top boundary profiles (host) ------------------
@@ -78,6 +81,7 @@ module ic_inflow_mod
   real(dp), allocatable, public :: U_top(:)    ! (nx ) u at top, x-faces
   real(dp), allocatable, public :: V_top(:)    ! (nxg) v at top, x-centers
   real(dp), allocatable, public :: W_top(:)    ! (nxg) w at top, x-centers
+  real(dp), allocatable, public :: Vbs_top(:)  ! (nxg) blowing/suction V (top_flag 1/2)
 
   !------------- temporal inflow-perturbation planes (host mirrors) ----------
   ! Zero when n_modes_inlet == 0; otherwise recomputed on the device by
@@ -105,6 +109,7 @@ module ic_inflow_mod
   ! Same names + `_d` (design-doc convention); filled by inflow_tables_to_device.
   real(dp), device, allocatable, public :: U_inlet_d(:), V_inlet_d(:), W_inlet_d(:)
   real(dp), device, allocatable, public :: U_top_d(:),   V_top_d(:),   W_top_d(:)
+  real(dp), device, allocatable, public :: Vbs_top_d(:)
   real(dp), device, allocatable, public :: Ut_inlet_d(:,:), Vt_inlet_d(:,:), Wt_inlet_d(:,:)
   real(dp), device, allocatable, public :: zmode_inlet_d(:), tmode_inlet_d(:)
   complex(dp), device, allocatable, public :: qu_inlet_d(:,:,:)
@@ -535,6 +540,116 @@ contains
   end subroutine compute_blasius_solution_for_bc
 
   !----------------------------------------------------------------------------
+  ! compute_turbulent_solution_for_bc — inlet/top profiles for the Lund
+  ! recycling inflow (inflow_flag = 3 or 5). Port of
+  ! boundary_conditions.f90:compute_turbulent_solution_for_bc (lines
+  ! 1208-1262): turbulent top displacement V_top = 0.0160*Rex^(-1/7)
+  ! (Vinf = Uinf*d(delta*)/dx, version 1), and for flag 5 the turbulent
+  ! mean inlet profile read from 'inflow_file'.
+  !
+  ! Port notes:
+  !  * flag 3 overwrites U(1,j,:) with the full rescaled plane
+  !    (apply_inflow_bc_x_rescaling), so the reference never reads its
+  !    (uninitialized) U_inlet; the port zeroes it because
+  !    bc_inflow_kernel always adds U_inlet(j) + Ut_inlet(j,k).
+  !  * the mean-profile file is an Intel-era big-endian stream (written
+  !    under F_UFMTENDIAN=big); read with convert='big_endian'.
+  !  * every rank reads the small profile file (the reference reads on
+  !    root + broadcasts; same values, no bcast needed).
+  !----------------------------------------------------------------------------
+  subroutine compute_turbulent_solution_for_bc()
+
+    real(dp) :: U_inf, Rex, d_delta
+    integer  :: i, ny_profile, funit, ios
+
+    ! set U_inf (reference line 1214)
+    U_inf = 1.0_dp
+
+    ! allocate boundary velocities (nprocs decomposes z only: nyg_global = nyg)
+    allocate( U_inlet(nyg), V_inlet(ny), W_inlet(nyg) )
+    allocate( U_top(nx), V_top(nxg), W_top(nxg) )
+
+    ! set top velocities (reference lines 1226-1233)
+    U_top = U_inf
+    do i = 1, nxg
+       Rex      = U_inf*xg(i)/nu
+       d_delta  = 0.0160_dp*Rex**(-1.0_dp/7.0_dp)
+       V_top(i) = U_inf*d_delta
+    end do
+    W_top = 0.0_dp
+
+    if ( inflow_boundary_flag == 5 ) then
+       ! impose own turbulent profile at the inlet (reference 1236-1260)
+       write(*,*) 'Reading Turbulent profile for inlet from file'
+       open(newunit=funit, file=file_inflow, form='unformatted', &
+            action='read', access='stream', convert='big_endian', iostat=ios)
+       if ( ios /= 0 ) then
+          write(*,*) 'ERROR: cannot open inflow_file: ', trim(file_inflow)
+          stop 'missing turbulent mean-profile file'
+       end if
+       read(funit) ny_profile
+       if ( ny_profile /= ny_global ) then
+          write(*,*) 'file_blasius_own', trim(file_inflow)
+          write(*,*) 'Profile doesnt match dimensions', ny_profile, ny_global
+          stop
+       end if
+       read(funit) U_inlet
+       read(funit) V_inlet
+       close(funit)
+       W_inlet = 0.0_dp
+    else
+       ! flag 3: the full plane is carried by Ut_inlet each step
+       U_inlet = 0.0_dp
+       V_inlet = 0.0_dp
+       W_inlet = 0.0_dp
+    end if
+
+    ! temporal component: owned by the Lund update (no Fourier modes)
+    allocate( Ut_inlet(nyg,nzg) )
+    allocate( Vt_inlet(ny ,nzg) )
+    allocate( Wt_inlet(nyg,nz ) )
+    Ut_inlet = 0.0_dp
+    Vt_inlet = 0.0_dp
+    Wt_inlet = 0.0_dp
+    n_modes_inlet = 0
+    m_modes_inlet = 0
+    beta_inlet    = 0.0_dp
+    omega_inlet   = 1.0_dp
+    dt_period     = 1.0_dp
+    ! zero-size tables so inflow_tables_to_device stays well defined
+    allocate( zmode_inlet(0), tmode_inlet(0) )
+    allocate( qu_inlet(nyg,0,0), qv_inlet(ny,0,0), qw_inlet(nyg,0,0) )
+
+  end subroutine compute_turbulent_solution_for_bc
+
+  !----------------------------------------------------------------------------
+  ! compute_blowsuction_top — precompute the blowing/suction V profile of
+  ! apply_Dirichlet_bc_y_top_BlowingSuction (boundary_conditions.f90:507-532)
+  ! as a table; the profile is time-invariant, so the per-step kernel just
+  ! imposes V(i,ny,:) = Vbs_top(i). Called for top_flag = 1 (Coleman 2018)
+  ! or 2 (Abe 2017), any inflow flag.
+  !----------------------------------------------------------------------------
+  subroutine compute_blowsuction_top()
+
+    integer :: i
+
+    allocate( Vbs_top(nxg) )
+    if ( top_boundary_flag == 1 ) then      ! Coleman 2018
+       do i = 1, nxg
+          ! Note that the minus sign is accounted in ( x_bs - x_g )
+          Vbs_top(i) = sqrt(2.0_dp)*Vbs_max*(x_bs-xg(i))/sigma_bs &
+                       *exp(0.5_dp - ((x_bs-xg(i))/sigma_bs)**2.0_dp) + phi_bs
+       end do
+    else                                    ! top_flag = 2, Abe 2017
+       do i = 1, nxg
+          Vbs_top(i) = sqrt(2.0_dp)*Vbs_max*(x_bs-xg(i))/sigma_bs &
+                       *exp(phi_bs - ((x_bs-xg(i))/sigma_bs)**2.0_dp)
+       end do
+    end if
+
+  end subroutine compute_blowsuction_top
+
+  !----------------------------------------------------------------------------
   ! inflow_tables_to_device — allocate the device copies (first call) and copy
   ! all inflow/top tables host -> device. Call once after
   ! compute_blasius_solution_for_bc(); the tables are time-invariant (the
@@ -566,6 +681,11 @@ contains
     U_top_d   = U_top
     V_top_d   = V_top
     W_top_d   = W_top
+
+    if ( allocated(Vbs_top) ) then
+       if (.not. allocated(Vbs_top_d)) allocate( Vbs_top_d(nxg) )
+       Vbs_top_d = Vbs_top
+    end if
 
     ! zero (no modes) or zeroed scratch (recomputed on device each substep)
     Ut_inlet_d = Ut_inlet

@@ -465,22 +465,47 @@ contains
       stop 'unsupported feature: wall-stress model'
     end if
 
-    if (inflow_boundary_flag /= 1 .and. inflow_boundary_flag /= 6) then
+    if (inflow_boundary_flag /= 1 .and. inflow_boundary_flag /= 3 .and. &
+        inflow_boundary_flag /= 5 .and. inflow_boundary_flag /= 6) then
       write(*,*) 'ERROR: inflow_flag = ', inflow_boundary_flag, &
-                 ' requested, but only inflow_flag = 1 (Blasius + temporal modes)', &
-                 ' and 6 (Blasius + HIT planes) are ported.'
+                 ' requested, but only inflow_flag = 1 (Blasius + temporal modes),', &
+                 ' 3/5 (Lund rescaling) and 6 (Blasius + HIT planes) are ported.'
       stop 'unsupported feature: inflow boundary condition'
+    end if
+    if (inflow_boundary_flag == 3 .or. inflow_boundary_flag == 5) then
+      if (i_rescale < 2 .or. i_rescale > nx_global-1) then
+        write(*,*) 'ERROR: inflow_flag = 3/5 needs 2 <= Lund_ix <= nx-1, got ', i_rescale
+        stop 'invalid Lund_ix'
+      end if
+      if (T_resc <= 0.0_dp) then
+        write(*,*) 'ERROR: inflow_flag = 3/5 needs Lund_T > 0, got ', T_resc
+        stop 'invalid Lund_T'
+      end if
+      if (delta_inlet <= 0.0_dp) then
+        write(*,*) 'ERROR: inflow_flag = 3/5 needs Lund_deltai > 0, got ', delta_inlet
+        stop 'invalid Lund_deltai'
+      end if
+      if (inflow_boundary_flag == 5 .and. len_trim(file_inflow) == 0) then
+        write(*,*) 'ERROR: inflow_flag = 5 requires inflow_file (turbulent mean profile).'
+        stop 'missing inflow_file'
+      end if
     end if
     if (inflow_boundary_flag == 6 .and. len_trim(file_hit_planes) == 0) then
       write(*,*) 'ERROR: inflow_flag = 6 requires hit_file in the input.'
       stop 'missing hit_file'
     end if
 
-    if (top_boundary_flag /= 0 .and. top_boundary_flag /= 4) then
+    if (top_boundary_flag /= 0 .and. top_boundary_flag /= 1 .and. &
+        top_boundary_flag /= 2 .and. top_boundary_flag /= 4) then
       write(*,*) 'ERROR: top_flag = ', top_boundary_flag, &
-                 ' requested, but only top_flag = 0 (imposed velocity)', &
-                 ' and 4 (zero-shear tangential) are ported.'
+                 ' requested, but only top_flag = 0 (imposed velocity),', &
+                 ' 1/2 (blowing-suction lid) and 4 (zero-shear tangential) are ported.'
       stop 'unsupported feature: top boundary condition'
+    end if
+    if ((top_boundary_flag == 1 .or. top_boundary_flag == 2) .and. &
+        sigma_bs == 0.0_dp) then
+      write(*,*) 'ERROR: top_flag = 1/2 needs sigma /= 0 (Gaussian width).'
+      stop 'invalid sigma for blowing/suction top'
     end if
 
     if (itime_step == 1) then
