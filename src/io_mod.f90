@@ -68,9 +68,10 @@ module io_mod
                              nyg_global, nzg_global,                           &
                              boxout_every, boxout_start, n_boxout,             &
                              dir_boxout, boxout_i0, boxout_i1, boxout_is,      &
-                             boxout_jmax, inflow_boundary_flag, LES_model
+                             boxout_jmax, inflow_boundary_flag, LES_model,  &
+                             snap3d_every, snap3d_stride, dir_snap3d
   use grid_mod,        only: nx, ny, nz, nxg, nyg, nzg,                        &
-                             x, y, z, xm, ym, zm, yg,                          &
+                             x, y, z, xm, ym, zm, yg, xg,                      &
                              weight_y_0, weight_y_1,                           &
                              z_global, zm_global, k1, k2, kg1, nzm
   use field_mod,       only: U, V, W, P, fields_from_device
@@ -104,6 +105,8 @@ module io_mod
                              !   integer, intent(in) :: istep
                              !   gated on mod(istep,nmonitor)==0 .or. istep==1:
                              !   print the monitor block (verbatim formats)
+  public :: output_snap3d    ! subroutine output_snap3d(istep)
+                             !   full-domain u,v,w float32, strided in x,z
   public :: output_boxes     ! subroutine output_boxes(istep)
                              !   subvolume float32 dumps for causal-analysis
                              !   campaigns (self-gated on the ABSOLUTE step)
@@ -491,6 +494,102 @@ contains
     call execute_command_line( string_link )
 
   end subroutine write_restart
+
+  !---------------------------------------------------------------------------
+  ! output_snap3d — full-domain coarsened 3-D snapshot stream (v3 production
+  ! campaigns). Every snap3d_every steps (absolute step, like output_boxes)
+  ! the three velocity fields are written as float32 with stride
+  ! snap3d_stride in x and z and FULL y, on their NATIVE staggered grids:
+  !
+  !   <dir_snap3d>/snap_<abs-step>.bin :
+  !     int32  magic = 20260803
+  !     int32  nxs_u, nyg, nzs_u        (U block dims)
+  !     int32  nxs_v, ny,  nzs_v        (V block dims)
+  !     int32  nxs_w, nyg, nzs_w        (W block dims)
+  !     int32  stride, abs_step
+  !     f64    t
+  !     f32    U(nxs_u,nyg,nzs_u), V(...), W(...)   (i fastest)
+  !
+  ! plus a one-time <dir_snap3d>/snap_grid.bin with the strided coordinate
+  ! arrays. Multi-rank: fields are gathered to root with the owned-plane
+  ! gather (gather_slabs_host) and strided there — strides are GLOBAL
+  ! (k = 1, 1+s, 1+2s, ... in global indices), so rank count never changes
+  ! the stored samples.
+  !---------------------------------------------------------------------------
+  subroutine output_snap3d(istep)
+
+    integer, intent(in) :: istep
+
+    character(200) :: fname
+    character(10)  :: ext
+    integer        :: unit_s, s, abs_step
+    logical, save  :: grid_written = .false.
+    real(dp), allocatable, save :: Ug3(:,:,:), Vg3(:,:,:), Wg3(:,:,:)
+
+    if (snap3d_every <= 0) return
+    if (.not. io_initialized) call io_init()
+    abs_step = istep + nstep_init
+    if (mod(abs_step, snap3d_every) /= 0) return
+
+    call refresh_host_fields(istep)
+
+    s = snap3d_stride
+
+    if (.not. allocated(Ug3)) then
+       if (is_root()) then
+          allocate ( Ug3(nx,  nyg, nzg_global) )
+          allocate ( Vg3(nxg, ny,  nzg_global) )
+          allocate ( Wg3(nxg, nyg, nz_global ) )
+       else
+          allocate ( Ug3(1,1,1), Vg3(1,1,1), Wg3(1,1,1) )
+       end if
+    end if
+
+    if (nprocs > 1) then
+       call gather_slabs_host(U, nx,  nyg, nzg, kg1, Ug3, nzg_global)
+       call gather_slabs_host(V, nxg, ny,  nzg, kg1, Vg3, nzg_global)
+       call gather_slabs_host(W, nxg, nyg, nz,  k1,  Wg3, nz_global )
+    else
+       Ug3 = U; Vg3 = V; Wg3 = W
+    end if
+
+    if (is_root()) then
+       if (.not. grid_written) then
+          open(newunit=unit_s, file=trim(adjustl(dir_snap3d))//'/snap_grid.bin', &
+               access='stream', form='unformatted', action='write')
+          write(unit_s) int(20260803, int32)
+          write(unit_s) int(size(x(1:nx:s)), int32),  int(nyg, int32), &
+                        int(size(z_global(1:nz_global:s)), int32), int(s, int32)
+          write(unit_s) x(1:nx:s)
+          write(unit_s) xg(1:nxg:s)
+          write(unit_s) y
+          write(unit_s) yg
+          write(unit_s) z_global(1:nz_global:s)
+          close(unit_s)
+          grid_written = .true.
+       end if
+
+       write(ext,'(I0.8)') abs_step
+       fname = trim(adjustl(dir_snap3d))//'/snap_'//trim(adjustl(ext))//'.bin'
+       open(newunit=unit_s, file=fname, access='stream', form='unformatted', &
+            action='write')
+       write(unit_s) int(20260803, int32)
+       write(unit_s) int(size(Ug3(1:nx:s,1,1)),  int32), int(nyg, int32), &
+                     int(size(Ug3(1,1,1:nzg_global:s)), int32)
+       write(unit_s) int(size(Vg3(1:nxg:s,1,1)), int32), int(ny,  int32), &
+                     int(size(Vg3(1,1,1:nzg_global:s)), int32)
+       write(unit_s) int(size(Wg3(1:nxg:s,1,1)), int32), int(nyg, int32), &
+                     int(size(Wg3(1,1,1:nz_global:s)),  int32)
+       write(unit_s) int(s, int32), int(abs_step, int32)
+       write(unit_s) t
+       write(unit_s) real(Ug3(1:nx:s,  :, 1:nzg_global:s), 4)
+       write(unit_s) real(Vg3(1:nxg:s, :, 1:nzg_global:s), 4)
+       write(unit_s) real(Wg3(1:nxg:s, :, 1:nz_global:s),  4)
+       close(unit_s)
+       write(*,*) 'snap3d: ', trim(fname)
+    end if
+
+  end subroutine output_snap3d
 
   !---------------------------------------------------------------------------
   ! output_boxes — subvolume ("box") output for causal-analysis campaigns.

@@ -76,6 +76,7 @@ module param_mod
   public :: file_hit_planes, N_buffer_hit, file_ygrid
   public :: boxout_every, boxout_start, n_boxout, dir_boxout
   public :: boxout_i0, boxout_i1, boxout_is, boxout_jmax
+  public :: snap3d_every, snap3d_stride, dir_snap3d
 
   ! boundary conditions
   public :: inflow_boundary_flag, top_boundary_flag
@@ -157,6 +158,10 @@ module param_mod
   integer        :: boxout_start = 0      !< absolute step to begin output
   integer        :: n_boxout = 0          !< number of boxes (<= 8)
   character(200) :: dir_boxout = './boxout' !< output directory (must exist)
+  ! full-domain coarsened 3-D snapshot stream (v3 production campaigns)
+  integer        :: snap3d_every  = 0        !< steps between 3-D snaps (0 = off)
+  integer        :: snap3d_stride = 2        !< stored stride in x and z
+  character(200) :: dir_snap3d = './snapshots' !< output directory (must exist)
   integer        :: boxout_i0(8) = 0, boxout_i1(8) = 0 !< x-index window
   integer        :: boxout_is(8) = 0      !< x-index stride
   integer        :: boxout_jmax(8) = 0    !< y-index cap (1..jmax)
@@ -371,6 +376,9 @@ contains
     if (.not. f) file_ygrid = ''
 
     ! subvolume (box) output for causal-analysis campaigns
+    call get_int('snap3d_every' , snap3d_every    , f)
+    call get_int('snap3d_stride', snap3d_stride   , f)
+    call get_str('snap3d_dir'   , dir_snap3d      , f)
     call get_int('boxout_every' , boxout_every    , f)
     if (.not. f) boxout_every = 0
     call get_int('boxout_start' , boxout_start    , f)

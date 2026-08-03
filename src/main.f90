@@ -31,7 +31,7 @@ program boundary_layer_cuda
   use hit_inflow_mod, only: init_hit_inflow
   use io_mod,        only: io_init, read_restart,                            &
                            output_stats, output_monitor, output_snapshot,    &
-                           output_boxes
+                           output_boxes, output_snap3d
 
   implicit none
   integer :: istep
@@ -109,6 +109,7 @@ program boundary_layer_cuda
      call output_monitor(istep)           ! self-gated: nmonitor
      call output_snapshot(istep)          ! self-gated: nsave (+ .restart link)
      call output_boxes(istep)             ! self-gated: causal-campaign boxes
+     call output_snap3d(istep)            ! self-gated: coarsened 3-D snaps
   end do
 
   ! ---- shutdown ----
