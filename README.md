@@ -29,10 +29,10 @@ turbulent spots in the layer below.*
 </picture>
 
 *The same case computed as a wall-resolved LES (dynamic Smagorinsky,
-`LES = 2`): 12x fewer grid points and double the time step reproduce the
-same streak growth and breakdown scenario at ~8x lower compute cost —
-here on a single GPU in 51 minutes versus 3.4 hours on two GPUs for the
-DNS above.*
+`LES = 2`) on a 12x coarser grid with double the time step, playing at
+the same time instants as the DNS above: the same streak growth and
+breakdown scenario at ~8x lower compute cost — one GPU for 51 minutes
+versus two GPUs for 3.4 hours.*
 
 ## Repository layout
 
