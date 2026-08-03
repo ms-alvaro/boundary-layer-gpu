@@ -23,6 +23,17 @@ $u'/U_\infty$ in a wall-normal $x$–$y$ plane at equal aspect ratio, axes in
 inlet-$\delta_{99}$ units. Freestream turbulence above drives streaks and
 turbulent spots in the layer below.*
 
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/img/tbl_hit_transition_les_dark.gif">
+  <img alt="Same case as wall-resolved LES" src="docs/img/tbl_hit_transition_les.gif">
+</picture>
+
+*The same case computed as a wall-resolved LES (dynamic Smagorinsky,
+`LES = 2`): 12x fewer grid points and double the time step reproduce the
+same streak growth and breakdown scenario at ~8x lower compute cost —
+here on a single GPU in 51 minutes versus 3.4 hours on two GPUs for the
+DNS above.*
+
 ## Repository layout
 
 ```
