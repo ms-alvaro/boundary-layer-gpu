@@ -1,4 +1,4 @@
-# boundary-layer-gpu
+# Boundary layer solver
 
 **A GPU-native incompressible boundary-layer DNS solver in CUDA Fortran** —
 single-GPU by default, multi-GPU capable, with a test harness that
