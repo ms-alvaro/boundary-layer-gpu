@@ -74,7 +74,8 @@ module io_mod
                              x, y, z, xm, ym, zm, yg, xg,                      &
                              weight_y_0, weight_y_1,                           &
                              z_global, zm_global, k1, k2, kg1, nzm
-  use field_mod,       only: U, V, W, P, fields_from_device
+  use field_mod,       only: U, V, W, P, fields_from_device, U_d, V_d, W_d
+  use snap3d_pack,     only: gather_strided_snap
   use lund_inflow_mod, only: Umean_resc_T, Vmean_resc_T, &
                              Umean_resc_To, Vmean_resc_To
   use les_mod,         only: nu_t, les_nut_to_host
@@ -523,35 +524,31 @@ contains
     character(200) :: fname
     character(10)  :: ext
     integer        :: unit_s, s, abs_step
+    integer        :: nxs_u, nxs_v, nzs_c, nzs_f
     logical, save  :: grid_written = .false.
-    real(dp), allocatable, save :: Ug3(:,:,:), Vg3(:,:,:), Wg3(:,:,:)
+    real(4), allocatable, save :: Us(:,:,:), Vs(:,:,:), Ws(:,:,:)
 
     if (snap3d_every <= 0) return
     if (.not. io_initialized) call io_init()
     abs_step = istep + nstep_init
     if (mod(abs_step, snap3d_every) /= 0) return
 
-    call refresh_host_fields(istep)
-
+    ! Device-side striding (branch snap3d-devpack): only the stored float32
+    ! samples leave the GPU; no full-field host refresh. Same bytes as the
+    ! previous host path real(Ug3(1:nx:s,:,1:nzg_global:s),4).
     s = snap3d_stride
-
-    if (.not. allocated(Ug3)) then
+    nxs_u = (nx  - 1) / s + 1;  nxs_v = (nxg - 1) / s + 1
+    nzs_c = (nzg_global - 1) / s + 1;  nzs_f = (nz_global - 1) / s + 1
+    if (.not. allocated(Us)) then
        if (is_root()) then
-          allocate ( Ug3(nx,  nyg, nzg_global) )
-          allocate ( Vg3(nxg, ny,  nzg_global) )
-          allocate ( Wg3(nxg, nyg, nz_global ) )
+          allocate ( Us(nxs_u, nyg, nzs_c), Vs(nxs_v, ny, nzs_c), Ws(nxs_v, nyg, nzs_f) )
        else
-          allocate ( Ug3(1,1,1), Vg3(1,1,1), Wg3(1,1,1) )
+          allocate ( Us(1,1,1), Vs(1,1,1), Ws(1,1,1) )
        end if
     end if
-
-    if (nprocs > 1) then
-       call gather_slabs_host(U, nx,  nyg, nzg, kg1, Ug3, nzg_global)
-       call gather_slabs_host(V, nxg, ny,  nzg, kg1, Vg3, nzg_global)
-       call gather_slabs_host(W, nxg, nyg, nz,  k1,  Wg3, nz_global )
-    else
-       Ug3 = U; Vg3 = V; Wg3 = W
-    end if
+    call gather_strided_snap(U_d, nx,  nyg, nzg, kg1, s, Us)
+    call gather_strided_snap(V_d, nxg, ny,  nzg, kg1, s, Vs)
+    call gather_strided_snap(W_d, nxg, nyg, nz,  k1,  s, Ws)
 
     if (is_root()) then
        if (.not. grid_written) then
@@ -574,17 +571,14 @@ contains
        open(newunit=unit_s, file=fname, access='stream', form='unformatted', &
             action='write')
        write(unit_s) int(20260803, int32)
-       write(unit_s) int(size(Ug3(1:nx:s,1,1)),  int32), int(nyg, int32), &
-                     int(size(Ug3(1,1,1:nzg_global:s)), int32)
-       write(unit_s) int(size(Vg3(1:nxg:s,1,1)), int32), int(ny,  int32), &
-                     int(size(Vg3(1,1,1:nzg_global:s)), int32)
-       write(unit_s) int(size(Wg3(1:nxg:s,1,1)), int32), int(nyg, int32), &
-                     int(size(Wg3(1,1,1:nz_global:s)),  int32)
+       write(unit_s) int(nxs_u, int32), int(nyg, int32), int(nzs_c, int32)
+       write(unit_s) int(nxs_v, int32), int(ny,  int32), int(nzs_c, int32)
+       write(unit_s) int(nxs_v, int32), int(nyg, int32), int(nzs_f, int32)
        write(unit_s) int(s, int32), int(abs_step, int32)
        write(unit_s) t
-       write(unit_s) real(Ug3(1:nx:s,  :, 1:nzg_global:s), 4)
-       write(unit_s) real(Vg3(1:nxg:s, :, 1:nzg_global:s), 4)
-       write(unit_s) real(Wg3(1:nxg:s, :, 1:nz_global:s),  4)
+       write(unit_s) Us
+       write(unit_s) Vs
+       write(unit_s) Ws
        close(unit_s)
        write(*,*) 'snap3d: ', trim(fname)
     end if

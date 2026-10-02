@@ -1,0 +1,88 @@
+!=============================================================================
+! snap3d_pack — device-side striding for the snap3d stream.
+!
+! pack_strided_d: dst(ii,j,kk) = real(src(1+(ii-1)*s, j, k0+(kk-1)*s), 4)
+! for ii = 1..nxs, j = 1..n2, kk = 1..nk, computed on the GPU so only the
+! stored samples (float32, 1/s^2 of the field) cross PCIe and MPI. The
+! double->single rounding is IEEE round-to-nearest on both host and device,
+! so the stored bytes equal the previous host-side real(...,4) path.
+!=============================================================================
+module snap3d_pack
+  use cudafor
+  use mpi
+  use precision_mod, only: dp
+  use mpi_mod,       only: myid, nprocs
+  implicit none
+  private
+  public :: pack_strided_d, gather_strided_snap
+contains
+  !---------------------------------------------------------------------------
+  ! gather_strided_snap: strided float32 samples of a z-slabbed DEVICE field
+  ! onto root, glob(1:nxs, 1:n2, 1:nzs) with global z index k = 1, 1+s, ...
+  ! Owned-plane attribution is the one of mpi_mod:gather_slabs_host
+  ! (rank 0: local 1..n3loc-1; interior: 2..n3loc-1; last: 2..n3loc;
+  ! single rank: 1..n3loc), so rank count never changes the stored samples.
+  !---------------------------------------------------------------------------
+  subroutine gather_strided_snap(src, n1, n2, n3loc, start, s, glob)
+    integer,  intent(in)          :: n1, n2, n3loc, start, s
+    real(dp), device, intent(in)  :: src(n1, n2, n3loc)
+    real(4),  intent(inout)       :: glob(:,:,:)
+    real(4),  allocatable :: buf(:,:,:)
+    integer :: l0, l1, g0, g1, kf, nk, pos, nxs, r, meta(2), ierr
+    integer :: st(MPI_STATUS_SIZE)
+    nxs = (n1 - 1) / s + 1
+    if (nprocs == 1) then
+      l0 = 1; l1 = n3loc
+    else if (myid == 0) then
+      l0 = 1; l1 = n3loc - 1
+    else if (myid < nprocs - 1) then
+      l0 = 2; l1 = n3loc - 1
+    else
+      l0 = 2; l1 = n3loc
+    end if
+    g0 = start + l0 - 1; g1 = start + l1 - 1
+    kf = g0 + mod(s - mod(g0 - 1, s), s)          ! first global k>=g0 with mod(k-1,s)==0
+    nk = 0; if (kf <= g1) nk = (g1 - kf) / s + 1
+    pos = (kf - 1) / s + 1
+    allocate ( buf(nxs, n2, max(nk,1)) )
+    call pack_strided_d(src, n1, n2, n3loc, s, kf - start + 1, nk, buf)
+    if (myid == 0) then
+      if (nk > 0) glob(:, :, pos:pos+nk-1) = buf(:, :, 1:nk)
+      do r = 1, nprocs - 1
+        call MPI_Recv(meta, 2, MPI_INTEGER, r, 910, MPI_COMM_WORLD, st, ierr)
+        if (meta(2) > 0) then
+          deallocate (buf); allocate ( buf(nxs, n2, meta(2)) )
+          call MPI_Recv(buf, nxs*n2*meta(2), MPI_REAL, r, 911, MPI_COMM_WORLD, st, ierr)
+          glob(:, :, meta(1):meta(1)+meta(2)-1) = buf
+        end if
+      end do
+    else
+      meta = [pos, nk]
+      call MPI_Send(meta, 2, MPI_INTEGER, 0, 910, MPI_COMM_WORLD, ierr)
+      if (nk > 0) call MPI_Send(buf, nxs*n2*nk, MPI_REAL, 0, 911, MPI_COMM_WORLD, ierr)
+    end if
+    deallocate (buf)
+  end subroutine gather_strided_snap
+
+  subroutine pack_strided_d(src, n1, n2, n3, s, k0, nk, dst_h)
+    integer,  intent(in)            :: n1, n2, n3, s, k0, nk
+    real(dp), device, intent(in)    :: src(n1, n2, n3)
+    real(4),  intent(out)           :: dst_h(:,:,:)
+    real(4),  device, allocatable   :: dst(:,:,:)
+    integer :: ii, j, kk, nxs
+    nxs = (n1 - 1) / s + 1
+    allocate ( dst(nxs, n2, max(nk,1)) )
+    if (nk > 0) then
+      !$cuf kernel do(3) <<<*,*>>>
+      do kk = 1, nk
+        do j = 1, n2
+          do ii = 1, nxs
+            dst(ii, j, kk) = real(src(1 + (ii-1)*s, j, k0 + (kk-1)*s), 4)
+          end do
+        end do
+      end do
+      dst_h(:, :, 1:nk) = dst(:, :, 1:nk)
+    end if
+    deallocate (dst)
+  end subroutine pack_strided_d
+end module snap3d_pack
