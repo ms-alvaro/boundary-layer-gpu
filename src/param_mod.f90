@@ -82,6 +82,7 @@ module param_mod
   public :: inflow_boundary_flag, top_boundary_flag
   public :: Amplitude_perturbations
   public :: beta_hartree
+  public :: x_le, le_active, le_open, le_ramp
   public :: Vbs_max, x_bs, sigma_bs, phi_bs
 
   ! Lund rescaling inflow (parsed, not ported — see check_supported)
@@ -178,6 +179,19 @@ module param_mod
                                       !! 3 Falkner-Skan
 
   real(dp) :: Amplitude_perturbations = 0.0_dp !< 'Amplitude' (inflow_flag=4)
+  ! Leading edge inside the domain ('x_le', fst_hit_tu2_aps v5): bottom is a
+  ! free-slip symmetry plane for x < x_le and a no-slip plate for x >= x_le;
+  ! inlet mean uniform, Blasius IC / top displacement measured from x_le.
+  ! Absent key -> le_active = .false. -> every code path identical to before.
+  real(dp) :: x_le = -1.0e30_dp
+  logical  :: le_active = .false.
+  ! 'le_open' = 1: upstream of x_le the bottom is OPEN (fst_hit_tu2_aps v5b):
+  ! mean symmetric, fluctuations = Taylor-delayed unmirrored HIT (hit_inflow_mod)
+  integer  :: le_open = 0
+  ! 'le_ramp' = n_r > 0: regularised leading edge — over the n_r faces before
+  ! x_le the ghost factor goes linearly from +1 (free slip) to -1 (no slip)
+  ! and the open-bottom HIT weight from 1 to 0 (audit v5b major 1)
+  integer  :: le_ramp = 0
   real(dp) :: beta_hartree = 0.0_dp !< Falkner-Skan Hartree parameter (top_flag=3;
                                     !! UNPARSED in the reference — implicitly 0 =
                                     !! flat plate; the port reads 'beta_hartree')
@@ -324,6 +338,12 @@ contains
 
     call get_dbl('Amplitude'    , Amplitude_perturbations, f)
     call get_dbl('beta_hartree' , beta_hartree    , f)
+    call get_dbl('x_le'         , x_le            , f)
+    le_active = f
+    call get_int('le_open'      , le_open         , f)
+    if (.not. f) le_open = 0
+    call get_int('le_ramp'      , le_ramp         , f)
+    if (.not. f) le_ramp = 0
 
     call get_int('init_step'    , nstep_init_input, f)
     call get_int('init_rand'    , random_init     , f)

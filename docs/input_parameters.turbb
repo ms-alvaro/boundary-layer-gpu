@@ -123,3 +123,30 @@ TauwModel = 0
 ! 0
 !! Hartree parameter for Falkner-Skan
 ! 0
+
+! ---------------------------------------------------------------------------
+! Leading edge inside the domain (optional). Without x_le the solver behaves
+! exactly as before.
+!   x_le    : streamwise position of the leading edge of a zero-thickness plate.
+!             Bottom boundary for x < x_le is a free-slip symmetry plane, for
+!             x >= x_le a no-slip plate. The inlet mean is uniform plus the
+!             potential-flow correction of the plate displacement, and the
+!             Blasius IC and the top-boundary displacement are measured from x_le.
+!   le_open : 1 -> open bottom upstream of x_le (needs inflow_flag = 6, HIT).
+!             The mean stays symmetric. The fluctuations crossing y = 0 are the
+!             unmirrored HIT planes delayed by tau = (x - x_inlet)/U_inf (Taylor).
+!             The net volume flux through the open patch is removed every step.
+!   le_ramp : n > 0 -> regularised leading edge. Over the n cells before x_le the
+!             ghost factor goes linearly from free slip to no slip and the
+!             open-bottom HIT weight from 1 to 0. 0 -> sharp edge.
+! x_le = 1.3504349615
+! le_open = 1
+! le_ramp = 8
+
+! 3-D snapshots (optional), single precision, strided in x and z, full y:
+!   snap3d_every  : steps between snapshots (0 -> off)
+!   snap3d_stride : stored stride in x and z (packed on the GPU, gathered on rank 0)
+!   snap3d_dir    : output directory (must exist). Grid in snap_grid.bin.
+! snap3d_every = 10
+! snap3d_stride = 3
+! snap3d_dir = ./snapshots

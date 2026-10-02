@@ -59,7 +59,8 @@ module ic_inflow_mod
                            inflow_boundary_flag, top_boundary_flag, &
                            Vbs_max, x_bs, sigma_bs, phi_bs, ny_global, &
                            beta_hartree, Amplitude_perturbations, &
-                           Lx_rand, Ly_rand, Lz_rand, alpha_rand
+                           Lx_rand, Ly_rand, Lz_rand, alpha_rand, &
+                           x_le, le_active
   use grid_mod,      only: nx, ny, nz, nxm, nym, nxg, nyg, nzg, x, y, xg, yg
   use field_mod,     only: U, V, W
   use cudafor
@@ -150,6 +151,7 @@ contains
     real(dp), allocatable :: xg_init(:), yg_init(:)
 
     write(*,*) 'Generating initial condition'
+    call snap_le()
 
     ! start time
     t = 0.0_dp
@@ -182,8 +184,11 @@ contains
     ! U is at x-faces (x), y-centers (yg_init)
     U = U_inf
     do ii = 1, nx
+       if (le_active) then                 ! leading edge: uniform upstream,
+          if (x(ii) - x_le <= 0.0_dp) cycle  ! Blasius from x_le downstream
+       end if
        do jj = 1, nyg
-          eta_local = yg_init(jj) * sqrt( U_inf/(2.0_dp*nu*x(ii)) )
+          eta_local = yg_init(jj) * sqrt( U_inf/(2.0_dp*nu*xdist(x(ii))) )
           j0 = 0
           do k = 2, n_source
              if ( eta_source(k) > eta_local ) then
@@ -206,9 +211,12 @@ contains
     ! V is at x-centers (xg_init), y-faces (y)
     V = 0.0_dp
     do ii = 1, nxg
-       Rex_ref = U_inf*xg_init(ii)/nu
+       if (le_active) then
+          if (xg_init(ii) - x_le <= 0.0_dp) cycle   ! V = 0 upstream of x_le
+       end if
+       Rex_ref = U_inf*xdist(xg_init(ii))/nu
        do jj = 1, ny
-          eta_local = y(jj) * sqrt( U_inf/(2.0_dp*nu*xg_init(ii)) )
+          eta_local = y(jj) * sqrt( U_inf/(2.0_dp*nu*xdist(xg_init(ii))) )
           j0 = 0
           do k = 2, n_source
              if ( eta_source(k) > eta_local ) then
@@ -303,6 +311,7 @@ contains
 
     ! set U_inf
     U_inf = 1.0_dp
+    call snap_le()
 
     ! allocate boundary velocities (nprocs = 1: nyg_global = nyg, ...)
     allocate( U_inlet(nyg), V_inlet(ny), W_inlet(nyg) )
@@ -319,6 +328,10 @@ contains
 
        ! Generate own Blasius
        write(*,*) 'Generating own Blasius for inlet'
+       if (le_active) then
+          if (x(1) - x_le > 0.0_dp .or. xg(1) - x_le > 0.0_dp) &
+             stop 'x_le must lie downstream of the inlet (x_le > xg(1))'
+       end if
 
        ! compute solution at inlet
        ! U
@@ -369,6 +382,25 @@ contains
        ! W
        W_inlet = 0.0_dp
 
+       ! leading edge inside the domain: the inlet sees the undisturbed
+       ! uniform stream (no plate upstream of x_le)
+       if (le_active) then
+          block
+            real(dp) :: up, vp
+            do j = 1, nyg                       ! u_pot is even in y (ghost j=1 at yg<0)
+               call pot_le(x(1) - x_le, abs(yg(j)), up, vp)
+               U_inlet(j) = U_inf + up
+            end do
+            do j = 1, ny                        ! v_pot(x<x_le, 0) = 0
+               call pot_le(xg(1) - x_le, y(j), up, vp)
+               V_inlet(j) = vp
+            end do
+            W_inlet = 0.0_dp
+            write(*,*) '   leading edge at x_le = ', x_le, ': potential-flow inlet mean,', &
+                       ' U_inlet ', minval(U_inlet), maxval(U_inlet), ' V_inlet max ', maxval(V_inlet)
+          end block
+       end if
+
     else if ( inflow_boundary_flag==2 ) then
 
        ! Read Blasius from file (reference boundary_conditions.f90:
@@ -415,6 +447,29 @@ contains
     end do
     ! W
     W_top = 0.0_dp
+
+    ! leading edge inside the domain: the mean flow outside the boundary layer
+    ! is the potential flow of the Blasius displacement body, i.e. the upper
+    ! half plane with the source sheet m(x) = d(delta*)/dx = ce sqrt(nu/(x-x_le))
+    ! on y = 0 for x > x_le (audit v5 finding 1). The lid takes V_top(x) =
+    ! v_pot(x, y(ny)) (smooth, total flux = delta*), and the inlet takes
+    ! U_inlet = 1 + u_pot(x(1), y), V_inlet = v_pot(xg(1), y) (set above in
+    ! the inflow branch), so the domain is a window of that flow: no mean
+    ! vorticity is injected, U_e = 1 on the plate (u_pot(x>x_le, 0+) = 0).
+    if (le_active) then
+       block
+         integer  :: ii
+         real(dp) :: up, vp
+         do ii = 1, nxg
+            call pot_le(xg(ii) - x_le, y(ny), up, vp)
+            V_top(ii) = vp
+         end do
+         write(*,*) '   leading edge: potential-flow lid V_top; max = ', maxval(V_top), &
+                    ' at x-x_le = ', xg(maxloc(V_top,1)) - x_le, &
+                    ' int V_top dx / delta*(x_end) = ', &
+                    sum(V_top(2:nxg-1)*(x(2:nxg-1)-x(1:nxg-2))) / (1.7208_dp*sqrt(nu*(x(nx)-x_le)))
+       end block
+    end if
 
     ! Falkner-Skan top (top_flag = 3, apply_top_bc_y_Falkner_Skan): the
     ! U_top profile is time-invariant — precompute it here (x_falkner =
@@ -794,6 +849,70 @@ contains
   ! reference read the same file with identical inline code
   ! (input_output.f90:196-202, boundary_conditions.f90:1475-1483).
   !----------------------------------------------------------------------------
+  !----------------------------------------------------------------------------
+  ! xdist — streamwise distance used by the Blasius similarity variable:
+  ! from x = 0 (legacy) or from the leading edge x_le when it is active.
+  !----------------------------------------------------------------------------
+  !----------------------------------------------------------------------------
+  ! pot_le — potential flow induced at (X = x - x_le, yy >= 0) by the Blasius
+  ! displacement source sheet m(x') = ce sqrt(nu/x'), x' > 0, on y = 0 in the
+  ! upper half plane (ce = 0.8604 = (eta f' - f)_inf/sqrt(2) of the table):
+  !   u' = (1/pi) int m (X - x') / ((X - x')^2 + y^2) dx'
+  !   v  = (1/pi) int m  y       / ((X - x')^2 + y^2) dx'
+  ! x' = s^2 removes the source singularity (m dx' = 2 ce sqrt(nu) ds). The
+  ! u' integrand tends to -1/s^2 for s -> inf: tail -1/S added analytically;
+  ! the v tail (y/(3 S^3)) likewise. Only evaluated at the inlet (X <= -0.3)
+  ! and at the lid (y = Ly), where the kernel is smooth.
+  !----------------------------------------------------------------------------
+  subroutine pot_le(X, yy, up, vp)
+    real(dp), intent(in)  :: X, yy
+    real(dp), intent(out) :: up, vp
+    real(dp), parameter   :: ce = 0.86039_dp, pi_ = 3.141592653589793238_dp
+    integer,  parameter   :: ns = 400000
+    real(dp) :: S, ds, sv, a1, d, fu0, fv0, fu1, fv1, au, av
+    integer  :: is
+    S  = sqrt( 400.0_dp*( abs(X) + yy ) + 400.0_dp )
+    ds = S/real(ns, dp)
+    d = X**2 + yy**2
+    fu0 = X/d; fv0 = yy/d
+    au = 0.0_dp; av = 0.0_dp
+    do is = 1, ns
+       sv = ds*real(is, dp)
+       a1 = X - sv*sv
+       d  = a1*a1 + yy*yy
+       fu1 = a1/d; fv1 = yy/d
+       au = au + 0.5_dp*(fu0 + fu1)*ds
+       av = av + 0.5_dp*(fv0 + fv1)*ds
+       fu0 = fu1; fv0 = fv1
+    end do
+    au = au - 1.0_dp/S
+    av = av + yy/(3.0_dp*S**3)
+    up = 2.0_dp*ce*sqrt(nu)*au/pi_
+    vp = 2.0_dp*ce*sqrt(nu)*av/pi_
+  end subroutine pot_le
+
+  !----------------------------------------------------------------------------
+  ! snap_le — put x_le exactly on the nearest U face x(i) (audit v5b major 2:
+  ! a round-off-short x(i) moved the plate start one face). Idempotent.
+  !----------------------------------------------------------------------------
+  subroutine snap_le()
+    integer :: i
+    if (.not. le_active) return
+    i = nint( (x_le - x(1))/(x(2) - x(1)) ) + 1
+    if (abs(x(i) - x_le) > 1.0e-6_dp*(x(2) - x(1)) .and. abs(x(i) - x_le) > 0.0_dp) &
+       write(*,*) '   leading edge: x_le snapped from ', x_le, ' to face ', i, ' x = ', x(i)
+    x_le = x(i)
+  end subroutine snap_le
+
+  pure real(dp) function xdist(xx)
+    real(dp), intent(in) :: xx
+    if (le_active) then
+       xdist = xx - x_le
+    else
+       xdist = xx
+    end if
+  end function xdist
+
   subroutine read_blasius_source(n_source, eta_source, f_source, df_source)
 
     integer,               intent(out) :: n_source

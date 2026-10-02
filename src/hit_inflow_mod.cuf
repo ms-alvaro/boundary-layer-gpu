@@ -27,8 +27,10 @@ module hit_inflow_mod
 
   use iso_fortran_env, only: int64
   use precision_mod,   only: dp, ceil_div
-  use param_mod,       only: CFL, file_hit_planes, N_buffer_hit, nz_global
-  use grid_mod,        only: ny, nz, nyg, nzg, y, yg, z, zg
+  use param_mod,       only: CFL, file_hit_planes, N_buffer_hit, nz_global, &
+                             x_le, le_active, le_open, le_ramp
+  use grid_mod,        only: ny, nz, nyg, nzg, y, yg, z, zg, nx, nxg, x, xg, x_d, xg_d
+  use field_mod,       only: U_d, V_d, W_d
   use ic_inflow_mod,   only: Ut_inlet_d, Vt_inlet_d, Wt_inlet_d
   use cudafor
 
@@ -38,6 +40,10 @@ module hit_inflow_mod
   public :: init_hit_inflow    ! call once, after grids + inflow tables exist
   public :: update_hit_inlet   ! call per BC application when inflow_flag = 6
   public :: hit_finalize
+  public :: hit_open_bottom    ! le_open: Taylor-delayed HIT on the bottom for x < x_le
+  public :: hit_open_iup       ! last V column (xg) upstream of x_le
+  real(dp) :: tau_max_hit = 0.0_dp   !< le_open: longest Taylor delay kept in the buffer
+  integer  :: hit_open_iup = 0
 
   ! header metadata (file format v2)
   integer  :: n_planes_hit = 0       !< total planes in the file
@@ -133,6 +139,17 @@ contains
     write(*,*) '   buffer = ', N_buffer_hit, ' planes (', &
                real(N_buffer_hit, dp)*real(nyg*nzg+ny*nzg+nyg*nz, dp)*8.0_dp/1.0e9_dp, ' GB)'
     write(*,*) '   Tu = ', Tu_hit, '  y_blend = ', y_blend_hit
+
+    if (le_active .and. le_open == 1) then
+       tau_max_hit = ( x_le - x(1) ) + 2.0_dp*dt_plane_hit     ! U_inf = 1
+       hit_open_iup = count( xg < x_le )
+       if ( real(N_buffer_hit, dp) < tau_max_hit/dt_plane_hit + 20.0_dp ) &
+          stop 'le_open: N_buffer_hit too small for the Taylor delay of the open bottom'
+       if ( y_hit_f(1) >= 0.0_dp ) &
+          stop 'le_open: the plane library needs a row below y = 0 (open-bottom library)'
+       write(*,*) '   le_open: open bottom upstream of x_le, tau_max = ', tau_max_hit, &
+                  ' planes ', tau_max_hit/dt_plane_hit, ' V columns 2..', hit_open_iup
+    end if
 
   end subroutine init_hit_inflow
 
@@ -275,7 +292,7 @@ contains
 
     real(dp), intent(in) :: t
 
-    integer    :: ip0, p0, il0
+    integer    :: ip0, p0, il0, plo
     real(dp)   :: theta
     type(dim3) :: tb, gr
 
@@ -290,9 +307,13 @@ contains
     end if
     p0 = ip0 + 1                        ! 1-based file index of left plane
 
-    ! reload if [p0, p0+1] not inside the buffer
-    if ( p0 < ibuf_start_hit .or. p0+1 > ibuf_start_hit+n_buf-1 ) then
-       call load_hit_buffer(p0)
+    ! reload if [p0, p0+1] not inside the buffer. With le_open the buffer
+    ! must also hold the planes of the Taylor-delayed times t - tau, tau up to
+    ! tau_max_hit (upstream bottom boundary): the window then starts at plo.
+    plo = p0
+    if (le_active .and. le_open == 1) plo = max(1, int( (t - tau_max_hit)/dt_plane_hit ) + 1)
+    if ( plo < ibuf_start_hit .or. p0+1 > ibuf_start_hit+n_buf-1 ) then
+       call load_hit_buffer(plo)
        hit_buf_u_d = hit_buf_u
        hit_buf_v_d = hit_buf_v
        hit_buf_w_d = hit_buf_w
@@ -312,6 +333,99 @@ contains
                                   N_buffer_hit, il0, theta)
 
   end subroutine update_hit_inlet
+
+  !----------------------------------------------------------------------------
+  ! hit_open_bottom — le_open = 1 (fst_hit_tu2_aps v5b). Upstream of x_le the
+  ! bottom plane y = 0 is inside the fluid of the true (two-sided) flow: the
+  ! MEAN is symmetric about it, the turbulence is not. The buffer rows hold
+  ! the unmirrored HIT fluctuation on the inlet grids: row 1 at yg(1) < 0
+  ! (ghost) and row 2 at yg(2) for u,w; row 1 at y(1) = 0 for v. At a
+  ! station x the fluid crossing y = 0 left the inlet tau = (x - x(1))/U_inf
+  ! earlier (Taylor), so
+  !   V(i,1,k) = v_HIT(y=0; t - tau)                      (net flux removed
+  !                                                          by the caller)
+  !   U(i,1,k) = U(i,2,k) + [u_HIT(yg1) - u_HIT(yg2)](t - tau)   (x faces)
+  !   W(i,1,k) = W(i,2,k) + [w_HIT(yg1) - w_HIT(yg2)](t - tau)   (x centres)
+  ! i.e. symmetric mean + the HIT's own wall-normal jump. Called after the
+  ! wall BC (which set the free-slip ghosts there).
+  !----------------------------------------------------------------------------
+  subroutine hit_open_bottom(t)
+    real(dp), intent(in) :: t
+    type(dim3) :: tb, gr
+    real(dp) :: lr
+    lr = real(le_ramp, dp)*(x(2) - x(1))
+    tb = dim3(64, 4, 1)
+    gr = dim3( ceil_div(nx, 64), ceil_div(nzg, 4), 1 )
+    call k_open_uw<<<gr, tb>>>(U_d, hit_buf_u_d, nx, nyg, nzg, N_buffer_hit, x_d, &
+         x(1), x_le, lr, t, dt_plane_hit, ibuf_start_hit, n_buf)
+    gr = dim3( ceil_div(nxg, 64), ceil_div(nz, 4), 1 )
+    call k_open_uw<<<gr, tb>>>(W_d, hit_buf_w_d, nxg, nyg, nz, N_buffer_hit, xg_d, &
+         x(1), x_le, lr, t, dt_plane_hit, ibuf_start_hit, n_buf)
+    gr = dim3( ceil_div(nxg, 64), ceil_div(nzg, 4), 1 )
+    call k_open_v<<<gr, tb>>>(V_d, hit_buf_v_d, nxg, ny, nzg, N_buffer_hit, xg_d, &
+         x(1), x_le, lr, t, dt_plane_hit, ibuf_start_hit, n_buf)
+  end subroutine hit_open_bottom
+
+  ! local buffer index + weight of the Taylor-delayed time (clamped to the
+  ! buffer; t - tau < 0 during the first tau of a cold start -> plane 1)
+  attributes(device) subroutine delayed_index(t, tau, dtp, ib0, nb, il, th)
+    real(dp), value :: t, tau, dtp
+    integer,  value :: ib0, nb
+    integer,  intent(out)  :: il
+    real(dp), intent(out)  :: th
+    real(dp) :: tq
+    integer  :: ip
+    tq = max(t - tau, 0.0_dp)
+    ip = int(tq/dtp)
+    th = tq/dtp - real(ip, dp)
+    il = ip + 1 - ib0 + 1
+    if (il < 1)      then; il = 1;      th = 0.0_dp; end if
+    if (il > nb - 1) then; il = nb - 1; th = 1.0_dp; end if
+  end subroutine delayed_index
+
+  attributes(global) subroutine k_open_uw(F, buf, n1, n2, n3, nb, xc, x1, xle, lr, t, dtp, ib0, nbuf)
+    integer,  value :: n1, n2, n3, nb, ib0, nbuf
+    real(dp), value :: x1, xle, lr, t, dtp
+    real(dp), intent(inout) :: F(n1, n2, n3)
+    real(dp), intent(in)    :: buf(n2, n3, nb), xc(n1)
+    integer  :: i, k, il
+    real(dp) :: th, g1, g2
+    i = (blockIdx%x - 1)*blockDim%x + threadIdx%x
+    k = (blockIdx%y - 1)*blockDim%y + threadIdx%y
+    if (i > n1 .or. k > n3) return
+    if (xc(i) >= xle) return
+    call delayed_index(t, xc(i) - x1, dtp, ib0, nbuf, il, th)
+    g1 = (1.0_dp-th)*buf(1,k,il) + th*buf(1,k,il+1)
+    g2 = (1.0_dp-th)*buf(2,k,il) + th*buf(2,k,il+1)
+    ! the wall kernel already set the (possibly partial-slip) ghost g*F(i,2,k);
+    ! add the HIT jump with weight (1+g)/2 (1 upstream of the ramp)
+    F(i,1,k) = F(i,1,k) + ramp_w(xc(i), xle, lr)*(g1 - g2)
+  end subroutine k_open_uw
+
+  attributes(global) subroutine k_open_v(F, buf, n1, n2, n3, nb, xc, x1, xle, lr, t, dtp, ib0, nbuf)
+    integer,  value :: n1, n2, n3, nb, ib0, nbuf
+    real(dp), value :: x1, xle, lr, t, dtp
+    real(dp), intent(inout) :: F(n1, n2, n3)
+    real(dp), intent(in)    :: buf(n2, n3, nb), xc(n1)
+    integer  :: i, k, il
+    real(dp) :: th
+    i = (blockIdx%x - 1)*blockDim%x + threadIdx%x
+    k = (blockIdx%y - 1)*blockDim%y + threadIdx%y
+    if (i > n1 .or. k > n3) return
+    if (xc(i) >= xle) return
+    call delayed_index(t, xc(i) - x1, dtp, ib0, nbuf, il, th)
+    F(i,1,k) = ramp_w(xc(i), xle, lr)*( (1.0_dp-th)*buf(1,k,il) + th*buf(1,k,il+1) )
+  end subroutine k_open_v
+
+  ! open-bottom weight: 1 upstream of the ramp, (1+g)/2 = 1 - (x-(xle-lr))/lr inside
+  attributes(device) pure real(dp) function ramp_w(xx, xle, lr)
+    real(dp), intent(in) :: xx, xle, lr
+    if (xx < xle - lr) then
+       ramp_w = 1.0_dp
+    else
+       ramp_w = 1.0_dp - (xx - (xle - lr))/lr
+    end if
+  end function ramp_w
 
   !----------------------------------------------------------------------------
   ! hit_finalize — free the buffers (optional, at shutdown).

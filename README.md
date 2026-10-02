@@ -108,7 +108,10 @@ Blasius + random, HIT planes), all top BCs (Dirichlet, blowing/suction,
 Falkner-Skan, zero-shear), LES (constant + dynamic Smagorinsky, on the
 GPU), all 15 wall models and the log-law wall-stress model (the reference
 wall-model stack runs verbatim on the host, bridged per substep), restart
-and box output. Two memory-corruption bugs found in the reference wall
+and box output. Optional: a leading edge inside the domain with an open
+bottom upstream of it for free-stream-turbulence receptivity (`x_le`,
+`le_open`, `le_ramp`), and strided 3-D snapshots packed on the GPU
+(`snap3d_*`). Both are documented in the parameter table. Two memory-corruption bugs found in the reference wall
 models during the port are repaired (see the commit history).
 
 ## Documentation

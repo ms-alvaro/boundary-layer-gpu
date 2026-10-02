@@ -63,7 +63,7 @@ module bc_kernels
   use precision_mod, only: dp, ceil_div
   use grid_mod,      only: nx, ny, nz, nxg, nyg, nzg, &   ! sizes
                            x, y, xg, yg, dx,          &   ! host grids
-                           z_d, zg_d                      ! device z coords
+                           z_d, zg_d, x_d, xg_d           ! device coords
   use field_mod,     only: U_d, V_d, W_d, Uo_d, Vo_d, Wo_d
   !--------------------------------------------------------------------
   ! ASSUMED ic_inflow_mod public API (module written in parallel; names
@@ -87,9 +87,9 @@ module bc_kernels
   ! If ic_inflow_mod ends up exporting different names, only this use
   ! statement (and nothing else in the file) needs updating.
   !--------------------------------------------------------------------
-  use hit_inflow_mod, only: update_hit_inlet
+  use hit_inflow_mod, only: update_hit_inlet, hit_open_bottom
   use param_mod,     only: inflow_boundary_flag, top_boundary_flag, i_rescale, &
-                           iwall_model
+                           iwall_model, x_le, le_active, le_open, le_ramp
   use wm_bridge,     only: alpha_x_d, alpha_y_d, alpha_z_d, V_bottom_d
   use global,        only: beta_y_legacy => beta_y
   use ic_inflow_mod, only: n_modes_inlet, m_modes_inlet, U_top, &
@@ -520,6 +520,21 @@ contains
   end subroutine bc_wall_subtract_kernel
 
   !--------------------------------------------------------------------
+  ! bc_open_subtract_kernel — le_open: F(1:iu,1,:) -= beta (net flux of
+  ! the open bottom patch removed)
+  !--------------------------------------------------------------------
+  attributes(global) subroutine bc_open_subtract_kernel(F, n1, n2, n3, iu, beta)
+    integer,  value         :: n1, n2, n3, iu
+    real(dp), value         :: beta
+    real(dp), intent(inout) :: F(n1, n2, n3)
+    integer :: i, k
+    i = (blockIdx%x - 1)*blockDim%x + threadIdx%x
+    k = (blockIdx%y - 1)*blockDim%y + threadIdx%y
+    if (i > iu .or. k > n3) return
+    F(i,1,k) = F(i,1,k) - beta
+  end subroutine bc_open_subtract_kernel
+
+  !--------------------------------------------------------------------
   ! k_wallplane_sum — deterministic serial sum of the wall plane
   ! F(2:n1-2, 1, 2:n3-kk) in reference memory order (i fastest).
   !--------------------------------------------------------------------
@@ -556,6 +571,34 @@ contains
 
     F(i,1,k) = -F(i,2,k)
   end subroutine bc_wall_antisym_kernel
+
+  !--------------------------------------------------------------------
+  ! bc_wall_le_kernel — leading edge inside the domain (x_le): for a
+  ! y-CENTERED array whose x-station of index i is xc(i) (x for U faces,
+  ! xg for W centers):
+  !   xc(i) >= x_le : no-slip plate,      F(i,1,k) = -F(i,2,k)
+  !   xc(i) <  x_le : free-slip symmetry, F(i,1,k) =  F(i,2,k)
+  ! V = 0 at y = 0 holds for both, so V keeps bc_wall_zero_kernel.
+  !--------------------------------------------------------------------
+  attributes(global) subroutine bc_wall_le_kernel(F, n1, n2, n3, xc, xle, lr)
+    integer,  value         :: n1, n2, n3
+    real(dp), intent(inout) :: F(n1, n2, n3)
+    real(dp), intent(in)    :: xc(n1)
+    real(dp), value         :: xle, lr    ! lr = ramp length (0: sharp edge)
+    integer :: i, k
+
+    i = (blockIdx%x - 1)*blockDim%x + threadIdx%x
+    k = (blockIdx%y - 1)*blockDim%y + threadIdx%y
+    if (i > n1 .or. k > n3) return
+
+    if (xc(i) >= xle) then
+       F(i,1,k) = -F(i,2,k)
+    else if (xc(i) >= xle - lr) then          ! partial slip: g = 1 -> -1
+       F(i,1,k) = ( 1.0_dp - 2.0_dp*(xc(i) - (xle - lr))/lr )*F(i,2,k)
+    else
+       F(i,1,k) =  F(i,2,k)
+    end if
+  end subroutine bc_wall_le_kernel
 
   !--------------------------------------------------------------------
   ! bc_wall_zero_kernel — no-slip wall for the y-FACE array
@@ -894,7 +937,10 @@ contains
     !------------------------------------------------------------------
     ! U at the wall
     gridS = dim3(ceil_div(nx, BX), ceil_div(nzg, BY), 1)
-    if (iwall_model == 0) then
+    if (iwall_model == 0 .and. le_active) then
+       call bc_wall_le_kernel<<<gridS, tBlock>>>(U_d, nx, nyg, nzg, x_d, x_le, real(le_ramp,dp)*(x(2)-x(1)))
+       call debug_check('bc_wall_le_kernel(U)')
+    else if (iwall_model == 0) then
        call bc_wall_antisym_kernel<<<gridS, tBlock>>>(U_d, nx, nyg, nzg)
        call debug_check('bc_wall_antisym_kernel(U)')
     else if (iwall_model == 11 .or. iwall_model == 15) then
@@ -949,14 +995,41 @@ contains
     end if
 
     ! W at the wall
-    gridS = dim3(ceil_div(nxg, BX), ceil_div(nz, BY), 1)
-    if (iwall_model == 0 .or. iwall_model == 11 .or. iwall_model == 15) then
+    gridS%x = ceil_div(nxg, BX); gridS%y = ceil_div(nz, BY); gridS%z = 1
+    if (iwall_model == 0 .and. le_active) then
+       call bc_wall_le_kernel<<<gridS, tBlock>>>(W_d, nxg, nyg, nz, xg_d, x_le, real(le_ramp,dp)*(x(2)-x(1)))
+       call debug_check('bc_wall_le_kernel(W)')
+    else if (iwall_model == 0 .or. iwall_model == 11 .or. iwall_model == 15) then
        call bc_wall_antisym_kernel<<<gridS, tBlock>>>(W_d, nxg, nyg, nz)
        call debug_check('bc_wall_antisym_kernel(W)')
     else
        call bc_wall_robin_kernel<<<gridS, tBlock>>>(W_d, nxg, nyg, nz, &
             alpha_z_d, yg(2)-yg(1))
        call debug_check('bc_wall_robin_kernel(W)')
+    end if
+
+    ! le_open: open bottom upstream of the leading edge (hit_open_bottom),
+    ! then remove the net volume flux through that open patch, so the
+    ! free-stream mass flux stays steady (otherwise the outlet correction
+    ! would pulsate the whole domain). Deterministic sum + MPI sum.
+    if (iwall_model == 0 .and. le_active .and. le_open == 1) then
+       call hit_open_bottom(t)
+       block
+         use param_mod, only: nzg_global
+         use hit_inflow_mod, only: hit_open_iup
+         integer  :: khi, iu
+         real(dp) :: qb, lb
+         iu  = hit_open_iup
+         khi = nzg - 1
+         if (myid == nprocs-1) khi = nzg - 2
+         if (nprocs == 1) khi = nzg - 2
+         qb = device_wsum3(V_d, nxg, ny, nzg, 2, iu, 1, 1, 2, khi, dx_d, nxg, 1)
+         call allreduce_sum(qb)
+         lb = ( x(iu) - x(1) )*real(nzg_global-3, dp)        ! sum of dx over 2..iu
+         gridS%x = ceil_div(iu, BX); gridS%y = ceil_div(nzg, BY); gridS%z = 1
+         call bc_open_subtract_kernel<<<gridS, tBlock>>>(V_d, nxg, ny, nzg, iu, qb/lb)
+         call debug_check('bc_open_subtract_kernel(V)')
+       end block
     end if
 
     !------------------------------------------------------------------
@@ -1022,7 +1095,7 @@ contains
     end if
 
     ! U(nx-1,:,:) += Delta_U; U(nx,:,:) = U(nx-1,:,:)
-    gridS = dim3(ceil_div(nyg, BX), ceil_div(nzg, BY), 1)
+    gridS%x = ceil_div(nyg, BX); gridS%y = ceil_div(nzg, BY); gridS%z = 1
     call bc_massflux_correct_kernel<<<gridS, tBlock>>>(U_d, nx, nyg, nzg, &
          delta_d)
     call debug_check('bc_massflux_correct_kernel(U)')
