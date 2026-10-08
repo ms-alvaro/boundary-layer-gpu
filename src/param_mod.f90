@@ -80,6 +80,7 @@ module param_mod
 
   ! boundary conditions
   public :: inflow_boundary_flag, top_boundary_flag, top_potential, top_potential_flux
+  public :: top_potential_tau
   public :: file_topref
   public :: Amplitude_perturbations
   public :: beta_hartree
@@ -184,12 +185,30 @@ module param_mod
   ! 1: matching on all top-plane modes (kx, kz) /= (0, 0); 2: only on the
   ! spanwise-uniform modes kz = 0.
   integer :: top_potential = 0
-  ! 'top_potential_flux' (with top_potential > 0): 0 or absent: the (0,0) mode
-  ! of the lid keeps v = V_top, i.e. the total lid flux is fixed (default).
-  ! 1: the (0,0) mode follows the k -> 0 limit of the matching condition,
-  ! dv/dy = 0 for the x-z mean, so the total lid flux is free and the outlet
-  ! mass correction absorbs it.
-  integer :: top_potential_flux = 0
+  logical :: have_topflux = .false., have_toptau = .false., have_topref = .false.  ! keys given
+  ! 'top_potential_flux' (with top_potential > 0): 1 or absent (default): the
+  ! (0,0) mode of the lid follows the k -> 0 limit of the matching condition,
+  ! dv/dy = 0 for the x-z mean, so the total lid flux is free: the net excess
+  ! displacement of the layer leaves through the lid, the outlet mass
+  ! correction absorbs it and the mean free stream keeps a zero pressure
+  ! gradient. 0: the (0,0) mode keeps v = V_top (fixed total lid flux); in a
+  ! long box this forces the net excess transpiration out of the outlet and
+  ! amplifies the lowest lid modes into box-wide free-stream velocity changes
+  ! (tbl_tu2_aps/TOPBC.md). Kept for comparison only.
+  integer :: top_potential_flux = 1
+  ! 'top_potential_tau' (with top_potential > 0): relaxation time of the
+  ! long-wave lid modes, the spanwise-uniform modes with kx Ly < 1 (box gain
+  ! Lx/(m pi Ly) > 1 on a lid-flux change; m = 0..10 in case A). Those modes
+  ! follow the matched value through a first-order relaxation with this time
+  ! constant (the lid-interior loop itself converges in Ly/Delta substeps,
+  ! about 0.05 t.u. in case A; the relaxation slows it to tau), so the fast
+  ! plane-mean residual of the
+  ! free-stream turbulence under the lid (eddy passage ~0.07 t.u., which the
+  ! pinned inlet flux cannot balance and the outlet correction would spread
+  ! over the box as u' = -eps x/Ly) is held back while the slow displacement
+  ! response of the layer (>= 1 t.u.) passes. 0: no relaxation. The filter
+  ! state is kept in the companion file <snapshot>.topbc (restart).
+  real(dp) :: top_potential_tau = 0.5_dp
   ! 'top_potential_ref' (with top_potential > 0, optional): file with the
   ! reference row Uref(1:nx) (top-cell centre row, U faces) of a steady
   ! laminar solution of the SAME grid computed with the old lid (stream
@@ -333,10 +352,16 @@ contains
     call get_int('top_flag'     , top_boundary_flag, f)
     call get_int('top_potential', top_potential   , f)
     if (.not. f) top_potential = 0
-    call get_int('top_potential_flux', top_potential_flux, f)
-    if (.not. f) top_potential_flux = 0
-    call get_str('top_potential_ref', file_topref, f)
-    if (.not. f) file_topref = ''
+    call get_int('top_potential_flux', top_potential_flux, have_topflux)
+    if (.not. have_topflux) top_potential_flux = 1
+    call get_dbl('top_potential_tau', top_potential_tau, have_toptau)
+    if (.not. have_toptau) top_potential_tau = 0.5_dp
+    call get_str('top_potential_ref', file_topref, have_topref)
+    if (.not. have_topref) file_topref = ''
+    if (top_potential == 0) then     ! option off: the sub-keys are inert
+       if (.not. have_topflux) top_potential_flux = 0
+       if (.not. have_toptau)  top_potential_tau  = 0.0_dp
+    end if
 
     call get_str('inflow_file'  , file_inflow     , f)
     if (f .eqv. .false.) then
@@ -563,13 +588,9 @@ contains
                  ' 1/2 (blowing-suction lid) and 4 (zero-shear tangential) are ported.'
       stop 'unsupported feature: top boundary condition'
     end if
-    if (len_trim(file_topref) > 0 .and. top_potential == 0) then
-      write(*,*) 'ERROR: top_potential_ref needs top_potential = 1 or 2.'
-      stop 'top_potential_ref without top_potential'
-    end if
-    if (top_potential_flux /= 0 .and. top_potential == 0) then
-      write(*,*) 'ERROR: top_potential_flux needs top_potential = 1 or 2.'
-      stop 'top_potential_flux without top_potential'
+    if (top_potential == 0 .and. (have_topref .or. have_topflux .or. have_toptau)) then
+      write(*,*) 'ERROR: top_potential_flux / top_potential_tau / top_potential_ref need top_potential = 1 or 2.'
+      stop 'top_potential sub-key without top_potential'
     end if
     if (top_potential /= 0) then
       if (top_potential < 0 .or. top_potential > 2) then
@@ -580,6 +601,10 @@ contains
       if (top_potential_flux < 0 .or. top_potential_flux > 1) then
         write(*,*) 'ERROR: top_potential_flux = ', top_potential_flux, ' ; use 0 (fixed lid flux) or 1 (free).'
         stop 'invalid top_potential_flux'
+      end if
+      if (top_potential_tau < 0.0_dp) then
+        write(*,*) 'ERROR: top_potential_tau = ', top_potential_tau, ' ; use 0 (off) or a relaxation time > 0.'
+        stop 'invalid top_potential_tau'
       end if
       if (top_boundary_flag /= 4) then
         write(*,*) 'ERROR: top_potential needs top_flag = 4 (zero-shear lid), got ', &

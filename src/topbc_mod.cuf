@@ -21,15 +21,24 @@
 !   U(i, nyg, k) = U(i, nyg-1, k) + [ (M - 1) * U' ](i, k),  U' = U(nyg-1) - Uref
 !   W(i, nyg, k) = W(i, nyg-1, k) + [ (M - 1) * W' ](i, k)
 ! where * is the mode-wise multiplication on the top plane. M = r on the
-! matched modes and 1 elsewhere; M_v = r on the matched modes and 0
-! elsewhere. So the (0,0) mode keeps the old mean condition exactly
-! (x-z mean of V at the lid = mean of V_top, du/dy = dw/dy = 0), and with
-! top_potential = 2 every kz /= 0 mode keeps v' = 0 and zero shear.
-! Option top_potential_flux = 1: M_v(0,0) = r(0) = 1 instead of 0, i.e. the
-! x-z mean of the lid fluctuation obeys dv/dy = 0 (the k -> 0 limit), the
-! total lid flux is free and the outlet mass correction absorbs it. Then
-! the mean of (U - Uref) in the top-cell row relaxes to the same value at
-! the outlet as at the inlet (no forced mean free-stream acceleration).
+! matched modes and 1 elsewhere, so the (0,0) mode keeps du/dy = dw/dy = 0
+! (its k -> 0 limit) and with top_potential = 2 every kz /= 0 mode keeps
+! zero shear. M_v = r on the matched modes and 0 on the unmatched kz /= 0
+! modes of top_potential = 2 (v' = 0, as the old lid). The (0,0) mode of
+! the lid is set by top_potential_flux:
+!   1 (default): M_v(0,0) = r(0) = 1, the x-z mean of the lid fluctuation
+!     obeys dv/dy = 0, the k -> 0 member of the decaying family (a uniform
+!     outflow that carries the net excess displacement flux of the layer to
+!     infinity). The total lid flux is free, the outlet mass correction
+!     absorbs it, and the mean of (U - Uref) in the top-cell row relaxes to
+!     the same value at the outlet as at the inlet: zero pressure gradient.
+!   0: M_v(0,0) = 0, the x-z mean of V at the lid stays the mean of V_top
+!     (fixed total lid flux). In a long box (Lx/Ly = 32 in case A) the net
+!     excess transpiration then leaves through the outlet (U_e rising
+!     linearly, +1 % in the transition region) and the lowest lid modes,
+!     passed freely by the matching (r = 1 - K Delta), redistribute the
+!     section flux, amplified by Lx/(pi Ly) into box-wide free-stream
+!     velocity changes of +-1 % (TOPBC.md). Comparison only.
 !
 ! Reference flow (steady potential flow, fixed in time): Uref(i) = 1 +
 ! u_pot(x(i) - x_le, yg(nyg-1)) with the leading edge (U_top = 1 without);
@@ -70,7 +79,9 @@ module topbc_mod
   use, intrinsic :: iso_c_binding, only: c_int
   use cudafor
   use precision_mod, only: dp, pi, ceil_div
-  use param_mod,     only: top_potential, top_potential_flux, nz_global, file_topref
+  use param_mod,     only: top_potential, top_potential_flux, top_potential_tau, &
+                           nz_global, file_topref, filein, fileout, random_init, &
+                           nstep_init
   use grid_mod,      only: nx, ny, nz, nxg, nyg, nzg, nslices_z, x, y, dx, dz
   use field_mod,     only: U_d, V_d, W_d
   use mpi_mod,       only: nprocs, myid, is_root, allgather_dev, allreduce_sum, &
@@ -80,12 +91,15 @@ module topbc_mod
   implicit none
   private
 
-  public :: topbc_on, topbc_init, topbc_prepare, topbc_apply, topbc_report
+  public :: topbc_on, topbc_init, topbc_prepare, topbc_apply, topbc_report, &
+            topbc_write_state
 
   logical :: topbc_on = .false.
 
   integer  :: nxt = 0, nx2 = 0, nzp = 0, ns = 0   ! nxt = nx-2, nx2 = 2 nxt
   real(dp) :: d2 = 0.0_dp              ! Delta^2 (top cell height squared)
+  real(dp) :: dlt = 0.0_dp             ! Delta (top cell height)
+  real(dp) :: hbox = 0.0_dp            ! Ly (lid height above the wall)
   real(dp) :: tscale = 0.0_dp          ! 1/(2N nzp), FFT normalisation
 
   real(dp),    device, allocatable :: uref_d(:), vrin_d(:)      ! (nx), (nxg)
@@ -96,6 +110,16 @@ module topbc_mod
   real(dp),    device, allocatable :: vlid_d(:,:)               ! (nxg, nzg)
 
   integer(c_int) :: plan1 = 0, plan2 = 0   ! 2-D Z2Z (nx2 x nzp), batch 1 / 2
+
+  ! long-wave relaxation (top_potential_tau): the kz = 0 lid modes m = 0..m_long
+  ! (kx Ly < 1) follow the matched value with the time constant tau_long
+  ! (weight dt Ly/(tau Delta) once per step, see topbc_prepare); afl holds
+  ! their (scaled) coefficients
+  integer  :: m_long = -1
+  real(dp) :: tau_long = 0.0_dp
+  logical  :: afl_set = .false.
+  complex(dp), device, allocatable :: afl_d(:)
+  complex(dp),         allocatable :: afl_h(:)
 
   integer(c_int), parameter :: CUFFT_FORWARD = -1
   integer(c_int), parameter :: CUFFT_INVERSE = +1
@@ -149,6 +173,8 @@ contains
     ns  = nslices_z
     delta  = y(ny) - y(ny-1)
     d2     = delta*delta
+    dlt    = delta
+    hbox   = y(ny) - y(1)
     tscale = 1.0_dp/( real(nx2, dp)*real(nzp, dp) )
 
     ! reference rows: Uref on the faces (top-cell centre row), Vref_in on the
@@ -185,6 +211,17 @@ contains
     pl_d   = (0.0_dp, 0.0_dp)
     vlid_d = 0.0_dp
 
+    ! long-wave relaxation: kz = 0 modes with kx Ly < 1, kx = pi m / L
+    tau_long = top_potential_tau
+    if (tau_long > 0.0_dp) then
+       m_long = int( (x(nx-1) - x(1))/( pi*(y(ny) - y(1)) ) )
+       m_long = max(0, min(m_long, nxt - 1))
+       allocate( afl_d(0:m_long), afl_h(0:m_long) )
+       afl_h = (0.0_dp, 0.0_dp)
+       afl_d = afl_h
+       if (random_init /= 1) call read_state(trim(filein)//'.topbc')
+    end if
+
     ! 2-D C2C plans on pl_d(2N, nzp, nb): C order n = (nzp, 2N)
     nn(1) = nzp; nn(2) = nx2
     ne(1) = nzp; ne(2) = nx2
@@ -208,6 +245,12 @@ contains
           write(*,*) '   lid flux FREE: mean mode dv/dy = 0, outlet correction absorbs it'
        else
           write(*,*) '   lid flux fixed: mean mode keeps v = V_top'
+       end if
+       if (tau_long > 0.0_dp) then
+          write(*,*) '   long-wave relaxation: kz = 0 modes m = 0..', m_long, &
+               ' (kx Ly < 1), tau = ', tau_long
+       else
+          write(*,*) '   long-wave relaxation: off'
        end if
        write(*,*) '   top plane ', nx2, ' (even-extended x) x ', nzp, ' ; Delta = ', delta
        write(*,*) '   r(K) at the x and z Nyquist: ', &
@@ -246,6 +289,52 @@ contains
     close(u)
   end subroutine read_topref
 
+  !----------------------------------------------------------------------------
+  ! Long-wave filter state: companion file <snapshot>.topbc (stream: int32
+  ! magic 20261009, int32 m_long, int32 step, complex128 afl(0:m_long)).
+  ! Named like the snapshot (absolute step). Written by the root rank with
+  ! every restart snapshot, read by every rank
+  ! at a restart; without the file the filter starts from the matched value.
+  !----------------------------------------------------------------------------
+  subroutine topbc_write_state(istep)
+    integer, intent(in) :: istep
+    integer :: u
+    character(220) :: fname
+    if (.not. topbc_on .or. tau_long <= 0.0_dp) return
+    if (.not. is_root()) return
+    afl_h = afl_d
+    write(fname, '(a,a,i8.8,a)') trim(fileout), '.', istep + nstep_init, '.topbc'
+    open(newunit=u, file=trim(fname), access='stream', form='unformatted', &
+         status='replace')
+    write(u) 20261009, m_long, istep + nstep_init
+    write(u) afl_h
+    close(u)
+  end subroutine topbc_write_state
+
+  subroutine read_state(fname)
+    character(*), intent(in) :: fname
+    integer :: u, ios, magic, ml, st
+    open(newunit=u, file=fname, access='stream', form='unformatted', &
+         action='read', status='old', iostat=ios)
+    if (ios /= 0) then
+       if (is_root()) write(*,*) '   long-wave filter state file not found (', &
+            trim(fname), '): starts from the matched value'
+       return
+    end if
+    read(u) magic, ml, st
+    if (magic /= 20261009 .or. ml /= m_long) then
+       write(*,*) 'ERROR: topbc state file ', trim(fname), ': magic ', magic, &
+            ' m_long ', ml, ' (expected 20261009, ', m_long, ')'
+       stop 'bad topbc state file'
+    end if
+    read(u) afl_h
+    close(u)
+    afl_d = afl_h
+    afl_set = .true.
+    if (is_root()) write(*,*) '   long-wave filter state read from ', trim(fname), &
+         ' (written at step ', st, ')'
+  end subroutine read_state
+
   pure real(dp) function rr(a)
     real(dp), intent(in) :: a
     rr = 2.0_dp/( (2.0_dp + a) + sqrt(a*(4.0_dp + a)) )
@@ -254,10 +343,15 @@ contains
   !----------------------------------------------------------------------------
   ! topbc_prepare: lid row V(:, ny, :) for the coming substep, from the
   ! current (projected) state. Stored in vlid_d, imposed by topbc_apply.
+  ! substep = 1 marks the first substep of a step (the long-wave relaxation
+  ! advances once per step; later substeps hold the value).
   !----------------------------------------------------------------------------
-  subroutine topbc_prepare()
+  subroutine topbc_prepare(substep, dt)
+    integer,  intent(in) :: substep
+    real(dp), intent(in) :: dt
     type(dim3) :: tb, g
     integer(c_int) :: istat
+    real(dp) :: w
 
     if (.not. topbc_on) return
     tb = dim3(BX, BY, 1)
@@ -271,6 +365,20 @@ contains
     istat = cufftExecZ2Z(plan1, pl_d, pl_d, CUFFT_FORWARD)
     call k_tb_mult<<<g, tb>>>(pl_d, sx_d, sz_d, nx2, nzp, d2, tscale, &
                               top_potential, 1, 0, 0, top_potential_flux)
+    if (tau_long > 0.0_dp) then
+       ! The interior row under the lid follows the lid within one substep
+       ! (top-cell continuity), so the matched value differs from the current
+       ! lid value by only (Delta/Ly) of the distance to the equilibrium: the
+       ! per-step weight is scaled by Ly/Delta to give the time constant tau.
+       w = 0.0_dp
+       if (substep == 1) w = min( 1.0_dp, dt*hbox/( tau_long*dlt ) )
+       if (.not. afl_set) w = -1.0_dp          ! first call: the matched value
+       tb = dim3(32, 1, 1)
+       g%x = ceil_div(m_long + 1, 32); g%y = 1; g%z = 1
+       call k_tb_relax<<<g, tb>>>(pl_d, afl_d, nx2, nzp, m_long, w)
+       afl_set = .true.
+       tb = dim3(BX, BY, 1)
+    end if
     istat = cufftExecZ2Z(plan1, pl_d, pl_d, CUFFT_INVERSE)
 
     g%x = ceil_div(nxg, BX); g%y = ceil_div(nzg, BY); g%z = 1
@@ -319,8 +427,9 @@ contains
 
   !----------------------------------------------------------------------------
   ! topbc_report: monitor line, rms/max of the lid fluctuation V - V_top over
-  ! the interior columns and owned planes, and its net flux (should be at
-  ! round-off: the (0,0) mode is excluded).
+  ! the interior columns and owned planes, and its mean (the net excess
+  ! displacement flux per unit lid area with top_potential_flux = 1; zero to
+  ! round-off with 0).
   !----------------------------------------------------------------------------
   subroutine topbc_report(istep)
     integer, intent(in) :: istep
@@ -459,6 +568,27 @@ contains
     end if
     pl(ix, q, b) = pl(ix, q, b)*( m*tscale )
   end subroutine k_tb_mult
+
+  ! long-wave relaxation of the kz = 0 lid modes m = 0..ml (scaled
+  ! coefficients, after k_tb_mult): w < 0 takes the matched value, w > 0
+  ! relaxes toward it with the weight w, w = 0 holds. The mirror position of the
+  ! even-extended x line (ix = n2 - m + 1) gets the conjugate.
+  attributes(global) subroutine k_tb_relax(pl, afl, n2, nzp, ml, w)
+    integer,     value         :: n2, nzp, ml
+    real(dp),    value         :: w
+    complex(dp), intent(inout) :: pl(n2, nzp, 2)
+    complex(dp), intent(inout) :: afl(0:ml)
+    integer :: m
+    m = (blockIdx%x - 1)*blockDim%x + threadIdx%x - 1
+    if (m > ml) return
+    if (w < 0.0_dp) then
+       afl(m) = pl(m+1, 1, 1)
+    else if (w > 0.0_dp) then
+       afl(m) = afl(m) + w*( pl(m+1, 1, 1) - afl(m) )
+    end if
+    pl(m+1, 1, 1) = afl(m)
+    if (m >= 1) pl(n2 - m + 1, 1, 1) = conjg( afl(m) )
+  end subroutine k_tb_relax
 
   ! lid row on every local plane (ghosts by periodic wrap of the pack index)
   attributes(global) subroutine k_tb_vlid(vlid, pl, vtop, nx, nxg, nzg, n2, nzp, ns, rank)

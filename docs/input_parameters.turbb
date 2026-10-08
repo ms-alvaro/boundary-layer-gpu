@@ -63,20 +63,36 @@ top_flag = 1 ! (*)
 ! potential mode of the solver's Laplacian, so displacement-thickness
 ! fluctuations no longer force a span-uniform change of the free-stream
 ! velocity. x uses the cosine basis of the pressure solve (rows extended
-! evenly about the inlet and outlet planes), z is periodic. The (0,0) mode
-! keeps the top_flag = 4 condition: the total flux through the lid and the
-! outlet mass correction are unchanged.
-!   0 or absent -> off (top_flag = 4 exactly as before)
-!   1 -> all modes (kx, kz) /= (0, 0)
+! evenly about the inlet and outlet planes), z is periodic.
+!   0 or absent -> off (top_flag = 4 exactly as before; the sub-keys below are
+!        then inert and may not be given)
+!   1 -> all modes (production value)
 !   2 -> only the spanwise-uniform modes kz = 0; kz /= 0 keep top_flag = 4
 ! top_potential = 1
-!   top_potential_flux = 1 -> the (0,0) mode follows dv/dy = 0 instead, so the
-!       total lid flux is free and the outlet mass correction absorbs it
-!       (0 or absent: fixed lid flux, as above).
-!   top_potential_ref = FILE -> reference row Uref (top-cell row) of a steady
-!       laminar solution of the same grid computed with the old lid
-!       (tools/make_top_reference.py). That steady state is then preserved
-!       exactly. Absent: the analytic potential flow of the displacement.
+!   top_potential_flux: the (0,0) mode of the lid. 1 or absent -> dv/dy = 0
+!       for the x-z mean (the k -> 0 limit of the condition): the total lid
+!       flux is free, the net excess displacement of the layer leaves through
+!       the lid, the outlet mass correction absorbs it and the mean free
+!       stream keeps a zero pressure gradient. 0 -> the mean keeps v = V_top
+!       (fixed total lid flux), for comparison only: in a long box it forces
+!       the excess transpiration out of the outlet and amplifies the lowest
+!       lid modes into box-wide free-stream velocity changes.
+!   top_potential_tau: relaxation time (default 0.5, 0 = off) of the long-wave
+!       lid modes, the spanwise-uniform modes with kx Ly < 1 (m = 0..10 in a
+!       box with Lx/Ly = 32). A lid-flux change on those modes is returned by
+!       the outlet mass correction as a box-wide u' with gain Lx/(m pi Ly),
+!       and the free-stream turbulence under the lid has a plane-mean v'
+!       residual on them (u'_rms/sqrt(N_eddies), decorrelating on the eddy
+!       passage time). The relaxation holds that fast residual back while the
+!       steady net displacement flux and the slow displacement response
+!       (>= 1 t.u.) pass. The filter state is written with every restart
+!       snapshot to <snapshot>.topbc and read back at a restart.
+!   top_potential_ref = FILE -> optional reference row Uref (top-cell row,
+!       U faces) of a steady laminar solution of the same grid computed with
+!       the old lid (tools/make_top_reference.py); that steady state is then
+!       preserved exactly. Absent: the analytic potential flow of the Blasius
+!       displacement (pot_le), which differs from the discrete laminar top
+!       row by about 2e-4 in U (laminar Cf changes by at most 0.2 %).
 
 ! If top_flag is 1 or 2 we have to define additional inputs. Their definition 
 ! can be found in eq (2.1) of Coleman et al 2018, JFM vol 847 pp 28-70 / or in
