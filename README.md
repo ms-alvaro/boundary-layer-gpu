@@ -110,9 +110,27 @@ GPU), all 15 wall models and the log-law wall-stress model (the reference
 wall-model stack runs verbatim on the host, bridged per substep), restart
 and box output. Optional: a leading edge inside the domain with an open
 bottom upstream of it for free-stream-turbulence receptivity (`x_le`,
-`le_open`, `le_ramp`), and strided 3-D snapshots packed on the GPU
-(`snap3d_*`). Both are documented in the parameter table. Two memory-corruption bugs found in the reference wall
+`le_open`, `le_ramp`), strided 3-D snapshots packed on the GPU
+(`snap3d_*`), and a potential-flow matching top boundary
+(`top_potential` with `top_flag = 4`, see below). All are documented in
+the parameter table. Two memory-corruption bugs found in the reference wall
 models during the port are repaired (see the commit history).
+
+### Potential-flow top boundary (`top_potential`)
+
+With `top_flag = 4` the lid velocity v is the steady displacement velocity.
+The volume flux through every cross-section is then fixed, so a
+displacement-thickness fluctuation of the boundary layer below forces a
+span-uniform change of the free-stream velocity, U delta*'/(Ly - delta*).
+`top_potential = 1` replaces this, for the fluctuation about the steady
+potential flow, by the decaying irrotational field above the lid: each
+top-plane mode satisfies d/dy q = -|k| q (u, v and w). The mean mode keeps
+the old condition, so the lid flux and the outlet mass correction do not
+change. `top_potential = 2` applies it to the spanwise-uniform modes only.
+The lid value of v is set at the start of each Runge-Kutta substep from the
+projected field and held through the pressure projection, whose top Neumann
+data stay homogeneous. Multi-GPU runs all-gather the top rows. Implementation
+and derivation: `src/topbc_mod.cuf`.
 
 ## Documentation
 

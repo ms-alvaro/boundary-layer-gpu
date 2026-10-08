@@ -41,7 +41,7 @@ module mpi_mod
   public :: myid, nprocs, is_root
   public :: halo_exchange_z, periodic_exchange_z
   public :: allreduce_sum, allreduce_max, allreduce_min
-  public :: gather_dev, scatter_dev
+  public :: gather_dev, scatter_dev, allgather_dev
   public :: alltoall_dev
   public :: pressure_exchange_z
   public :: gather_slabs_host
@@ -211,6 +211,25 @@ contains
     call MPI_Scatter(send_d, count, MPI_REAL8, recv_d, count, MPI_REAL8, &
                      0, MPI_COMM_WORLD, ierr)
   end subroutine scatter_dev
+
+  !---------------------------------------------------------------------------
+  ! allgather_dev — fixed-count all-gather of DEVICE buffers (CUDA-aware):
+  ! rank r's block lands at recv_d(r*count+1 : (r+1)*count) on every rank.
+  ! Single rank: a device-to-device copy. (top-plane rows of topbc_mod)
+  !---------------------------------------------------------------------------
+  subroutine allgather_dev(send_d, count, recv_d)
+    integer, intent(in) :: count
+    real(dp), device, intent(in)    :: send_d(count)
+    real(dp), device, intent(inout) :: recv_d(count*nprocs)
+    integer :: istat
+    if (nprocs == 1) then
+       recv_d(1:count) = send_d(1:count)
+       return
+    end if
+    istat = cudaDeviceSynchronize()   ! see halo_exchange_z
+    call MPI_Allgather(send_d, count, MPI_REAL8, recv_d, count, MPI_REAL8, &
+                       MPI_COMM_WORLD, ierr)
+  end subroutine allgather_dev
 
   !---------------------------------------------------------------------------
   ! alltoall_dev — device-buffer MPI_Alltoall with fixed per-rank block size
