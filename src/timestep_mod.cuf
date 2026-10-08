@@ -89,6 +89,7 @@ module timestep_mod
   use rhs_kernels,     only: compute_rhs_u, compute_rhs_v, compute_rhs_w
   use bc_kernels,      only: apply_boundary_conditions_gpu => apply_bc
   use poisson_mod,     only: compute_projection_step => projection_step
+  use topbc_mod,       only: topbc_on, topbc_prepare
 
   implicit none
   private
@@ -376,6 +377,7 @@ contains
     step_beginning = 1
     rk_step        = 3
 
+    if (topbc_on) call topbc_prepare()   ! lid row from the projected state
     if (LES_model > 0) call compute_eddy_viscosity()
     if (wm_active()) call wm_update(dt, t, istep, .true.)
 
@@ -406,6 +408,10 @@ contains
 
     ! step 1
     rk_step = 1
+
+    ! potential-flow lid (top_potential > 0): the lid row V(:,ny,:) for this
+    ! substep from the current projected state (topbc_mod header)
+    if (topbc_on) call topbc_prepare()
 
     ! LES: eddy viscosity from the step's base state (reference
     ! time_integration.f90:34, compute_eddy_viscosity(Uo,...) — U_d
@@ -451,6 +457,8 @@ contains
 
     ! step 2
     rk_step = 2
+
+    if (topbc_on) call topbc_prepare()
 
     ! LES: refresh nu_t from the substep-1 state (reference line 112)
     if (LES_model > 0) call compute_eddy_viscosity()
@@ -503,6 +511,8 @@ contains
     ! step 1
     rk_step = 1
 
+    if (topbc_on) call topbc_prepare()
+
     ! LES: eddy viscosity from the step's base state (reference line 34)
     if (LES_model > 0) call compute_eddy_viscosity()
     if (wm_active()) call wm_update(dt, t, istep, .true.)
@@ -541,6 +551,7 @@ contains
 
     ! step 2
     rk_step = 2
+    if (topbc_on) call topbc_prepare()
     if (LES_model > 0) call compute_eddy_viscosity()
     if (wm_active()) call wm_update(dt, t, istep, .false.)
     call compute_rhs_u(U_d, V_d, W_d, Fu2_d)
@@ -556,6 +567,7 @@ contains
 
     ! step 3
     rk_step = 3
+    if (topbc_on) call topbc_prepare()
     if (LES_model > 0) call compute_eddy_viscosity()
     if (wm_active()) call wm_update(dt, t, istep, .false.)
     call compute_rhs_u(U_d, V_d, W_d, Fu3_d)

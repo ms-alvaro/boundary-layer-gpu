@@ -99,6 +99,7 @@ module bc_kernels
                            qu_inlet_d, qv_inlet_d, qw_inlet_d, &
                            zmode_inlet_d, tmode_inlet_d
   use reductions,    only: wsum3_partials, scratch_d, device_wsum3
+  use topbc_mod,     only: topbc_on, topbc_apply
   use mpi_mod,       only: nprocs, myid, halo_exchange_z, periodic_exchange_z, &
                            allreduce_sum, STAG_CENTER, STAG_FACE
 
@@ -900,6 +901,11 @@ contains
        gridS = dim3(ceil_div(nxg, BX), ceil_div(nz, BY), 1)
        call bc_top_zeroshear_kernel<<<gridS, tBlock>>>(W_d, nxg, nyg, nz)
        call debug_check('bc_top_zeroshear_kernel(W,FS)')
+    else if (top_boundary_flag == 4 .and. topbc_on) then
+       ! potential-flow matching (top_potential > 0, topbc_mod): U and W
+       ! ghost rows from the current interior, V lid from the row stored
+       ! by topbc_prepare at the start of the substep
+       call topbc_apply()
     else if (top_boundary_flag == 4) then
        gridS = dim3(ceil_div(nx, BX), ceil_div(nzg, BY), 1)
        call bc_top_zeroshear_kernel<<<gridS, tBlock>>>(U_d, nx, nyg, nzg)

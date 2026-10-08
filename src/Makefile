@@ -45,6 +45,7 @@ SRC = precision_mod.f90 \
       legacy_wallmodel.f90 \
       wm_bridge.f90     \
       hit_inflow_mod.cuf \
+      topbc_mod.cuf     \
       rhs_kernels.cuf   \
       bc_kernels.cuf    \
       poisson_mod.cuf   \
@@ -102,21 +103,24 @@ wm_bridge.o:      precision_mod.o param_mod.o grid_mod.o field_mod.o \
                   mpi_mod.o les_mod.o legacy_global.o legacy_mpi.o \
                   legacy_wallmodel.o
 hit_inflow_mod.o: precision_mod.o param_mod.o grid_mod.o ic_inflow_mod.o field_mod.o
+topbc_mod.o:      precision_mod.o param_mod.o grid_mod.o field_mod.o mpi_mod.o \
+                  ic_inflow_mod.o
 rhs_kernels.o:    precision_mod.o param_mod.o grid_mod.o field_mod.o les_mod.o
 bc_kernels.o:     precision_mod.o param_mod.o grid_mod.o field_mod.o \
                   ic_inflow_mod.o hit_inflow_mod.o reductions.o mpi_mod.o \
-                  wm_bridge.o
+                  wm_bridge.o topbc_mod.o
 poisson_mod.o:    precision_mod.o grid_mod.o field_mod.o reductions.o mpi_mod.o
 timestep_mod.o:   precision_mod.o param_mod.o grid_mod.o field_mod.o \
                   reductions.o rhs_kernels.o bc_kernels.o poisson_mod.o mpi_mod.o \
-                  lund_inflow_mod.o les_mod.o
+                  lund_inflow_mod.o les_mod.o topbc_mod.o
 io_mod.o:         precision_mod.o param_mod.o grid_mod.o field_mod.o \
                   timestep_mod.o poisson_mod.o mpi_mod.o lund_inflow_mod.o les_mod.o \
                   snap3d_pack.o
 snap3d_pack.o:    precision_mod.o mpi_mod.o
 main.o:           param_mod.o grid_mod.o field_mod.o ic_inflow_mod.o mpi_mod.o \
                   hit_inflow_mod.o poisson_mod.o timestep_mod.o \
-                  bc_kernels.o reductions.o io_mod.o lund_inflow_mod.o les_mod.o
+                  bc_kernels.o reductions.o io_mod.o lund_inflow_mod.o les_mod.o \
+                  topbc_mod.o
 
 clean:
 	rm -f $(OBJ) *.mod $(EXE)

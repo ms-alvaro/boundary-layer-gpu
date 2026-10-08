@@ -75,6 +75,7 @@ module ic_inflow_mod
   public :: compute_blowsuction_top       ! V_bs profile (top_flag = 1/2)
   public :: inflow_tables_to_device       ! host tables -> device copies
   public :: random_inflow_update          ! inflow_flag = 4: new noise plane
+  public :: top_reference_u               ! top_potential: reference U row
 
   !------------------- inlet / top boundary profiles (host) ------------------
   ! (reference names, global.f90; allocated by compute_blasius_solution_for_bc)
@@ -890,6 +891,27 @@ contains
     up = 2.0_dp*ce*sqrt(nu)*au/pi_
     vp = 2.0_dp*ce*sqrt(nu)*av/pi_
   end subroutine pot_le
+
+  !----------------------------------------------------------------------------
+  ! top_reference_u — reference streamwise velocity of the steady mean
+  ! potential flow on the top-cell centre row yg(nyg-1), at the U faces x(i)
+  ! (top_potential, topbc_mod). With the leading edge: 1 + u_pot of the
+  ! Blasius displacement source (the flow that already sets U_inlet and
+  ! V_top); otherwise U_top (= 1). Call after compute_blasius_solution_for_bc.
+  !----------------------------------------------------------------------------
+  subroutine top_reference_u(uref)
+    real(dp), intent(out) :: uref(:)
+    integer  :: i
+    real(dp) :: up, vp
+    if (le_active) then
+       do i = 1, nx
+          call pot_le(x(i) - x_le, yg(nyg-1), up, vp)
+          uref(i) = 1.0_dp + up
+       end do
+    else
+       uref(1:nx) = U_top(1:nx)
+    end if
+  end subroutine top_reference_u
 
   !----------------------------------------------------------------------------
   ! snap_le — put x_le exactly on the nearest U face x(i) (audit v5b major 2:

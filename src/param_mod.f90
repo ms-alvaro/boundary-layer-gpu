@@ -79,7 +79,8 @@ module param_mod
   public :: snap3d_every, snap3d_stride, dir_snap3d
 
   ! boundary conditions
-  public :: inflow_boundary_flag, top_boundary_flag
+  public :: inflow_boundary_flag, top_boundary_flag, top_potential, top_potential_flux
+  public :: file_topref
   public :: Amplitude_perturbations
   public :: beta_hartree
   public :: x_le, le_active, le_open, le_ramp
@@ -177,6 +178,25 @@ module param_mod
   integer :: top_boundary_flag    = 0 !< 0 impose velocity — only supported
                                       !! value; 1 Coleman2018, 2 Abe2017,
                                       !! 3 Falkner-Skan
+
+  ! 'top_potential' (needs top_flag = 4): potential-flow matching of the lid
+  ! (topbc_mod). 0 or absent: the zero-shear lid of top_flag = 4, unchanged.
+  ! 1: matching on all top-plane modes (kx, kz) /= (0, 0); 2: only on the
+  ! spanwise-uniform modes kz = 0.
+  integer :: top_potential = 0
+  ! 'top_potential_flux' (with top_potential > 0): 0 or absent: the (0,0) mode
+  ! of the lid keeps v = V_top, i.e. the total lid flux is fixed (default).
+  ! 1: the (0,0) mode follows the k -> 0 limit of the matching condition,
+  ! dv/dy = 0 for the x-z mean, so the total lid flux is free and the outlet
+  ! mass correction absorbs it.
+  integer :: top_potential_flux = 0
+  ! 'top_potential_ref' (with top_potential > 0, optional): file with the
+  ! reference row Uref(1:nx) (top-cell centre row, U faces) of a steady
+  ! laminar solution of the SAME grid computed with the old lid (stream
+  ! binary: int32 magic 20261008, int32 nx, float64 Uref(nx)). The matching
+  ! then acts on the deviation from that discrete base flow, so that steady
+  ! state is preserved exactly. Absent: the analytic potential flow (pot_le).
+  character(200) :: file_topref = ' '
 
   real(dp) :: Amplitude_perturbations = 0.0_dp !< 'Amplitude' (inflow_flag=4)
   ! Leading edge inside the domain ('x_le', fst_hit_tu2_aps v5): bottom is a
@@ -311,6 +331,12 @@ contains
 
     call get_int('inflow_flag'  , inflow_boundary_flag, f)
     call get_int('top_flag'     , top_boundary_flag, f)
+    call get_int('top_potential', top_potential   , f)
+    if (.not. f) top_potential = 0
+    call get_int('top_potential_flux', top_potential_flux, f)
+    if (.not. f) top_potential_flux = 0
+    call get_str('top_potential_ref', file_topref, f)
+    if (.not. f) file_topref = ''
 
     call get_str('inflow_file'  , file_inflow     , f)
     if (f .eqv. .false.) then
@@ -536,6 +562,30 @@ contains
                  ' requested, but only top_flag = 0 (imposed velocity),', &
                  ' 1/2 (blowing-suction lid) and 4 (zero-shear tangential) are ported.'
       stop 'unsupported feature: top boundary condition'
+    end if
+    if (len_trim(file_topref) > 0 .and. top_potential == 0) then
+      write(*,*) 'ERROR: top_potential_ref needs top_potential = 1 or 2.'
+      stop 'top_potential_ref without top_potential'
+    end if
+    if (top_potential_flux /= 0 .and. top_potential == 0) then
+      write(*,*) 'ERROR: top_potential_flux needs top_potential = 1 or 2.'
+      stop 'top_potential_flux without top_potential'
+    end if
+    if (top_potential /= 0) then
+      if (top_potential < 0 .or. top_potential > 2) then
+        write(*,*) 'ERROR: top_potential = ', top_potential, &
+                   ' ; use 0 (off), 1 (all top-plane modes) or 2 (kz = 0 modes only).'
+        stop 'invalid top_potential'
+      end if
+      if (top_potential_flux < 0 .or. top_potential_flux > 1) then
+        write(*,*) 'ERROR: top_potential_flux = ', top_potential_flux, ' ; use 0 (fixed lid flux) or 1 (free).'
+        stop 'invalid top_potential_flux'
+      end if
+      if (top_boundary_flag /= 4) then
+        write(*,*) 'ERROR: top_potential needs top_flag = 4 (zero-shear lid), got ', &
+                   top_boundary_flag
+        stop 'top_potential needs top_flag = 4'
+      end if
     end if
     if ((top_boundary_flag == 1 .or. top_boundary_flag == 2) .and. &
         sigma_bs == 0.0_dp) then

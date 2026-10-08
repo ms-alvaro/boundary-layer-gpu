@@ -1,0 +1,527 @@
+!------------------------------------------------------------------------------
+! topbc_mod -- potential-flow matching ("asymptotic") top boundary condition
+!
+! Key 'top_potential' (needs top_flag = 4). 0 or absent: the zero-shear lid of
+! top_flag = 4 is used unchanged and nothing in this module runs.
+!   top_potential = 1 : matching on every plane mode (kx, kz) /= (0, 0)
+!   top_potential = 2 : matching only on the spanwise-uniform modes kz = 0,
+!                       kx > 0; kz /= 0 keeps the top_flag = 4 treatment
+!
+! Condition. Above y = Ly the fluctuation about the steady mean potential
+! flow is taken to be irrotational and decaying, so every plane mode obeys
+! d/dy q^ = -|k| q^ for q = u, v, w. The discrete form uses the decaying root
+! of the solver's own second-order Laplacian: on a uniform top spacing Delta
+! a discrete harmonic mode changes by the factor r per cell, with
+!   r + 1/r - 2 = (K Delta)^2,   K^2 = -(kxx + kzz)
+! (kxx, kzz: the modified wavenumbers of the Poisson solver), i.e.
+!   r(K) = 2 / ( (2 + a) + sqrt(a (4 + a)) ),   a = (K Delta)^2.
+! r = 1 - K Delta + O((K Delta)^2) is the trapezoidal form of the continuous
+! condition and is exact for discrete potential modes. Applied as
+!   V(i, ny, k)  = V_top(i) + [ M_v * V' ](i, k),  V'  = V(ny-1)  - Vref_in
+!   U(i, nyg, k) = U(i, nyg-1, k) + [ (M - 1) * U' ](i, k),  U' = U(nyg-1) - Uref
+!   W(i, nyg, k) = W(i, nyg-1, k) + [ (M - 1) * W' ](i, k)
+! where * is the mode-wise multiplication on the top plane. M = r on the
+! matched modes and 1 elsewhere; M_v = r on the matched modes and 0
+! elsewhere. So the (0,0) mode keeps the old mean condition exactly
+! (x-z mean of V at the lid = mean of V_top, du/dy = dw/dy = 0), and with
+! top_potential = 2 every kz /= 0 mode keeps v' = 0 and zero shear.
+! Option top_potential_flux = 1: M_v(0,0) = r(0) = 1 instead of 0, i.e. the
+! x-z mean of the lid fluctuation obeys dv/dy = 0 (the k -> 0 limit), the
+! total lid flux is free and the outlet mass correction absorbs it. Then
+! the mean of (U - Uref) in the top-cell row relaxes to the same value at
+! the outlet as at the inlet (no forced mean free-stream acceleration).
+!
+! Reference flow (steady potential flow, fixed in time): Uref(i) = 1 +
+! u_pot(x(i) - x_le, yg(nyg-1)) with the leading edge (U_top = 1 without);
+! V_top is the existing lid row; Vref_in = V_top + Delta*(dUref/dx) is the
+! discrete-continuity completion of the reference in the top cell.
+! Optional file reference (top_potential_ref): Uref from a steady laminar
+! solution of the same grid with the old lid (the discrete base flow of
+! Brandt et al.'s (D + k)(u - u_base) = 0). For that steady state V' and
+! U' vanish identically, so it is preserved exactly; the analytic potential
+! differs from the discrete laminar top flow by about 2e-4 in U.
+!
+! Bases. x is not periodic: every top-plane row is extended evenly about
+! the inlet face x(1) and the outlet face x(nx-1) (the planes where the
+! pressure solve is even, i.e. its DCT-II), giving a periodic line of 2N
+! points, N = nx-2. V and W live at the centres xg(2..nx-1) (DCT-II); U at
+! the faces x(1..nx-1) (DCT-I). Only the interior columns are written (V, W:
+! 2..nx-1; U: 2..nx-2); the inflow and outflow columns keep the top_flag = 4
+! values. z is periodic over the nzp unique planes.
+!
+! Time levels and the projection. The lid value V(:,ny,:) is the boundary
+! datum of the pressure Poisson problem: it is imposed on u* before the
+! solve, the solve has homogeneous Neumann data at the top, and the
+! projection never changes V(:,ny,:). It must therefore be the SAME in the
+! pre- and post-projection apply_bc calls of a substep, or the top cells
+! keep a divergence. topbc_prepare (start of every RK substep, on the
+! projected, divergence-free state) computes and stores the lid row;
+! apply_bc imposes the stored row in both calls. The U and W ghost rows do
+! not enter the divergence and are recomputed from the current interior in
+! every apply_bc call (as the zero-shear rows of top_flag = 4).
+!
+! Multi-GPU (z slabs). The top plane is small (nx x nzp): every rank
+! all-gathers the owned rows, runs the identical full-plane transform and
+! writes its own planes, ghosts included (periodic wrap). One collective per
+! call, no extra halo exchange; the result is independent of the rank count.
+!------------------------------------------------------------------------------
+module topbc_mod
+
+  use, intrinsic :: iso_c_binding, only: c_int
+  use cudafor
+  use precision_mod, only: dp, pi, ceil_div
+  use param_mod,     only: top_potential, top_potential_flux, nz_global, file_topref
+  use grid_mod,      only: nx, ny, nz, nxg, nyg, nzg, nslices_z, x, y, dx, dz
+  use field_mod,     only: U_d, V_d, W_d
+  use mpi_mod,       only: nprocs, myid, is_root, allgather_dev, allreduce_sum, &
+                           allreduce_max
+  use ic_inflow_mod, only: V_top, V_top_d, top_reference_u
+
+  implicit none
+  private
+
+  public :: topbc_on, topbc_init, topbc_prepare, topbc_apply, topbc_report
+
+  logical :: topbc_on = .false.
+
+  integer  :: nxt = 0, nx2 = 0, nzp = 0, ns = 0   ! nxt = nx-2, nx2 = 2 nxt
+  real(dp) :: d2 = 0.0_dp              ! Delta^2 (top cell height squared)
+  real(dp) :: tscale = 0.0_dp          ! 1/(2N nzp), FFT normalisation
+
+  real(dp),    device, allocatable :: uref_d(:), vrin_d(:)      ! (nx), (nxg)
+  real(dp),    device, allocatable :: sx_d(:), sz_d(:)          ! (nx2), (nzp)
+  real(dp),    device, allocatable :: loc_d(:,:,:)              ! (nxg, ns, 2)
+  real(dp),    device, allocatable :: glob_d(:,:,:,:)           ! (nxg, ns, 2, P)
+  complex(dp), device, allocatable :: pl_d(:,:,:)               ! (nx2, nzp, 2)
+  real(dp),    device, allocatable :: vlid_d(:,:)               ! (nxg, nzg)
+
+  integer(c_int) :: plan1 = 0, plan2 = 0   ! 2-D Z2Z (nx2 x nzp), batch 1 / 2
+
+  integer(c_int), parameter :: CUFFT_FORWARD = -1
+  integer(c_int), parameter :: CUFFT_INVERSE = +1
+  integer(c_int), parameter :: CUFFT_Z2Z     = int(z'69', c_int)
+  integer(c_int), parameter :: CUFFT_SUCCESS = 0
+  integer, parameter :: BX = 64, BY = 4
+
+  interface
+     integer(c_int) function cufftPlanMany(plan, rank, n, inembed, istride,  &
+                                           idist, onembed, ostride, odist,   &
+                                           ctype, batch)                     &
+          bind(c, name='cufftPlanMany')
+       import :: c_int
+       integer(c_int)        :: plan
+       integer(c_int), value :: rank
+       integer(c_int)        :: n(*)
+       integer(c_int)        :: inembed(*)
+       integer(c_int), value :: istride, idist
+       integer(c_int)        :: onembed(*)
+       integer(c_int), value :: ostride, odist
+       integer(c_int), value :: ctype, batch
+     end function cufftPlanMany
+
+     integer(c_int) function cufftExecZ2Z(plan, idata, odata, direction)     &
+          bind(c, name='cufftExecZ2Z')
+       import :: c_int, dp
+       integer(c_int), value  :: plan
+       complex(dp), device    :: idata(*), odata(*)
+       integer(c_int), value  :: direction
+     end function cufftExecZ2Z
+  end interface
+
+contains
+
+  !----------------------------------------------------------------------------
+  ! topbc_init: reference rows, wavenumber tables, buffers and cuFFT plans.
+  ! Call once after inflow_tables_to_device (V_top, x_le snapped).
+  !----------------------------------------------------------------------------
+  subroutine topbc_init()
+    real(dp), allocatable :: uref(:), vrin(:), sx(:), sz(:)
+    integer  :: i, ix
+    integer(c_int) :: istat, nn(2), ne(2)
+    real(dp) :: delta
+
+    if (top_potential == 0) return
+    topbc_on = .true.
+
+    nxt = nx - 2
+    nx2 = 2*nxt
+    nzp = nz_global - 2
+    ns  = nslices_z
+    delta  = y(ny) - y(ny-1)
+    d2     = delta*delta
+    tscale = 1.0_dp/( real(nx2, dp)*real(nzp, dp) )
+
+    ! reference rows: Uref on the faces (top-cell centre row), Vref_in on the
+    ! centres (face y(ny-1)) from discrete continuity of the 2-D reference
+    allocate( uref(nx), vrin(nxg) )
+    if (len_trim(file_topref) > 0) then
+       call read_topref(uref)
+    else
+       call top_reference_u(uref)
+    end if
+    vrin = V_top
+    do i = 2, nx - 1
+       vrin(i) = V_top(i) + delta*( uref(i) - uref(i-1) )/( x(i) - x(i-1) )
+    end do
+
+    ! -kxx, -kzz of the pressure solver on the 2N-periodic x line and z
+    allocate( sx(nx2), sz(nzp) )
+    do ix = 0, nx2 - 1
+       sx(ix+1) = -2.0_dp*( cos(pi*real(ix,dp)/real(nxt,dp)) - 1.0_dp )/dx**2
+    end do
+    do ix = 0, nzp - 1
+       sz(ix+1) = -2.0_dp*( cos(2.0_dp*pi*real(ix,dp)/real(nzp,dp)) - 1.0_dp )/dz**2
+    end do
+
+    allocate( uref_d(nx), vrin_d(nxg), sx_d(nx2), sz_d(nzp) )
+    uref_d = uref
+    vrin_d = vrin
+    sx_d   = sx
+    sz_d   = sz
+    allocate( loc_d(nxg, ns, 2), glob_d(nxg, ns, 2, nprocs) )
+    allocate( pl_d(nx2, nzp, 2), vlid_d(nxg, nzg) )
+    loc_d  = 0.0_dp
+    glob_d = 0.0_dp
+    pl_d   = (0.0_dp, 0.0_dp)
+    vlid_d = 0.0_dp
+
+    ! 2-D C2C plans on pl_d(2N, nzp, nb): C order n = (nzp, 2N)
+    nn(1) = nzp; nn(2) = nx2
+    ne(1) = nzp; ne(2) = nx2
+    istat = cufftPlanMany(plan1, 2, nn, ne, 1, nx2*nzp, ne, 1, nx2*nzp, CUFFT_Z2Z, 1)
+    if (istat /= CUFFT_SUCCESS) then
+       write(*,*) 'topbc: cufftPlanMany (batch 1) failed:', istat; stop
+    end if
+    istat = cufftPlanMany(plan2, 2, nn, ne, 1, nx2*nzp, ne, 1, nx2*nzp, CUFFT_Z2Z, 2)
+    if (istat /= CUFFT_SUCCESS) then
+       write(*,*) 'topbc: cufftPlanMany (batch 2) failed:', istat; stop
+    end if
+
+    if (is_root()) then
+       write(*,*) 'top_potential =', top_potential, ': potential-flow matching at y = Ly'
+       if (top_potential == 1) then
+          write(*,*) '   matched modes: all (kx, kz) /= (0, 0)'
+       else
+          write(*,*) '   matched modes: kz = 0, kx > 0 (kz /= 0 keeps the zero-shear lid)'
+       end if
+       if (top_potential_flux == 1) then
+          write(*,*) '   lid flux FREE: mean mode dv/dy = 0, outlet correction absorbs it'
+       else
+          write(*,*) '   lid flux fixed: mean mode keeps v = V_top'
+       end if
+       write(*,*) '   top plane ', nx2, ' (even-extended x) x ', nzp, ' ; Delta = ', delta
+       write(*,*) '   r(K) at the x and z Nyquist: ', &
+            rr(maxval(sx)*d2), rr(maxval(sz)*d2), ' ; lowest x mode: ', rr(sx(2)*d2)
+       if (len_trim(file_topref) > 0) then
+          write(*,*) '   reference row from file: ', trim(file_topref)
+       else
+          write(*,*) '   reference row: analytic potential flow (pot_le)'
+       end if
+       write(*,*) '   Uref(1), Uref(nx) = ', uref(1), uref(nx), &
+            ' ; max |Vref_in - V_top| = ', maxval(abs(vrin(2:nx-1) - V_top(2:nx-1)))
+    end if
+    deallocate( uref, vrin, sx, sz )
+
+  end subroutine topbc_init
+
+  !----------------------------------------------------------------------------
+  ! read_topref: reference row from file (stream: int32 20261008, int32 nx,
+  ! float64 Uref(nx)); every rank reads it.
+  !----------------------------------------------------------------------------
+  subroutine read_topref(uref)
+    real(dp), intent(out) :: uref(:)
+    integer :: u, ios, magic, nxf
+    open(newunit=u, file=trim(file_topref), access='stream', form='unformatted', &
+         action='read', status='old', iostat=ios)
+    if (ios /= 0) then
+       write(*,*) 'ERROR: cannot open top_potential_ref file ', trim(file_topref)
+       stop 'missing top_potential_ref file'
+    end if
+    read(u) magic, nxf
+    if (magic /= 20261008 .or. nxf /= nx) then
+       write(*,*) 'ERROR: top_potential_ref: magic ', magic, ' nx ', nxf, ' (expected 20261008, ', nx, ')'
+       stop 'bad top_potential_ref file'
+    end if
+    read(u) uref(1:nx)
+    close(u)
+  end subroutine read_topref
+
+  pure real(dp) function rr(a)
+    real(dp), intent(in) :: a
+    rr = 2.0_dp/( (2.0_dp + a) + sqrt(a*(4.0_dp + a)) )
+  end function rr
+
+  !----------------------------------------------------------------------------
+  ! topbc_prepare: lid row V(:, ny, :) for the coming substep, from the
+  ! current (projected) state. Stored in vlid_d, imposed by topbc_apply.
+  !----------------------------------------------------------------------------
+  subroutine topbc_prepare()
+    type(dim3) :: tb, g
+    integer(c_int) :: istat
+
+    if (.not. topbc_on) return
+    tb = dim3(BX, BY, 1)
+
+    g%x = ceil_div(nxg, BX); g%y = ceil_div(ns, BY); g%z = 1
+    call k_tb_fluct_v<<<g, tb>>>(loc_d, V_d, vrin_d, nx, nxg, ny, nzg, ns)
+    call gather_rows(1)
+
+    g%x = ceil_div(nx2, BX); g%y = ceil_div(nzp, BY); g%z = 1
+    call k_tb_pack<<<g, tb>>>(pl_d, glob_d, nxt, nx2, nzp, nxg, ns, 1, 2, 2)
+    istat = cufftExecZ2Z(plan1, pl_d, pl_d, CUFFT_FORWARD)
+    call k_tb_mult<<<g, tb>>>(pl_d, sx_d, sz_d, nx2, nzp, d2, tscale, &
+                              top_potential, 1, 0, 0, top_potential_flux)
+    istat = cufftExecZ2Z(plan1, pl_d, pl_d, CUFFT_INVERSE)
+
+    g%x = ceil_div(nxg, BX); g%y = ceil_div(nzg, BY); g%z = 1
+    call k_tb_vlid<<<g, tb>>>(vlid_d, pl_d, V_top_d, nx, nxg, nzg, nx2, nzp, ns, myid)
+
+  end subroutine topbc_prepare
+
+  !----------------------------------------------------------------------------
+  ! topbc_apply: top rows inside apply_bc (replaces the top_flag = 4 kernels).
+  ! U and W ghosts from the current interior; V lid from the stored row.
+  !----------------------------------------------------------------------------
+  subroutine topbc_apply()
+    type(dim3) :: tb, g
+    integer(c_int) :: istat
+
+    tb = dim3(BX, BY, 1)
+
+    g%x = ceil_div(nxg, BX); g%y = ceil_div(ns, BY); g%z = 1
+    call k_tb_fluct_uw<<<g, tb>>>(loc_d, U_d, W_d, uref_d, nx, nxg, nyg, nzg, nz, ns)
+    call gather_rows(2)
+
+    g%x = ceil_div(nx2, BX); g%y = ceil_div(nzp, BY); g%z = 2
+    call k_tb_pack<<<g, tb>>>(pl_d, glob_d, nxt, nx2, nzp, nxg, ns, 2, 1, 2)
+    istat = cufftExecZ2Z(plan2, pl_d, pl_d, CUFFT_FORWARD)
+    call k_tb_mult<<<g, tb>>>(pl_d, sx_d, sz_d, nx2, nzp, d2, tscale, &
+                              top_potential, 2, 1, 1, 0)
+    istat = cufftExecZ2Z(plan2, pl_d, pl_d, CUFFT_INVERSE)
+
+    g%x = ceil_div(nx, BX); g%y = ceil_div(nzg, BY); g%z = 1
+    call k_tb_ghost_u<<<g, tb>>>(U_d, pl_d, nx, nyg, nzg, nx2, nzp, ns, myid)
+    g%x = ceil_div(nxg, BX); g%y = ceil_div(nz, BY); g%z = 1
+    call k_tb_ghost_w<<<g, tb>>>(W_d, pl_d, nx, nxg, nyg, nz, nx2, nzp, ns, myid)
+    g%x = ceil_div(nxg, BX); g%y = ceil_div(nzg, BY); g%z = 1
+    call k_tb_put_v<<<g, tb>>>(V_d, vlid_d, nxg, ny, nzg)
+
+  end subroutine topbc_apply
+
+  !----------------------------------------------------------------------------
+  ! gather_rows: owned rows loc_d(:, :, 1:nf) of every rank -> glob_d on all
+  ! ranks, rank r's block at glob_d(:, :, 1:nf, r+1).
+  !----------------------------------------------------------------------------
+  subroutine gather_rows(nf)
+    integer, intent(in) :: nf
+    call allgather_dev(loc_d, nxg*ns*nf, glob_d)
+  end subroutine gather_rows
+
+  !----------------------------------------------------------------------------
+  ! topbc_report: monitor line, rms/max of the lid fluctuation V - V_top over
+  ! the interior columns and owned planes, and its net flux (should be at
+  ! round-off: the (0,0) mode is excluded).
+  !----------------------------------------------------------------------------
+  subroutine topbc_report(istep)
+    integer, intent(in) :: istep
+    real(dp), allocatable :: vl(:,:)
+    real(dp) :: s2, smax, flux, cnt
+    integer  :: i, k
+
+    if (.not. topbc_on) return
+    allocate( vl(nxg, nzg) )
+    vl = vlid_d
+    s2 = 0.0_dp; smax = 0.0_dp; flux = 0.0_dp
+    do k = 2, ns + 1
+       do i = 2, nx - 1
+          s2   = s2 + ( vl(i,k) - V_top(i) )**2
+          smax = max( smax, abs(vl(i,k) - V_top(i)) )
+          flux = flux + ( vl(i,k) - V_top(i) )*( x(i) - x(i-1) )
+       end do
+    end do
+    deallocate( vl )
+    call allreduce_sum(s2)
+    call allreduce_sum(flux)
+    call allreduce_max(smax)
+    cnt = real(nx-2, dp)*real(nzp, dp)
+    if (is_root()) write(*,'(a,i9,3(a,es11.3))') ' topbc step ', istep, &
+         ' rms(V_lid-V_top) ', sqrt(s2/cnt), ' max ', smax, &
+         ' mean(V_lid-V_top) ', flux/( (x(nx-1)-x(1))*real(nzp,dp) )
+  end subroutine topbc_report
+
+  !============================================================================
+  ! kernels
+  !============================================================================
+
+  ! V' at the face below the lid, owned planes, interior columns 2..nx-1
+  attributes(global) subroutine k_tb_fluct_v(loc, V, vrin, nx, nxg, ny, nzg, ns)
+    integer,  value       :: nx, nxg, ny, nzg, ns
+    real(dp), intent(out) :: loc(nxg, ns, 2)
+    real(dp), intent(in)  :: V(nxg, ny, nzg), vrin(nxg)
+    integer :: i, kk
+    i  = (blockIdx%x - 1)*blockDim%x + threadIdx%x
+    kk = (blockIdx%y - 1)*blockDim%y + threadIdx%y
+    if (i > nxg .or. kk > ns) return
+    if (i >= 2 .and. i <= nx-1) then
+       loc(i, kk, 1) = V(i, ny-1, kk+1) - vrin(i)
+    else
+       loc(i, kk, 1) = 0.0_dp
+    end if
+  end subroutine k_tb_fluct_v
+
+  ! U' (faces 1..nx-1) and W' (centres 2..nx-1) in the top-cell row
+  attributes(global) subroutine k_tb_fluct_uw(loc, U, W, uref, nx, nxg, nyg, nzg, nz, ns)
+    integer,  value       :: nx, nxg, nyg, nzg, nz, ns
+    real(dp), intent(out) :: loc(nxg, ns, 2)
+    real(dp), intent(in)  :: U(nx, nyg, nzg), W(nxg, nyg, nz), uref(nx)
+    integer :: i, kk
+    i  = (blockIdx%x - 1)*blockDim%x + threadIdx%x
+    kk = (blockIdx%y - 1)*blockDim%y + threadIdx%y
+    if (i > nxg .or. kk > ns) return
+    if (i <= nx-1) then
+       loc(i, kk, 1) = U(i, nyg-1, kk+1) - uref(i)
+    else
+       loc(i, kk, 1) = 0.0_dp
+    end if
+    if (i >= 2 .and. i <= nx-1) then
+       loc(i, kk, 2) = W(i, nyg-1, kk+1)
+    else
+       loc(i, kk, 2) = 0.0_dp
+    end if
+  end subroutine k_tb_fluct_uw
+
+  ! even extension into the 2N-periodic complex line; slot b of pl takes
+  ! field b of glob (nb fields gathered, rank r's block = glob(:,:,:,r+1));
+  ! kind 1 = faces (x(1..nx-1)), kind 2 = centres (xg(2..nx-1)); the kind
+  ! of slot 1 is k1, of slot 2 is k2.
+  attributes(global) subroutine k_tb_pack(pl, glob, nh, n2, nzp, nxg, ns, nb, k1, k2)
+    integer,     value       :: nh, n2, nzp, nxg, ns, nb, k1, k2
+    complex(dp), intent(out) :: pl(n2, nzp, 2)
+    real(dp),    intent(in)  :: glob(nxg, ns, nb, *)
+    integer :: ix, q, b, r, kk, i, kind
+    ix = (blockIdx%x - 1)*blockDim%x + threadIdx%x - 1     ! 0-based x index
+    q  = (blockIdx%y - 1)*blockDim%y + threadIdx%y         ! 1-based z pack index
+    b  = blockIdx%z
+    if (ix > n2-1 .or. q > nzp .or. b > nb) return
+    kind = k1
+    if (b == 2) kind = k2
+    r  = (q - 1)/ns
+    kk = q - r*ns
+    if (kind == 1) then                    ! faces: f(0..nh) = x(1..nx-1)
+       if (ix <= nh) then
+          i = ix + 1
+       else
+          i = n2 - ix + 1
+       end if
+    else                                   ! centres: c(0..nh-1) = xg(2..nx-1)
+       if (ix <= nh-1) then
+          i = ix + 2
+       else
+          i = n2 + 1 - ix
+       end if
+    end if
+    pl(ix+1, q, b) = cmplx( glob(i, kk, b, r+1), 0.0_dp, dp )
+  end subroutine k_tb_pack
+
+  ! mode-wise multiplier, with the FFT normalisation. For slot b the kind
+  ! (0 = lid V: r on matched modes, 0 elsewhere; 1 = ghost correction:
+  ! r - 1 on matched modes, 0 elsewhere) is c1 for b = 1 and c2 for b = 2.
+  ! freeflux = 1: the lid V keeps its (0,0) mode (r(0) = 1).
+  attributes(global) subroutine k_tb_mult(pl, sx, sz, n2, nzp, d2, tscale, &
+                                          mode, nb, c1, c2, freeflux)
+    integer,     value         :: n2, nzp, mode, nb, c1, c2, freeflux
+    real(dp),    value         :: d2, tscale
+    complex(dp), intent(inout) :: pl(n2, nzp, 2)
+    real(dp),    intent(in)    :: sx(n2), sz(nzp)
+    integer  :: ix, q, b, c
+    real(dp) :: a, r, m
+    logical  :: act
+    ix = (blockIdx%x - 1)*blockDim%x + threadIdx%x         ! 1-based
+    q  = (blockIdx%y - 1)*blockDim%y + threadIdx%y
+    b  = blockIdx%z
+    if (ix > n2 .or. q > nzp .or. b > nb) return
+    c = c1
+    if (b == 2) c = c2
+    act = .not. (ix == 1 .and. q == 1)
+    if (mode == 2 .and. q /= 1) act = .false.
+    if (act) then
+       a = ( sx(ix) + sz(q) )*d2
+       r = 2.0_dp/( (2.0_dp + a) + sqrt(a*(4.0_dp + a)) )
+       if (c == 0) then
+          m = r
+       else
+          m = r - 1.0_dp
+       end if
+    else if (c == 0 .and. freeflux == 1 .and. ix == 1 .and. q == 1) then
+       m = 1.0_dp
+    else
+       m = 0.0_dp
+    end if
+    pl(ix, q, b) = pl(ix, q, b)*( m*tscale )
+  end subroutine k_tb_mult
+
+  ! lid row on every local plane (ghosts by periodic wrap of the pack index)
+  attributes(global) subroutine k_tb_vlid(vlid, pl, vtop, nx, nxg, nzg, n2, nzp, ns, rank)
+    integer,     value       :: nx, nxg, nzg, n2, nzp, ns, rank
+    real(dp),    intent(out) :: vlid(nxg, nzg)
+    complex(dp), intent(in)  :: pl(n2, nzp, 2)
+    real(dp),    intent(in)  :: vtop(nxg)
+    integer :: i, p, q
+    i = (blockIdx%x - 1)*blockDim%x + threadIdx%x
+    p = (blockIdx%y - 1)*blockDim%y + threadIdx%y
+    if (i > nxg .or. p > nzg) return
+    q = modulo(rank*ns + p - 2, nzp) + 1
+    if (i >= 2 .and. i <= nx-1) then
+       vlid(i, p) = vtop(i) + real(pl(i-1, q, 1), dp)
+    else
+       vlid(i, p) = vtop(i)
+    end if
+  end subroutine k_tb_vlid
+
+  ! U ghost row: interior faces 2..nx-2 get the correction, the inlet and
+  ! outlet columns keep zero shear
+  attributes(global) subroutine k_tb_ghost_u(U, pl, nx, nyg, nzg, n2, nzp, ns, rank)
+    integer,     value         :: nx, nyg, nzg, n2, nzp, ns, rank
+    real(dp),    intent(inout) :: U(nx, nyg, nzg)
+    complex(dp), intent(in)    :: pl(n2, nzp, 2)
+    integer :: i, p, q
+    i = (blockIdx%x - 1)*blockDim%x + threadIdx%x
+    p = (blockIdx%y - 1)*blockDim%y + threadIdx%y
+    if (i > nx .or. p > nzg) return
+    q = modulo(rank*ns + p - 2, nzp) + 1
+    if (i >= 2 .and. i <= nx-2) then
+       U(i, nyg, p) = U(i, nyg-1, p) + real(pl(i, q, 1), dp)
+    else
+       U(i, nyg, p) = U(i, nyg-1, p)
+    end if
+  end subroutine k_tb_ghost_u
+
+  ! W ghost row: interior centres 2..nx-1 get the correction
+  attributes(global) subroutine k_tb_ghost_w(W, pl, nx, nxg, nyg, nz, n2, nzp, ns, rank)
+    integer,     value         :: nx, nxg, nyg, nz, n2, nzp, ns, rank
+    real(dp),    intent(inout) :: W(nxg, nyg, nz)
+    complex(dp), intent(in)    :: pl(n2, nzp, 2)
+    integer :: i, p, q
+    i = (blockIdx%x - 1)*blockDim%x + threadIdx%x
+    p = (blockIdx%y - 1)*blockDim%y + threadIdx%y
+    if (i > nxg .or. p > nz) return
+    q = modulo(rank*ns + p - 2, nzp) + 1
+    if (i >= 2 .and. i <= nx-1) then
+       W(i, nyg, p) = W(i, nyg-1, p) + real(pl(i-1, q, 2), dp)
+    else
+       W(i, nyg, p) = W(i, nyg-1, p)
+    end if
+  end subroutine k_tb_ghost_w
+
+  attributes(global) subroutine k_tb_put_v(V, vlid, nxg, ny, nzg)
+    integer,  value         :: nxg, ny, nzg
+    real(dp), intent(inout) :: V(nxg, ny, nzg)
+    real(dp), intent(in)    :: vlid(nxg, nzg)
+    integer :: i, p
+    i = (blockIdx%x - 1)*blockDim%x + threadIdx%x
+    p = (blockIdx%y - 1)*blockDim%y + threadIdx%y
+    if (i > nxg .or. p > nzg) return
+    V(i, ny, p) = vlid(i, p)
+  end subroutine k_tb_put_v
+
+end module topbc_mod
