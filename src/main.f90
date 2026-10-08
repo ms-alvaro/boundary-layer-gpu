@@ -12,7 +12,7 @@ program boundary_layer_cuda
 
   use param_mod,     only: read_input_parameters, check_supported,           &
                            print_banner, param_summary, nsteps, random_init, &
-                           inflow_boundary_flag, top_boundary_flag, nmonitor
+                           inflow_boundary_flag, top_boundary_flag, nmonitor, nsave
   use grid_mod,      only: grid_generate, grid_to_device
   use field_mod,     only: fields_allocate, fields_to_device
   use ic_inflow_mod, only: generate_initial_condition,                       &
@@ -29,7 +29,7 @@ program boundary_layer_cuda
   use reductions,    only: reductions_finalize
   use mpi_mod,       only: mpi_initialize, mpi_finalize_run, is_root
   use hit_inflow_mod, only: init_hit_inflow
-  use topbc_mod,     only: topbc_on, topbc_init, topbc_report
+  use topbc_mod,     only: topbc_on, topbc_init, topbc_report, topbc_write_state
   use io_mod,        only: io_init, read_restart,                            &
                            output_stats, output_monitor, output_snapshot,    &
                            output_boxes, output_snap3d
@@ -113,6 +113,9 @@ program boundary_layer_cuda
         if (mod(istep, nmonitor) == 0) call topbc_report(istep)
      end if
      call output_snapshot(istep)          ! self-gated: nsave (+ .restart link)
+     if (topbc_on .and. nsave > 0) then  ! long-wave filter state next to it
+        if (mod(istep, nsave) == 0) call topbc_write_state(istep)
+     end if
      call output_boxes(istep)             ! self-gated: causal-campaign boxes
      call output_snap3d(istep)            ! self-gated: coarsened 3-D snaps
   end do

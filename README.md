@@ -124,13 +124,25 @@ displacement-thickness fluctuation of the boundary layer below forces a
 span-uniform change of the free-stream velocity, U delta*'/(Ly - delta*).
 `top_potential = 1` replaces this, for the fluctuation about the steady
 potential flow, by the decaying irrotational field above the lid: each
-top-plane mode satisfies d/dy q = -|k| q (u, v and w). The mean mode keeps
-the old condition, so the lid flux and the outlet mass correction do not
-change. `top_potential = 2` applies it to the spanwise-uniform modes only.
+top-plane mode satisfies d/dy q = -|k| q (u, v and w). The mean mode obeys
+the k -> 0 limit, dv/dy = 0 (`top_potential_flux = 1`, the default): the
+total lid flux is free, the net excess displacement of the layer leaves
+through the lid and the mean free stream keeps a zero pressure gradient
+(`top_potential_flux = 0` pins the lid flux instead, for comparison only).
+The spanwise-uniform modes with kx Ly < 1 follow the matched value through
+a relaxation of time constant `top_potential_tau` (default 0.5): in a long
+box the outlet mass correction would otherwise return the plane-mean v'
+residual of the free-stream turbulence under the lid as a box-wide u'
+flicker (gain Lx/(m pi Ly)); the filter state travels with the restart
+snapshots (`<snapshot>.topbc`).
+`top_potential = 2` applies the matching to the spanwise-uniform modes only.
 The lid value of v is set at the start of each Runge-Kutta substep from the
 projected field and held through the pressure projection, whose top Neumann
-data stay homogeneous. Multi-GPU runs all-gather the top rows. Implementation
-and derivation: `src/topbc_mod.cuf`.
+data stay homogeneous. Multi-GPU runs all-gather the top rows. An optional
+reference row from a steady laminar solution of the same grid
+(`top_potential_ref`, `tools/make_top_reference.py`) preserves that state
+exactly. Implementation and derivation: `src/topbc_mod.cuf`; validation:
+`tbl_tu2_aps/TOPBC.md` of the fst_hit_tu3_aps campaign.
 
 ## Documentation
 
