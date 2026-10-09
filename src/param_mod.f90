@@ -80,7 +80,7 @@ module param_mod
 
   ! boundary conditions
   public :: inflow_boundary_flag, top_boundary_flag, top_potential, top_potential_flux
-  public :: top_potential_tau
+  public :: top_potential_tau, top_potential_long, file_topvmean
   public :: file_topref
   public :: Amplitude_perturbations
   public :: beta_hartree
@@ -186,6 +186,7 @@ module param_mod
   ! spanwise-uniform modes kz = 0.
   integer :: top_potential = 0
   logical :: have_topflux = .false., have_toptau = .false., have_topref = .false.  ! keys given
+  logical :: have_toplong = .false., have_topvmean = .false.
   ! 'top_potential_flux' (with top_potential > 0): 1 or absent (default): the
   ! (0,0) mode of the lid follows the k -> 0 limit of the matching condition,
   ! dv/dy = 0 for the x-z mean, so the total lid flux is free: the net excess
@@ -196,7 +197,30 @@ module param_mod
   ! amplifies the lowest lid modes into box-wide free-stream velocity changes
   ! (tbl_tu2_aps/TOPBC.md). Kept for comparison only.
   integer :: top_potential_flux = 1
-  ! 'top_potential_tau' (with top_potential > 0): relaxation time of the
+  ! 'top_potential_long' (with top_potential > 0): treatment of the long-wave
+  ! lid modes, the spanwise-uniform modes with kx Ly < 1 (m = 0..10 in case A),
+  ! whose unbounded response a box with a pinned inlet flux cannot host: a
+  ! lid-flux change on them is returned by the outlet mass correction as a
+  ! box-wide u' with gain Lx/(m pi Ly), and the free-stream turbulence under
+  ! the lid has a plane-mean v' residual on them (u'/sqrt(N_eddies), evolving
+  ! on the box-transit time, so no time filter removes it).
+  !   0 (default): they keep the top_flag = 4 lid (v' = 0, zero shear): the
+  !      displacement response at those wavelengths stays confined as before,
+  !      everything with k Ly >= 1 is matched. Mean flow: see
+  !      top_potential_vmean.
+  !   1: matched like every other mode; the (0,0) mode per top_potential_flux.
+  !   2: as 1 with the relaxation top_potential_tau (cuts the fast part of the
+  !      residual only).
+  integer :: top_potential_long = 0
+  ! 'top_potential_vmean' (with top_potential > 0, optional): file with a row
+  ! dV(1:nxg) (V centres, ghosts included) added to the lid row V_top: the
+  ! steady mean excess transpiration of the actual (transitional/turbulent)
+  ! layer, d(U_e delta* - delta*_lam)/dx from the statistics of a previous run
+  ! (tools/make_top_vmean.py). With it the pinned lid flux carries the layer's
+  ! mean displacement growth and the mean free stream is at zero pressure
+  ! gradient (stream binary: int32 magic 20261010, int32 nxg, float64 dV(nxg)).
+  character(200) :: file_topvmean = ' '
+  ! 'top_potential_tau' (with top_potential_long = 2): relaxation time of the
   ! long-wave lid modes, the spanwise-uniform modes with kx Ly < 1 (box gain
   ! Lx/(m pi Ly) > 1 on a lid-flux change; m = 0..10 in case A). Those modes
   ! follow the matched value through a first-order relaxation with this time
@@ -358,6 +382,10 @@ contains
     if (.not. have_toptau) top_potential_tau = 0.5_dp
     call get_str('top_potential_ref', file_topref, have_topref)
     if (.not. have_topref) file_topref = ''
+    call get_int('top_potential_long', top_potential_long, have_toplong)
+    if (.not. have_toplong) top_potential_long = 0
+    call get_str('top_potential_vmean', file_topvmean, have_topvmean)
+    if (.not. have_topvmean) file_topvmean = ''
     if (top_potential == 0) then     ! option off: the sub-keys are inert
        if (.not. have_topflux) top_potential_flux = 0
        if (.not. have_toptau)  top_potential_tau  = 0.0_dp
@@ -588,8 +616,8 @@ contains
                  ' 1/2 (blowing-suction lid) and 4 (zero-shear tangential) are ported.'
       stop 'unsupported feature: top boundary condition'
     end if
-    if (top_potential == 0 .and. (have_topref .or. have_topflux .or. have_toptau)) then
-      write(*,*) 'ERROR: top_potential_flux / top_potential_tau / top_potential_ref need top_potential = 1 or 2.'
+    if (top_potential == 0 .and. (have_topref .or. have_topflux .or. have_toptau .or. have_toplong .or. have_topvmean)) then
+      write(*,*) 'ERROR: the top_potential_* sub-keys need top_potential = 1 or 2.'
       stop 'top_potential sub-key without top_potential'
     end if
     if (top_potential /= 0) then
@@ -601,6 +629,10 @@ contains
       if (top_potential_flux < 0 .or. top_potential_flux > 1) then
         write(*,*) 'ERROR: top_potential_flux = ', top_potential_flux, ' ; use 0 (fixed lid flux) or 1 (free).'
         stop 'invalid top_potential_flux'
+      end if
+      if (top_potential_long < 0 .or. top_potential_long > 2) then
+        write(*,*) 'ERROR: top_potential_long = ', top_potential_long, ' ; use 0 (old lid), 1 (matched) or 2 (relaxed).'
+        stop 'invalid top_potential_long'
       end if
       if (top_potential_tau < 0.0_dp) then
         write(*,*) 'ERROR: top_potential_tau = ', top_potential_tau, ' ; use 0 (off) or a relaxation time > 0.'

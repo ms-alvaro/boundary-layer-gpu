@@ -124,17 +124,19 @@ displacement-thickness fluctuation of the boundary layer below forces a
 span-uniform change of the free-stream velocity, U delta*'/(Ly - delta*).
 `top_potential = 1` replaces this, for the fluctuation about the steady
 potential flow, by the decaying irrotational field above the lid: each
-top-plane mode satisfies d/dy q = -|k| q (u, v and w). The mean mode obeys
-the k -> 0 limit, dv/dy = 0 (`top_potential_flux = 1`, the default): the
-total lid flux is free, the net excess displacement of the layer leaves
-through the lid and the mean free stream keeps a zero pressure gradient
-(`top_potential_flux = 0` pins the lid flux instead, for comparison only).
-The spanwise-uniform modes with kx Ly < 1 follow the matched value through
-a relaxation of time constant `top_potential_tau` (default 0.5): in a long
-box the outlet mass correction would otherwise return the plane-mean v'
-residual of the free-stream turbulence under the lid as a box-wide u'
-flicker (gain Lx/(m pi Ly)); the filter state travels with the restart
-snapshots (`<snapshot>.topbc`).
+top-plane mode with k Ly >= 1 satisfies d/dy q = -|k| q (u, v and w). The
+spanwise-uniform modes with kx Ly < 1 (the mean mode among them) keep the
+old lid by default (`top_potential_long = 0`): a box with a pinned inlet
+flux cannot host their unbounded response, because the outlet mass
+correction returns any lid-flux change on them as a box-wide u' with gain
+Lx/(m pi Ly), and the free-stream turbulence under the lid carries a
+plane-mean v' residual on exactly those modes. The steady mean displacement
+growth of the actual layer is given to the lid as a row from the statistics
+of a previous run (`top_potential_vmean`, `tools/make_top_vmean.py`), so the
+mean free stream stays at zero pressure gradient. `top_potential_long = 1/2`
+match the long modes too (free mean flux `top_potential_flux`, optional
+relaxation `top_potential_tau`, state in `<snapshot>.topbc`); they were
+measured and rejected for production (box-wide flicker).
 `top_potential = 2` applies the matching to the spanwise-uniform modes only.
 The lid value of v is set at the start of each Runge-Kutta substep from the
 projected field and held through the pressure projection, whose top Neumann

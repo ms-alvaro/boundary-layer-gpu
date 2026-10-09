@@ -80,6 +80,7 @@ module topbc_mod
   use cudafor
   use precision_mod, only: dp, pi, ceil_div
   use param_mod,     only: top_potential, top_potential_flux, top_potential_tau, &
+                           top_potential_long, file_topvmean, &
                            nz_global, file_topref, filein, fileout, random_init, &
                            nstep_init
   use grid_mod,      only: nx, ny, nz, nxg, nyg, nzg, nslices_z, x, y, dx, dz
@@ -185,6 +186,9 @@ contains
     else
        call top_reference_u(uref)
     end if
+    ! mean excess transpiration of the layer added to the lid row (and to
+    ! the device copy used by the lid and the inflow/outflow columns)
+    if (len_trim(file_topvmean) > 0) call add_vmean()
     vrin = V_top
     do i = 2, nx - 1
        vrin(i) = V_top(i) + delta*( uref(i) - uref(i-1) )/( x(i) - x(i-1) )
@@ -211,11 +215,12 @@ contains
     pl_d   = (0.0_dp, 0.0_dp)
     vlid_d = 0.0_dp
 
-    ! long-wave relaxation: kz = 0 modes with kx Ly < 1, kx = pi m / L
-    tau_long = top_potential_tau
+    ! long-wave modes: kz = 0 with kx Ly < 1, kx = pi m / L, m = 0..m_long
+    m_long = int( (x(nx-1) - x(1))/( pi*(y(ny) - y(1)) ) )
+    m_long = max(0, min(m_long, nxt - 1))
+    tau_long = 0.0_dp
+    if (top_potential_long == 2) tau_long = top_potential_tau
     if (tau_long > 0.0_dp) then
-       m_long = int( (x(nx-1) - x(1))/( pi*(y(ny) - y(1)) ) )
-       m_long = max(0, min(m_long, nxt - 1))
        allocate( afl_d(0:m_long), afl_h(0:m_long) )
        afl_h = (0.0_dp, 0.0_dp)
        afl_d = afl_h
@@ -246,11 +251,16 @@ contains
        else
           write(*,*) '   lid flux fixed: mean mode keeps v = V_top'
        end if
-       if (tau_long > 0.0_dp) then
-          write(*,*) '   long-wave relaxation: kz = 0 modes m = 0..', m_long, &
-               ' (kx Ly < 1), tau = ', tau_long
-       else
-          write(*,*) '   long-wave relaxation: off'
+       select case (top_potential_long)
+       case (0)
+          write(*,*) '   long-wave kz = 0 modes m = 0..', m_long, ' (kx Ly < 1): old lid (v = V_top, zero shear)'
+       case (1)
+          write(*,*) '   long-wave kz = 0 modes m = 0..', m_long, ' (kx Ly < 1): matched'
+       case (2)
+          write(*,*) '   long-wave kz = 0 modes m = 0..', m_long, ' (kx Ly < 1): matched, relaxation tau = ', tau_long
+       end select
+       if (len_trim(file_topvmean) > 0) then
+          write(*,*) '   mean excess transpiration added to the lid from: ', trim(file_topvmean)
        end if
        write(*,*) '   top plane ', nx2, ' (even-extended x) x ', nzp, ' ; Delta = ', delta
        write(*,*) '   r(K) at the x and z Nyquist: ', &
@@ -266,6 +276,34 @@ contains
     deallocate( uref, vrin, sx, sz )
 
   end subroutine topbc_init
+
+  !----------------------------------------------------------------------------
+  ! add_vmean: lid row V_top(1:nxg) += dV(1:nxg) from file_topvmean (stream:
+  ! int32 20261010, int32 nxg, float64 dV(nxg)); host and device copies.
+  !----------------------------------------------------------------------------
+  subroutine add_vmean()
+    real(dp), allocatable :: dv(:)
+    integer :: u, ios, magic, nf
+    open(newunit=u, file=trim(file_topvmean), access='stream', form='unformatted', &
+         action='read', status='old', iostat=ios)
+    if (ios /= 0) then
+       write(*,*) 'ERROR: cannot open top_potential_vmean file ', trim(file_topvmean)
+       stop 'missing top_potential_vmean file'
+    end if
+    read(u) magic, nf
+    if (magic /= 20261010 .or. nf /= nxg) then
+       write(*,*) 'ERROR: top_potential_vmean: magic ', magic, ' nxg ', nf, ' (expected 20261010, ', nxg, ')'
+       stop 'bad top_potential_vmean file'
+    end if
+    allocate( dv(nxg) )
+    read(u) dv(1:nxg)
+    close(u)
+    V_top(1:nxg) = V_top(1:nxg) + dv(1:nxg)
+    V_top_d = V_top
+    if (is_root()) write(*,*) '   lid mean transpiration: max |dV| = ', maxval(abs(dv)), &
+         ' ; net dV flux / L = ', sum(dv(2:nx-1))/real(nx-2, dp)
+    deallocate( dv )
+  end subroutine add_vmean
 
   !----------------------------------------------------------------------------
   ! read_topref: reference row from file (stream: int32 20261008, int32 nx,
@@ -364,7 +402,8 @@ contains
     call k_tb_pack<<<g, tb>>>(pl_d, glob_d, nxt, nx2, nzp, nxg, ns, 1, 2, 2)
     istat = cufftExecZ2Z(plan1, pl_d, pl_d, CUFFT_FORWARD)
     call k_tb_mult<<<g, tb>>>(pl_d, sx_d, sz_d, nx2, nzp, d2, tscale, &
-                              top_potential, 1, 0, 0, top_potential_flux)
+                              top_potential, 1, 0, 0, top_potential_flux, &
+                              top_potential_long, m_long)
     if (tau_long > 0.0_dp) then
        ! The interior row under the lid follows the lid within one substep
        ! (top-cell continuity), so the matched value differs from the current
@@ -404,7 +443,7 @@ contains
     call k_tb_pack<<<g, tb>>>(pl_d, glob_d, nxt, nx2, nzp, nxg, ns, 2, 1, 2)
     istat = cufftExecZ2Z(plan2, pl_d, pl_d, CUFFT_FORWARD)
     call k_tb_mult<<<g, tb>>>(pl_d, sx_d, sz_d, nx2, nzp, d2, tscale, &
-                              top_potential, 2, 1, 1, 0)
+                              top_potential, 2, 1, 1, 0, top_potential_long, m_long)
     istat = cufftExecZ2Z(plan2, pl_d, pl_d, CUFFT_INVERSE)
 
     g%x = ceil_div(nx, BX); g%y = ceil_div(nzg, BY); g%z = 1
@@ -535,10 +574,11 @@ contains
   ! mode-wise multiplier, with the FFT normalisation. For slot b the kind
   ! (0 = lid V: r on matched modes, 0 elsewhere; 1 = ghost correction:
   ! r - 1 on matched modes, 0 elsewhere) is c1 for b = 1 and c2 for b = 2.
-  ! freeflux = 1: the lid V keeps its (0,0) mode (r(0) = 1).
+  ! freeflux = 1: the lid V keeps its (0,0) mode (r(0) = 1). long = 0: the
+  ! kz = 0 modes m = 0..ml (ix = m+1 and the mirror n2-m+1) are not matched.
   attributes(global) subroutine k_tb_mult(pl, sx, sz, n2, nzp, d2, tscale, &
-                                          mode, nb, c1, c2, freeflux)
-    integer,     value         :: n2, nzp, mode, nb, c1, c2, freeflux
+                                          mode, nb, c1, c2, freeflux, long, ml)
+    integer,     value         :: n2, nzp, mode, nb, c1, c2, freeflux, long, ml
     real(dp),    value         :: d2, tscale
     complex(dp), intent(inout) :: pl(n2, nzp, 2)
     real(dp),    intent(in)    :: sx(n2), sz(nzp)
@@ -553,6 +593,7 @@ contains
     if (b == 2) c = c2
     act = .not. (ix == 1 .and. q == 1)
     if (mode == 2 .and. q /= 1) act = .false.
+    if (long == 0 .and. q == 1 .and. (ix <= ml + 1 .or. ix >= n2 - ml + 1)) act = .false.
     if (act) then
        a = ( sx(ix) + sz(q) )*d2
        r = 2.0_dp/( (2.0_dp + a) + sqrt(a*(4.0_dp + a)) )
@@ -561,7 +602,7 @@ contains
        else
           m = r - 1.0_dp
        end if
-    else if (c == 0 .and. freeflux == 1 .and. ix == 1 .and. q == 1) then
+    else if (c == 0 .and. freeflux == 1 .and. long /= 0 .and. ix == 1 .and. q == 1) then
        m = 1.0_dp
     else
        m = 0.0_dp
