@@ -82,7 +82,10 @@ filein = ../BL.00070000
 ! If init_rand = 1 -> we must specify the fluid domain:
 ! Lx, Ly, Lz, stret_factor (in y direction)
 boxsize = 6.283185307179586 2.0 3.141592653589793 1d0
-! NOTE: if stret_factor = 1d0 -> uniform mesh in y direction
+! NOTE: y_j = Ly*sinh(stret_factor*s_j)/sinh(stret_factor), s_j = (j-1)/(ny-1);
+! the ratio of the last to the first spacing is about cosh(stret_factor), so
+! 1d0 is a mild stretching (ratio 1.5) and 3d0 a strong one (ratio 10);
+! 0d0 is not allowed (0/0). A uniform mesh needs a very small positive value.
 
 init_step = 10 ! first number for output flow field (default is 0)
 
