@@ -111,31 +111,86 @@ must follow `=` without a blank, as the shipped cases do.
 
 The solver integrates the incompressible Navier-Stokes equations with
 $U_\infty = 1$ and the inlet distance from the leading edge as the unit of
-length, so the inlet Reynolds number is $1/\texttt{nu}$. The inflow can be a
-Blasius profile, Blasius plus temporal Tollmien-Schlichting modes, Blasius
-read from a file, Blasius plus random noise, Lund recycling of a downstream
-plane (full or fluctuations only) or Blasius plus time-resolved planes from
-a precursor homogeneous-turbulence library (`inflow_flag` 1 to 6). The top
-boundary is a Dirichlet free stream, a Coleman or Abe blowing-and-suction
-lid, a Falkner-Skan free stream or a zero-shear lid (`top_flag` 0 to 4).
-The outflow is convective with a global mass correction, the spanwise
-direction is periodic, and the wall is no-slip unless a wall model is
-active. The LES models are constant-coefficient Smagorinsky and dynamic
-Smagorinsky with spanwise averaging or pointwise coefficients (`LES` 1 to
-3), all on the GPU. The wall models are the 14 options of the reference
-solver (`WM` 1 to 9 and 11 to 15: slip-length Robin conditions from
-momentum balances, a dynamic slip model, a least-squares Robin fit, log-law
-models and skin-friction correlations) together with a log-law wall-stress
-estimate (`TauwModel = 1`); the reference wall-model code runs on the host
-and is bridged to the GPU at every substep. Seven of the wall models are
-validated against the CPU solver to machine precision; the others run
-identically to the reference on the probes tried but have not been exercised
-to a physical result. The Euler, RK2 and RK3 schemes, restart, statistics,
-box output and strided 3-D snapshots are all available. Each option, its
-input keys, the equations it imposes and its validation status are in
-[docs/PHYSICS_AND_MODELS.md](docs/PHYSICS_AND_MODELS.md). Two memory errors
-found in the reference wall models during the port are repaired (see the
-commit history).
+length, so the inlet Reynolds number is $1/\texttt{nu}$. The streamwise
+direction has an inflow and an outflow, the wall-normal direction has the
+wall and a top boundary, and the spanwise direction is periodic. The tables
+list every option the code accepts, the input key that selects it, and how
+it has been checked. The status column uses four levels. Physical means
+compared with a known solution or with published data. Reference means
+agreement with the original CPU solver, started from the same restart file,
+to round-off. Ported means the option runs but no comparison is recorded.
+Not exercised means the option runs as in the CPU solver but no case in this
+repository has carried it to a physical result. The
+equations behind each option are in
+[docs/PHYSICS_AND_MODELS.md](docs/PHYSICS_AND_MODELS.md).
+
+Inflow, `inflow_flag`:
+
+| value | inflow | status |
+|---|---|---|
+| 1 | Blasius profile plus temporal Tollmien-Schlichting modes (none if no mode file) | physical: Blasius $C_f$ in the laminar gate, 500k-step K-type transition; reference: $2\times10^{-14}$ |
+| 2 | mean $u$, $v$ profiles read from a file | reference: $2.0\times10^{-14}$ |
+| 3 | Lund recycling of a downstream plane, full field rescaled | reference: $\le 2.5\times10^{-13}$ |
+| 4 | Blasius profile plus random noise redrawn every step | ported: the random sequence differs from the CPU solver by construction |
+| 5 | turbulent mean profile from a file plus rescaled Lund fluctuations | reference: $\le 2.5\times10^{-13}$ |
+| 6 | Blasius profile plus time-resolved planes from a precursor HIT library | physical: bypass transition at $Tu = 2\%$, $C_f$, $H$ and $u'_{rms}$ against Wu (2025); reference: $2.2\times10^{-14}$ |
+
+Top boundary, `top_flag`:
+
+| value | top boundary | status |
+|---|---|---|
+| 0 | Dirichlet free stream, $u = 1$, $v$ from the Blasius edge value, $w = 0$ | physical: Blasius $C_f$ in the laminar gate |
+| 1 | blowing and suction lid, Coleman et al. (2018) form, zero spanwise vorticity | reference: $\le 2.5\times10^{-13}$ |
+| 2 | blowing and suction lid, Abe (2017) form, zero spanwise vorticity | ported |
+| 3 | Falkner-Skan free stream, $u \propto x^{\beta/(2-\beta)}$ set by `beta_hartree` | reference: $2.2\times10^{-14}$ |
+| 4 | zero shear, $\partial u/\partial y = \partial w/\partial y = 0$, $v$ imposed | reference: $2.2\times10^{-14}$ on a production grid |
+
+The wall is no-slip unless a wall model is active. The outflow is a
+first-order convective condition with a global mass correction.
+
+Subgrid-scale model, `LES`:
+
+| value | model | status |
+|---|---|---|
+| 0 | none (DNS) | physical: laminar gate, transition, bypass transition |
+| 1 | constant-coefficient Smagorinsky, $C_s = 0.11$, $\Delta = (\Delta x\,\Delta y\,\Delta z)^{1/3}$ | reference: $4.2\times10^{-15}$ |
+| 2 | dynamic Smagorinsky, coefficient averaged over the spanwise slab | reference: bitwise at matched decomposition; used for the LES row in the figure above |
+| 3 | dynamic Smagorinsky, pointwise coefficient | reference: $2.1\times10^{-15}$ |
+
+All subgrid models run on the GPU, and the eddy viscosity is clipped at zero.
+
+Wall model, `WM` (0 is a no-slip wall):
+
+| value | wall model | status |
+|---|---|---|
+| 1 | slip length from a momentum integral | reference: $10^{-15}$ |
+| 2 | dynamic slip length (Bose type) | reference: $10^{-15}$ |
+| 3 | least-squares Robin fit on grid and test-filtered fields | reference: machine precision |
+| 4 | slip length from the momentum balance at the wall | reference: $2.9\times10^{-10}$ |
+| 5 | prescribed, optionally oscillating slip lengths (`alphas`) | reference: machine precision |
+| 6 | log layer with the resolved eddy viscosity | not exercised |
+| 7 | dynamic momentum balance | reference: machine precision |
+| 8 | log layer with a fixed eddy viscosity | not exercised |
+| 9 | wall stress from a $C_f$ correlation, imposed through $u$ and $v$ | not exercised |
+| 11 | Neumann wall stress from the momentum balance and `TauwModel` | reference: machine precision |
+| 12 | wall stress from a $C_f$ correlation, imposed through $u$ | not exercised |
+| 13 | wall stress from a $C_f$ correlation, imposed by wall transpiration | not exercised |
+| 14 | as 13, with a pseudo-Robin condition on $v$ | not exercised |
+| 15 | exact Neumann wall stress from a $C_f$ correlation | reference: machine precision |
+
+`TauwModel` selects the wall-stress estimate used by `WM = 11`: 0 takes a
+$C_f$ correlation and 1 solves the log law by Newton iteration (reference:
+machine precision). The wall-model code runs on the host and is bridged to
+the GPU at every substep. No wall model has been compared with
+boundary-layer data, and models 6, 8, 9, 12, 13 and 14 divide by zero on
+every input tried, in this code and in the CPU solver alike. Two memory
+errors found in the CPU wall models during the port are repaired in both
+codes.
+
+Time stepping, `RKscheme`: 1 is forward Euler (reference: $2.4\times10^{-15}$),
+2 is a two-stage Runge-Kutta scheme, and 3 is a three-stage Runge-Kutta
+scheme. A negative `CFL` fixes the time step. Restart, statistics, box
+output and strided 3-D snapshots are described in the same document.
 
 ## Documentation
 
