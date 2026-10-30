@@ -12,7 +12,7 @@ discretization is second-order staggered finite differences with explicit
 Euler, RK2 or RK3 stepping and a fractional-step projection. The Poisson
 equation is diagonalized by a half-length real cosine transform in $x$ and a
 Fourier transform in $z$, and solved by the Thomas algorithm in $y$. The
-fields stay resident on the GPU; the host is used for gated statistics,
+fields stay resident on the GPU. The host is used for gated statistics,
 monitoring and I/O.
 
 <picture>
@@ -78,7 +78,7 @@ sends cuFFT onto a slow path and costs about 10% per step.
 ## Tests
 
 The fastest end-to-end check is the laminar Blasius case, about 8 s on an
-A100. The same harness gates every solver change; see
+A100. The same harness gates every solver change. See
 [tests/README.md](tests/README.md) for the method and the full baseline and
 result tables.
 
@@ -98,11 +98,11 @@ python3 tests/validate.py bench   --exe ./boundary_layer_cuda --label my-run
 
 | case | what it is |
 |---|---|
-| `cases/laminar` | Blasius flat plate; the correctness gate (about 8 s on an A100) |
+| `cases/laminar` | Blasius flat plate, the correctness gate (about 8 s on an A100) |
 | `cases/transition` | K-type transition from Tollmien-Schlichting inflow modes |
-| `cases/turbulent_lund` | turbulent boundary layer with Lund recycling inflow (`inflow_flag = 3/5`), ported and validated to machine precision against the CPU solver; see [cases/turbulent_lund/README.md](cases/turbulent_lund/README.md) |
+| `cases/turbulent_lund` | turbulent boundary layer with Lund recycling inflow (`inflow_flag = 3/5`), ported and validated to machine precision against the CPU solver. See [cases/turbulent_lund/README.md](cases/turbulent_lund/README.md) |
 
-Input files are `key = value` text files (`.turbb`); see the commented
+Input files are `key = value` text files (`.turbb`). See the commented
 examples in each case directory and the parameter table in
 [docs/input_parameters.turbb](docs/input_parameters.turbb). String values
 must follow `=` without a blank, as the shipped cases do.
@@ -128,12 +128,12 @@ Inflow, `inflow_flag`:
 
 | value | inflow | status |
 |---|---|---|
-| 1 | Blasius profile plus temporal Tollmien-Schlichting modes (none if no mode file) | physical: Blasius $C_f$ in the laminar gate, 500k-step K-type transition; reference: $2\times10^{-14}$ |
+| 1 | Blasius profile plus temporal Tollmien-Schlichting modes (none if no mode file) | physical: Blasius $C_f$ in the laminar gate, 500k-step K-type transition. Reference: $2\times10^{-14}$ |
 | 2 | mean $u$, $v$ profiles read from a file | reference: $2.0\times10^{-14}$ |
 | 3 | Lund recycling of a downstream plane, full field rescaled | reference: $\le 2.5\times10^{-13}$ |
 | 4 | Blasius profile plus random noise redrawn every step | ported: the random sequence differs from the CPU solver by construction |
 | 5 | turbulent mean profile from a file plus rescaled Lund fluctuations | reference: $\le 2.5\times10^{-13}$ |
-| 6 | Blasius profile plus time-resolved planes from a precursor HIT library | physical: bypass transition at $Tu = 2\%$, $C_f$, $H$ and $u'_{rms}$ against Wu (2025); reference: $2.2\times10^{-14}$ |
+| 6 | Blasius profile plus time-resolved planes from a precursor HIT library | physical: bypass transition at $Tu = 2\%$, $C_f$, $H$ and $u'_{rms}$ against Wu (2025). Reference: $2.2\times10^{-14}$ |
 
 Top boundary, `top_flag`:
 
@@ -154,7 +154,7 @@ Subgrid-scale model, `LES`:
 |---|---|---|
 | 0 | none (DNS) | physical: laminar gate, transition, bypass transition |
 | 1 | constant-coefficient Smagorinsky, $C_s = 0.11$, $\Delta = (\Delta x\,\Delta y\,\Delta z)^{1/3}$ | reference: $4.2\times10^{-15}$ |
-| 2 | dynamic Smagorinsky, coefficient averaged over the spanwise slab | reference: bitwise at matched decomposition; used for the LES row in the figure above |
+| 2 | dynamic Smagorinsky, coefficient averaged over the spanwise slab | reference: bitwise at matched decomposition. Used for the LES row in the figure above |
 | 3 | dynamic Smagorinsky, pointwise coefficient | reference: $2.1\times10^{-15}$ |
 
 All subgrid models run on the GPU, and the eddy viscosity is clipped at zero.

@@ -58,7 +58,7 @@ section 3) and $f_i = (\mathrm{dPdx}, 0, \mathrm{dPdz})$ is a uniform body
 force set by the keys `dPdx` and `dPdz`. The convective term is discretized in
 divergence form, and the viscous term in flux form with the viscosity
 evaluated on the cell faces. The rotation term of the reference solver is not
-ported; `Omega_z` is always zero.
+ported, so `Omega_z` is always zero.
 
 The code is dimensionless. The free-stream velocity is $U_\infty = 1$
 (`ic_inflow_mod.f90`). The unit of length is the distance from the plate
@@ -83,7 +83,7 @@ Cell centers number one fewer, and the arrays carry one ghost point on each
 side of the centers. The grid is staggered: $u$ lives on $x$ faces, $v$ on
 $y$ faces, $w$ on $z$ faces and $p$ on cell centers. Finite differences are
 second order on this arrangement. Interpolations from centers to $y$ faces
-use the linear weights of the stretched grid; all other interpolations are
+use the linear weights of the stretched grid. All other interpolations are
 plain averages.
 
 The key `boxsize = Lx Ly Lz alpha` sets the domain and the wall-normal
@@ -97,8 +97,8 @@ y_j = L_y\,\frac{\sinh(\alpha\, s_j)}{\sinh \alpha},\qquad s_j = \frac{j-1}{ny-1
 $$
 
 so cells grow away from the wall. The ratio of the last to the first spacing
-approaches $\cosh\alpha$ for fine grids; $\alpha = 3$, the value of the
-shipped cases, gives a ratio near 10. The formula is not uniform for
+approaches $\cosh\alpha$ for fine grids. The value $\alpha = 3$ of the
+shipped cases gives a ratio near 10. The formula is not uniform for
 $\alpha = 1$ and is undefined for $\alpha = 0$. The key `ygrid_file` replaces
 this formula by a list of $ny$ face coordinates read from a text file, one
 value per line, with blank lines and lines starting with `#` ignored.
@@ -126,8 +126,8 @@ again.
 | `RKscheme` | scheme | coefficients $c_{sq}$ | substep times $t_s - t^n$ |
 |---|---|---|---|
 | 1 | forward Euler | $c_{11} = 1$ | $\Delta t$ |
-| 2 | two-stage Runge-Kutta (midpoint) | $c_{11} = 1/2$; $c_{21} = 0$, $c_{22} = 1$ | $\Delta t/2$, $\Delta t$ |
-| 3 | three-stage Runge-Kutta | $c_{11} = 8/15$; $c_{21} = 1/4$, $c_{22} = 5/12$; $c_{31} = 1/4$, $c_{32} = 0$, $c_{33} = 3/4$ | $8\Delta t/15$, $2\Delta t/3$, $\Delta t$ |
+| 2 | two-stage Runge-Kutta (midpoint) | stage 1: $c_{11} = 1/2$. Stage 2: $c_{21} = 0$, $c_{22} = 1$ | $\Delta t/2$, $\Delta t$ |
+| 3 | three-stage Runge-Kutta | stage 1: $c_{11} = 8/15$. Stage 2: $c_{21} = 1/4$, $c_{22} = 5/12$. Stage 3: $c_{31} = 1/4$, $c_{32} = 0$, $c_{33} = 3/4$ | $8\Delta t/15$, $2\Delta t/3$, $\Delta t$ |
 
 The Euler step is executed as the last substep of the three-stage table, so
 its boundary conditions and projection use the substep-3 coefficients.
@@ -174,7 +174,7 @@ singular mean mode is pinned by scaling the first pivot by $3/2$, as in the
 reference solver. The transforms run in cuFFT with a half-length real
 cosine transform (Makhoul packing), and the whole projection stays on the
 GPU. Multi-GPU runs use a $z$-slab decomposition with an all-to-all
-transpose of the cosine coefficients; `docs/MULTI_GPU_DESIGN.md` describes
+transpose of the cosine coefficients. `docs/MULTI_GPU_DESIGN.md` describes
 that pipeline.
 
 The only periodic direction is $z$. The streamwise direction has an inflow
@@ -210,12 +210,12 @@ parts are built.
 
 | `inflow_flag` | steady profile | time-dependent part | keys | files |
 |---|---|---|---|---|
-| 1 | Blasius similarity solution evaluated at $x(1)$ | sum of spanwise-temporal Fourier modes, or none | `inflow_file`, `timeinflow_file` | Blasius table (formatted); mode file (stream binary) or the placeholder `**TO DO**` |
-| 2 | $u$ and $v$ profiles read from a binary file | same as 1 | `inflow_file`, `timeinflow_file` | profile file (stream binary: `int32 ny`, `U(nyg)`, `V(ny)` as `real64`, endianness detected); the Blasius table is read from `blasius_solution.dat` in the working directory |
+| 1 | Blasius similarity solution evaluated at $x(1)$ | sum of spanwise-temporal Fourier modes, or none | `inflow_file`, `timeinflow_file` | Blasius table (formatted). Mode file (stream binary) or the placeholder `**TO DO**` |
+| 2 | $u$ and $v$ profiles read from a binary file | same as 1 | `inflow_file`, `timeinflow_file` | profile file (stream binary: `int32 ny`, `U(nyg)`, `V(ny)` as `real64`, endianness detected). The Blasius table is read from `blasius_solution.dat` in the working directory |
 | 3 | zero | the full plane at $i = $ `Lund_ix`, rescaled to inlet units every step | `Lund_ix`, `Lund_deltai`, `Lund_T` | `<snapshot>.mean.rescaling` companion on restart (optional) |
 | 4 | Blasius as in 1 | uniform random noise redrawn every step | `inflow_file`, `Amplitude` | Blasius table |
 | 5 | turbulent mean profile read from a binary file | fluctuations at $i = $ `Lund_ix`, rescaled every step | `inflow_file`, `Lund_ix`, `Lund_deltai`, `Lund_T` | profile file (stream binary, big-endian: `int32 ny`, `U(nyg)`, `V(ny)`) |
-| 6 | Blasius as in 1 | planes from a precursor homogeneous-turbulence library, interpolated in time | `inflow_file`, `hit_file`, `N_buffer_hit`, `ygrid_file` (optional) | Blasius table; plane library (format v2) |
+| 6 | Blasius as in 1 | planes from a precursor homogeneous-turbulence library, interpolated in time | `inflow_file`, `hit_file`, `N_buffer_hit`, `ygrid_file` (optional) | Blasius table. Plane library (format v2) |
 
 Any other value stops the run. The paragraphs below give the details of
 each option.
@@ -223,7 +223,7 @@ each option.
 Option 1 reads the Blasius table from `inflow_file`. The file is formatted
 and holds the number of points $n$, then $\eta(1{:}n)$, $f(1{:}n)$ and
 $f'(1{:}n)$, each as one list-directed record. The profiles are linear
-interpolations of $f'$ and $\eta f' - f$ in $\eta$; above the tabulated
+interpolations of $f'$ and $\eta f' - f$ in $\eta$. Above the tabulated
 range $u$ is $1$ and $v$ keeps its edge value. If `timeinflow_file` holds a
 file name, the time-dependent plane is
 
@@ -278,13 +278,13 @@ and the means are scaled as $\gamma\langle u\rangle$ (inner) and
 $\gamma\langle u\rangle + (1-\gamma)U_\infty$ (outer). Option 3 imposes the
 full rescaled plane and sets $U_{\mathrm{inlet}} = 0$. Option 5 zeroes the
 rescaled means and adds the rescaled fluctuations to the mean profile read
-from `inflow_file`; its $w$ plane is shifted in $z$ by 16 cells,
+from `inflow_file`. Its $w$ plane is shifted in $z$ by 16 cells,
 $W_t(j,k) \leftarrow W_t(j,\,\mathrm{mod}(k+16, nz)+1)$, as in the reference
 solver. For both options the top profile is the turbulent displacement
 velocity $V_{\mathrm{top}}(x) = 0.0160\,\mathrm{Re}_x^{-1/7}$. The run checks
 $2 \le$ `Lund_ix` $\le nx-1$, `Lund_T` $> 0$ and `Lund_deltai` $> 0$. For
 option 3 every snapshot is accompanied by `<snapshot>.mean.rescaling` holding
-the filtered means, and a restart reads it back when it exists; otherwise the
+the filtered means, and a restart reads it back when it exists. Otherwise the
 means restart from the spanwise averages of the initial field.
 
 Option 4 draws, once per step on the host, $U_t(j,k) = A\,(1 - U_{\mathrm{inlet}}(j))\,(r - 1/2)$
@@ -297,7 +297,7 @@ preprocessing pipeline that is not part of this repository. The file
 (`hit_file`) is a stream binary with the header `int32 magic = 20260612`,
 `int32 n_planes`, `int32 ny_hit`, `int32 nz_hit`, `real64 dt_plane`,
 `real64 Lz_box`, seven `real64` descriptors (`Tu, L11r, alphaL, A_vel, alphat, y_blend, Uinf`),
-and `real64 y_hit(ny_hit)`; then every plane stores $u$, $v$, $w$ as
+and `real64 y_hit(ny_hit)`. Then every plane stores $u$, $v$, $w$ as
 `real32` arrays with $z$ fastest. The planes are interpolated to the inlet
 grids on the host (linear and clamped in $y$, linear and periodic in $z$) and
 held on the GPU in a buffer of `N_buffer_hit` planes (default 1000), which is
@@ -305,7 +305,7 @@ reloaded from disk when the simulation time leaves it. At every substep the
 inlet plane is the linear interpolation in time between the two planes that
 bracket $t$. The library period `Lz_box` must equal the domain period
 $\Delta z\,(nz-2)$ to a relative tolerance of $10^{-6}$. When $t$ passes the
-last plane the run stops; the library is never recycled. The key
+last plane the run stops. The library is never recycled. The key
 `ygrid_file` was added for this option so that the wall-normal grid can
 resolve the free-stream turbulence.
 
@@ -315,7 +315,7 @@ Without a wall model (`WM = 0`) the wall is a no-slip plate. The ghost rows
 of the center-located components are set antisymmetric,
 $u(i,1,k) = -u(i,2,k)$ and $w(i,1,k) = -w(i,2,k)$, so the interpolated wall
 value vanishes, and the wall-normal velocity on the wall face is
-$v(i,1,k) = 0$. There is no input key for wall blowing or suction; the only
+$v(i,1,k) = 0$. There is no input key for wall blowing or suction. The only
 nonzero wall-normal velocity at the wall comes from wall model 13.
 
 With a wall model the slip lengths $\alpha_x, \alpha_y, \alpha_z$ returned by
@@ -385,8 +385,8 @@ The first form is equation (2.1) of Coleman, Rumsey and Spalart (2018) and
 the second equation (2.1) of Abe (2017). The key `sigma` must be nonzero.
 For $i \le$ `Lund_ix` the $u$ and $w$ top rows are reset to
 $U_{\mathrm{top}}$ and $W_{\mathrm{top}} = 0$, so the inlet region keeps a
-Dirichlet top; when `Lund_ix` is absent or zero this reset is skipped. The
-reference solver also wrote one row past the $v$ array here; the port keeps
+Dirichlet top. When `Lund_ix` is absent or zero this reset is skipped. The
+reference solver also wrote one row past the $v$ array here. The port keeps
 the blowing-and-suction profile over the whole lid, which is what that write
 amounted to after the wall condition overwrote it.
 
@@ -445,7 +445,7 @@ viscosity $\nu_t$ is defined at cell centers and enters the momentum
 equations through the flux-form viscous term, with $\nu + \nu_t$
 interpolated to each face as in the reference `equations.f90`. The eddy
 viscosity is recomputed on the GPU from the current velocity before the
-right-hand side of every substep. All LES kernels run on the device; the
+right-hand side of every substep. All LES kernels run on the device. The
 host receives $\nu_t$ only at output steps and, for the wall models, the
 wall-parallel average.
 
@@ -468,11 +468,11 @@ $$
 
 where $\Delta y_j = y_j - y_{j-1}$ is the local cell height and $S_{ij}$ is
 the rate-of-strain tensor at the cell center. The diagonal components are
-differences across the cell; the off-diagonal components are formed on cell
+differences across the cell. The off-diagonal components are formed on cell
 edges and averaged to the center. The reference carries a van Driest damping
 factor $f = 1 - \exp(-y^+/25)$ with $u_\tau = \sqrt{\mathrm{dPdx}}$, but the
 reference hard-sets `Dirichlet_nu_t = 0` after the input is read and the
-factor is then $f = 1$; the port keeps this override. The key `nutBC` is
+factor is then $f = 1$. The port keeps this override. The key `nutBC` is
 parsed but has no effect. The wall-parallel average $\langle\nu_t\rangle(y)$
 is computed for the wall models and clipped at zero.
 
@@ -503,12 +503,12 @@ cells of the slab owned by each rank before the ratio is formed, so on
 several GPUs the coefficient depends on the rank count. For `LES = 3` the
 ratio is taken pointwise. In both cases $\nu_t$ is clipped at zero over the
 whole array after the ratio, and the wall-normal ghost rows are Neumann
-copies. For `LES = 2` the filtered fields take Neumann ghosts in $x$; for
+copies. For `LES = 2` the filtered fields take Neumann ghosts in $x$. For
 `LES = 3` they take periodic ghosts in $x$, as the reference code did, even
 though the domain is not periodic in $x$. There is no wall damping in the
 dynamic models. For `LES = 2` the raw, unclipped ratio
 $\langle L_{ij}M_{ij}\rangle/\langle M_{ij}M_{ij}\rangle$ is what the wall
-models receive as the average eddy viscosity; for `LES = 3` they receive
+models receive as the average eddy viscosity. For `LES = 3` they receive
 zero.
 
 The LES models were compared with the CPU reference from a shared restart:
@@ -523,7 +523,7 @@ The bypass-transition case shown in the README was run with `LES = 2`.
 
 | key | values | meaning |
 |---|---|---|
-| `WM` | 0, 1 to 9, 11 to 15 | wall-model option; 10 is not defined and any other value stops the run |
+| `WM` | 0, 1 to 9, 11 to 15 | wall-model option. 10 is not defined and any other value stops the run |
 | `TauwModel` | 0, 1 | wall-stress estimate used by `WM = 11`: 0 takes $u_{\tau,\mathrm{ref}}(x) = \sqrt{\tfrac{1}{2}\,0.027\,(x/\nu)^{-1/7}}$, 1 solves the logarithmic law by Newton iteration |
 | `WMnutflag` | 0, 2 | for `WM` 9, 12, 13, 14: 0 uses the fixed viscous fraction `WMnut`, 2 estimates it from the velocity at the third and fourth cells |
 | `WMnut` | real | viscous fraction $f_{\mathrm{vis}}$ of the wall stress carried by the resolved gradient (`WM` 9, 12, 13, 14) |
@@ -563,7 +563,7 @@ between the wall ghost row and the first cell.
 
 | `WM` | model | what it computes | matching location | returned condition |
 |---|---|---|---|---|
-| 1 | momentum integral | $\alpha_x = \langle\int_0^{l}(\hat u\hat v + T_{uv} - uv - \tau_{uv})\,dy\rangle / [\nu(1-r)\langle\partial_y u\rangle_w]$; the integration length $l$ is a variable the input path never sets, so the integral and $\alpha_x$ are zero | wall and the band $y \le l$ | Robin, $\alpha_y = \alpha_z = \alpha_x$ |
+| 1 | momentum integral | $\alpha_x = \langle\int_0^{l}(\hat u\hat v + T_{uv} - uv - \tau_{uv})\,dy\rangle / [\nu(1-r)\langle\partial_y u\rangle_w]$. The integration length $l$ is a variable the input path never sets, so the integral and $\alpha_x$ are zero | wall and the band $y \le l$ | Robin, $\alpha_y = \alpha_z = \alpha_x$ |
 | 2 | dynamic slip (Bose-type) | $\alpha^2 = \langle L_{ij}M_{ij}\rangle/\langle M_{ij}M_{ij}\rangle$ with $L_{ij} = \widehat{u_iu_j} - u_iu_j - T_{ij} + \hat\tau_{ij}$ and $M_{ij} = r^2\,\widehat{\partial_n u_i}\,\widehat{\partial_n u_j} - \partial_n u_i\,\partial_n u_j$, clipped at zero, square root | first two cells at the wall (and top) | Robin, single $\alpha$ |
 | 3 | least-squares Robin fit | $\alpha = \sum_i\langle u_i\,\partial_y u_i + r\,\hat u_i\,\partial_y\hat u_i\rangle / \sum_i\langle(\partial_y u_i)^2 + r^2(\partial_y\hat u_i)^2\rangle$, clipped at zero | wall face | Robin, single $\alpha$ |
 | 4 | momentum balance at the wall | $\alpha^2 = (\nu\langle\partial_y u\rangle - \mathrm{dPdx}\,L_y/2 - \langle\tau_{uv}\rangle)/\langle\partial_y u\,\partial_y v\rangle$, clipped, square root | wall face | Robin, single $\alpha$ |
@@ -571,12 +571,12 @@ between the wall ghost row and the first cell.
 | 6 | log layer with resolved $\nu_t$ | $\alpha = \dfrac{\langle\nu_t\rangle_w + \nu}{\kappa u_\tau}\ln\!\left(\dfrac{\Delta_1 u_\tau}{\nu}e^{\kappa B}\right)$, $\kappa = 0.38$, $B = 5.2$, $u_\tau = \sqrt{\mathrm{dPdx}}$ | first cell | Robin, single $\alpha$ |
 | 7 | dynamic momentum balance | $\alpha^2 = [\nu(\langle\partial_y\hat u\rangle - \langle\partial_y u\rangle) + \langle\tau_{uv}\rangle - \langle T_{uv}\rangle]/[r^2\langle\partial_y\hat u\,\partial_y\hat v\rangle - \langle\partial_y u\,\partial_y v\rangle]$, clipped, square root | wall face | Robin, single $\alpha$ |
 | 8 | log layer with fixed $\nu_t$ | $\alpha = \Delta_1\ln\!\left(\dfrac{\Delta_1 u_\tau}{\nu}e^{\kappa B}\right)$ and the ghost rows of $\langle\nu_t\rangle$ set to $\nu_t = \kappa u_\tau\Delta_1$ at the wall | first cell | Robin, single $\alpha$ |
-| 9 | wall stress from $C_f$ through $v$ | $\alpha_x(x) = \nu\langle u\rangle_w/(f_{\mathrm{vis}}\tau_w^{\mathrm{ref}})$ floored at $10^{-3}$; $\alpha_y(x) = [\nu\langle\partial_y u\rangle - \tau_w^{\mathrm{ref}} - \langle\tau_{uv}\rangle + \beta_y\langle u\rangle_w]/\langle u\,\partial_y v\rangle$ with $\beta_y$ the wall-plane mean removed by the $v$ condition | wall face, per $x$ station | Robin $u$, $w$; pseudo-Robin $v$; $\alpha_z = \alpha_y$ |
-| 11 | Neumann from the momentum balance | $\alpha_x(x) = (u_{\tau,\mathrm{model}}^2 + \langle\tau_{uv}\rangle)/\nu$ with $u_{\tau,\mathrm{model}}$ from `TauwModel`; floored at zero | wall face, per $x$ station | Neumann $\partial_y u = \alpha_x$; $v = 0$; $w$ no-slip |
-| 12 | wall stress from $C_f$ through $u$ | $\alpha_x$ as in 9; $\alpha_y(x) = [\nu\langle\partial_y u\rangle - \tau_w^{\mathrm{ref}} - \langle\tau_{uv}\rangle]/(\alpha_x\langle\partial_y u\,\partial_y v\rangle)$ capped at $\lvert\alpha_y\rvert \le 2\times10^{-3}$ | wall face, per $x$ station | Robin $u$, $w$; pseudo-Robin $v$; $\alpha_z = \alpha_y$ |
-| 13 | wall transpiration from $C_f$ | $\alpha_x$ as in 9 (floored at zero); $V_{\mathrm{bottom}}(x) = [\nu\langle\partial_y u\rangle - \tau_w^{\mathrm{ref}} - \langle\tau_{uv}\rangle]/\langle u\rangle_w$ clipped to $\lvert V\rvert \le 0.5$; $\alpha_z = \alpha_x/10$ | wall face, per $x$ station | Robin $u$, $w$; Dirichlet $v = V_{\mathrm{bottom}}$ |
+| 9 | wall stress from $C_f$ through $v$ | $\alpha_x(x) = \nu\langle u\rangle_w/(f_{\mathrm{vis}}\tau_w^{\mathrm{ref}})$ floored at $10^{-3}$. $\alpha_y(x) = [\nu\langle\partial_y u\rangle - \tau_w^{\mathrm{ref}} - \langle\tau_{uv}\rangle + \beta_y\langle u\rangle_w]/\langle u\,\partial_y v\rangle$ with $\beta_y$ the wall-plane mean removed by the $v$ condition | wall face, per $x$ station | Robin $u$, $w$. Pseudo-Robin $v$. $\alpha_z = \alpha_y$ |
+| 11 | Neumann from the momentum balance | $\alpha_x(x) = (u_{\tau,\mathrm{model}}^2 + \langle\tau_{uv}\rangle)/\nu$ with $u_{\tau,\mathrm{model}}$ from `TauwModel`, floored at zero | wall face, per $x$ station | Neumann $\partial_y u = \alpha_x$, $v = 0$, $w$ no-slip |
+| 12 | wall stress from $C_f$ through $u$ | $\alpha_x$ as in 9. $\alpha_y(x) = [\nu\langle\partial_y u\rangle - \tau_w^{\mathrm{ref}} - \langle\tau_{uv}\rangle]/(\alpha_x\langle\partial_y u\,\partial_y v\rangle)$ capped at $\lvert\alpha_y\rvert \le 2\times10^{-3}$ | wall face, per $x$ station | Robin $u$, $w$. Pseudo-Robin $v$. $\alpha_z = \alpha_y$ |
+| 13 | wall transpiration from $C_f$ | $\alpha_x$ as in 9 (floored at zero). $V_{\mathrm{bottom}}(x) = [\nu\langle\partial_y u\rangle - \tau_w^{\mathrm{ref}} - \langle\tau_{uv}\rangle]/\langle u\rangle_w$ clipped to $\lvert V\rvert \le 0.5$. $\alpha_z = \alpha_x/10$ | wall face, per $x$ station | Robin $u$, $w$. Dirichlet $v = V_{\mathrm{bottom}}$ |
 | 14 | same routine as 13 | identical quantities to 13 | as 13 | the wall kernels do not single out 14, so $v$ takes the pseudo-Robin condition with $\alpha_y = V_{\mathrm{bottom}}$ instead of the Dirichlet value |
-| 15 | exact Neumann from $C_f$ | $\alpha_x(x) = \tau_w^{\mathrm{ref}}(x)\big/\langle\nu + \nu_t\rangle_w$ with the spanwise average of $\nu + \nu_t$ in the first cell, $U_\infty = 1$ | wall face, per $x$ station | Neumann $\partial_y u = \alpha_x$; $v = 0$; $w$ no-slip |
+| 15 | exact Neumann from $C_f$ | $\alpha_x(x) = \tau_w^{\mathrm{ref}}(x)\big/\langle\nu + \nu_t\rangle_w$ with the spanwise average of $\nu + \nu_t$ in the first cell, $U_\infty = 1$ | wall face, per $x$ station | Neumann $\partial_y u = \alpha_x$, $v = 0$, $w$ no-slip |
 
 For models 9, 12 and 13 the free-stream velocity in $C_f^{\mathrm{ref}}$ is
 taken as the top-row value $u(2, nyg, 2)$. With `WMnutflag = 2` the viscous
@@ -610,7 +610,7 @@ and the allocation of the filtered average eddy viscosity).
 |---|---|---|
 | 1, 2 | machine precision ($\sim 10^{-15}$) | machine precision ($1.3\times10^{-15}$) |
 | 3, 5, 7, 11, 15, and `TauwModel = 1` | machine precision | not reported |
-| 4 | division by zero in both codes | $2.9\times10^{-10}$ (its ratio amplifies round-off; the rank-resolved terms agree to $10^{-12}$) |
+| 4 | division by zero in both codes | $2.9\times10^{-10}$ (its ratio amplifies round-off. The rank-resolved terms agree to $10^{-12}$) |
 | 6, 8, 9, 12, 13, 14 | division by zero in both codes | division by zero in both codes |
 
 Models 6 and 8 divide by $u_\tau = \sqrt{\mathrm{dPdx}}$, which is zero in
@@ -618,7 +618,7 @@ every boundary-layer input, and models 9, 12, 13 and 14 divide by
 wall-plane averages that vanish on the probes used. These six options are
 ported and run identically to the reference as far as the reference runs,
 but no case in this repository exercises them to a physical result. No wall
-model is physically validated against boundary-layer data here; the record
+model is physically validated against boundary-layer data here. The record
 above is code-to-code agreement only. The automated test `tests/validate.py`
 covers the laminar DNS case and does not run a wall model.
 
@@ -638,10 +638,10 @@ pressure gradients, the inlet Reynolds numbers $\mathrm{Re}_x$,
 $\mathrm{Re}_\theta$, $\mathrm{Re}_\delta$ and $\delta_{99}$ computed by the
 statistics, the maximum interior divergence and the elapsed wall-clock time
 since the previous monitor. The line `No wall model` is printed regardless
-of `WM`; the monitor was not extended when the wall models were added. With
+of `WM`. The monitor was not extended when the wall models were added. With
 `BL_PROFILE=1` in the environment the driver also prints every 100 steps the
 average time of the first substep split into copy, right-hand side,
-advance, boundary conditions and projection; the fences this needs slow the
+advance, boundary conditions and projection. The fences this needs slow the
 run.
 
 ### Statistics
@@ -663,8 +663,8 @@ where $\tau_{\mathrm{sgs},w}$ is the mean eddy viscosity near the wall times
 the wall gradient and is zero in DNS. The inlet momentum thickness and
 $\delta_{99}$ come from the mean profile at $i = 1$. The file is formatted:
 the first line holds `%`, $t$, $\nu$ (`2F15.8`) and $nx$, $ny$, $nz$, the
-step (`4I8`); then $C_f(1{:}nx)$, $x(1{:}nx)$ and $y(1{:}ny)$, one record
-each; then, one $x$ station per line with $ny$ values, the blocks
+step (`4I8`). Then $C_f(1{:}nx)$, $x(1{:}nx)$ and $y(1{:}ny)$, one record
+each. Then, one $x$ station per line with $ny$ values, the blocks
 $\langle u\rangle$, $\langle v\rangle$, $\langle w\rangle$,
 $\langle u^2\rangle$, $\langle v^2\rangle$, $\langle w^2\rangle$,
 $\langle p\rangle$, $\langle p^2\rangle$. The mean eddy viscosity is
@@ -675,9 +675,9 @@ accumulated but not written.
 Every `nsave` steps the solver writes the binary snapshot `<fileout>.<step>`
 with the step as eight digits, and refreshes the symbolic link
 `<fileout>.restart` to point at it. The file is a stream of native-endian
-records: $t$, $\nu$ (`real64`); the marker `-73` and the step (`int32`);
-the six grids, each as its length (`int32`) followed by the coordinates
-(`real64`); then $u$, $v$, $w$, $\nu_t$ and $p$, each as three `int32`
+records: $t$, $\nu$ (`real64`). The marker `-73` and the step (`int32`).
+The six grids, each as its length (`int32`) followed by the coordinates
+(`real64`). Then $u$, $v$, $w$, $\nu_t$ and $p$, each as three `int32`
 dimensions followed by the `real64` array. The $u$, $v$ and $\nu_t$ blocks
 store the first $nzg - 1$ spanwise planes, $w$ the first $nz - 1$, and $p$
 all $nzg$ planes. The $\nu_t$ block is zero in DNS. Multi-GPU runs write one
@@ -716,7 +716,7 @@ resolution in $y$, every `snap3d_every` absolute steps. Each file
 array shapes, the stride and the step (`int32`), then $t$ (`real64`) and
 the three `real32` arrays on their native staggered grids. A one-time file
 `snap_grid.bin` holds the strided coordinates. On `main` the fields are
-gathered to the root rank in double precision and strided there; the branch
+gathered to the root rank in double precision and strided there. The branch
 in section 6 strides them on the GPU.
 
 ### Environment variables and build options
@@ -738,14 +738,14 @@ exact changes.
 
 One commit on top of `main` (`6249b6d`). It adds a flat plate whose leading
 edge lies inside the domain, and moves the striding of the `snap3d`
-snapshots to the GPU. The new keys are optional; without them the code paths
+snapshots to the GPU. The new keys are optional. Without them the code paths
 are those of `main`.
 
 | key | meaning |
 |---|---|
-| `x_le` | streamwise position of the leading edge of a zero-thickness plate. For $x < x_{le}$ the bottom is a free-slip symmetry plane ($u(1) = u(2)$, $w(1) = w(2)$, $v = 0$); for $x \ge x_{le}$ it is the no-slip plate. The inlet mean is uniform plus the potential-flow correction of the plate displacement, and the Blasius initial condition and the top displacement velocity are measured from $x_{le}$. Only with `WM = 0`. |
+| `x_le` | streamwise position of the leading edge of a zero-thickness plate. For $x < x_{le}$ the bottom is a free-slip symmetry plane ($u(1) = u(2)$, $w(1) = w(2)$, $v = 0$). For $x \ge x_{le}$ it is the no-slip plate. The inlet mean is uniform plus the potential-flow correction of the plate displacement, and the Blasius initial condition and the top displacement velocity are measured from $x_{le}$. Only with `WM = 0`. |
 | `le_open` | 1 opens the bottom upstream of $x_{le}$ for the precursor-turbulence inflow (`inflow_flag = 6`): the fluctuations crossing $y = 0$ are the unmirrored library planes delayed by the Taylor time $(x - x_{\mathrm{inlet}})/U_\infty$, and the net volume flux through the open patch is removed every step. |
-| `le_ramp` | $n > 0$ blends the bottom condition linearly from free slip to no slip over the $n$ cells before $x_{le}$ and takes the open-bottom weight from 1 to 0 over the same cells; 0 gives a sharp edge. |
+| `le_ramp` | $n > 0$ blends the bottom condition linearly from free slip to no slip over the $n$ cells before $x_{le}$ and takes the open-bottom weight from 1 to 0 over the same cells. 0 gives a sharp edge. |
 
 The new module `src/snap3d_pack.cuf` strides the fields on the device and
 gathers only the stored samples, so the bytes written equal those of the
@@ -765,18 +765,18 @@ lid: every top-plane mode with wavenumber $k$ satisfies
 $\partial_y \hat q = -\lvert k\rvert\,\hat q$ for $q = u, v, w$. Discretely,
 the lid value is the value one cell below times the per-cell decay factor
 of a harmonic mode of the solver's Laplacian, using the modified wavenumbers
-of the pressure solve; $x$ is extended evenly about the inlet and outlet
+of the pressure solve. $x$ is extended evenly about the inlet and outlet
 planes and $z$ is periodic. The lid row of $v$ is computed at the start of
 each substep from the projected field and held through the projection.
 
 | key | values | meaning |
 |---|---|---|
-| `top_potential` | 0 (default), 1, 2 | 0 off; 1 match every mode $(k_x, k_z) \ne (0,0)$; 2 match only the spanwise-uniform modes |
+| `top_potential` | 0 (default), 1, 2 | 0 off. 1 matches every mode $(k_x, k_z) \ne (0,0)$. 2 matches only the spanwise-uniform modes |
 | `top_potential_long` | 0 (default), 1, 2 | treatment of the spanwise-uniform modes with $k_x L_y < 1$: 0 keeps the `top_flag = 4` lid for them, 1 matches them, 2 matches them with a first-order relaxation |
 | `top_potential_flux` | 0, 1 (default) | the mean mode of the lid: 1 lets the total lid flux float ($\partial_y v = 0$ for the mean), 0 pins it to $V_{\mathrm{top}}$ |
-| `top_potential_tau` | real (default 0.5) | relaxation time for `top_potential_long = 2`; the filter state is stored in `<snapshot>.topbc` |
+| `top_potential_tau` | real (default 0.5) | relaxation time for `top_potential_long = 2`. The filter state is stored in `<snapshot>.topbc` |
 | `top_potential_vmean` | file | a row $\delta V(1{:}nxg)$ added to $V_{\mathrm{top}}$, the mean excess transpiration of the actual layer from a previous run (`tools/make_top_vmean.py`) |
-| `top_potential_ref` | file | a reference top row $U_{\mathrm{ref}}(1{:}nx)$ from a steady laminar solution of the same grid (`tools/make_top_reference.py`); otherwise the analytic potential flow of the plate displacement is used |
+| `top_potential_ref` | file | a reference top row $U_{\mathrm{ref}}(1{:}nx)$ from a steady laminar solution of the same grid (`tools/make_top_reference.py`). Otherwise the analytic potential flow of the plate displacement is used |
 
 The sub-keys are rejected when `top_potential` is absent, and
 `top_potential` requires `top_flag = 4`. The commit messages record that the
